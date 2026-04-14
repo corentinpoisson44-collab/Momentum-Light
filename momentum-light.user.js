@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.2.0
-// @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP sur les barres de tickets, et bandeau de vélocité moyenne des 3 derniers sprints.
+// @version      0.2.1
+// @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, et chip de vélocité moyenne des 5 derniers sprints intégrée dans le toolbar.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
 // @run-at       document-idle
@@ -285,7 +285,7 @@
 
   const velocity = (() => {
     const BOARD_OVERRIDE_KEY = 'momentum-light::velocity-board-id';
-    const SPRINT_WINDOW = 3;
+    const SPRINT_WINDOW = 5;
     const CACHE_TTL_MS = 5 * 60_000;
     const MAX_CLOSED_SPRINTS_SCANNED = 200;
 
@@ -443,45 +443,46 @@
         white-space: nowrap;
         text-overflow: ellipsis;
       }
-      /* Ticket variant: no fill, label sits flush-left so it reads like a chip
-         attached to the start of the bar. The text-shadow keeps it legible on
-         any bar color without needing the mix-blend-mode fill. */
+      /* Ticket variant: no fill, label keeps the default centered alignment
+         inherited from .momentum-progress__label (flex center + padding).
+         The text-shadow keeps it legible on any bar color without needing
+         the mix-blend-mode fill. */
       .${OVERLAY_ESTIMATE_MOD} .${OVERLAY_FILL_CLASS} {
         display: none;
       }
-      .${OVERLAY_ESTIMATE_MOD} .${OVERLAY_LABEL_CLASS} {
-        justify-content: flex-start;
-        padding: 0 6px;
-      }
+      /* Inline chip, designed to sit naturally in the plan/timeline top bar
+         next to native Atlassian controls. Colors are pulled from Atlassian's
+         neutral palette so it reads as part of the UI, not a floating addon. */
       #${VELOCITY_BANNER_ID} {
-        position: fixed;
-        top: 96px;
-        right: 24px;
-        z-index: 1000;
         display: inline-flex;
-        align-items: baseline;
+        align-items: center;
         gap: 6px;
-        padding: 6px 12px;
-        border-radius: 16px;
-        background: #0c66e4;
-        color: #fff;
+        margin: 4px 8px;
+        padding: 4px 10px;
+        border-radius: 12px;
+        background: #DFE1E6;
+        color: #172B4D;
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
         font-size: 12px;
-        line-height: 1;
-        box-shadow: 0 2px 8px rgba(9, 30, 66, 0.2);
-        pointer-events: auto;
+        line-height: 1.3;
+        cursor: pointer;
         user-select: none;
+        vertical-align: middle;
+      }
+      #${VELOCITY_BANNER_ID}:hover {
+        background: #C1C7D0;
       }
       #${VELOCITY_BANNER_ID} .momentum-velocity-banner__label {
-        opacity: 0.85;
         font-weight: 500;
+        color: #42526E;
       }
       #${VELOCITY_BANNER_ID} .momentum-velocity-banner__value {
         font-weight: 700;
         font-variant-numeric: tabular-nums;
       }
       #${VELOCITY_BANNER_ID}[data-state="error"] {
-        background: #6b778c;
+        background: #F4F5F7;
+        color: #6B778C;
       }
     `;
     document.head.appendChild(style);
@@ -789,25 +790,66 @@
   })();
 
   // ---------------------------------------------------------------------------
-  // velocityBanner — fixed pill rendered on timeline/plan pages that surfaces
-  // the average velocity of the last 3 closed sprints. Click to refresh.
+  // velocityBanner — inline chip embedded in the plan/timeline UI that
+  // surfaces the average velocity of the last N closed sprints. Click to
+  // refresh (bypasses the in-memory velocity cache).
+  //
+  // Anchor search order (first match wins):
+  //   1. An explicit toolbar (`data-testid` ending in `.toolbar` or
+  //      containing "controls" under a plan/roadmap scope).
+  //   2. The plan tab-title / header container.
+  //   3. The outermost `roadmap.timeline-table-kit.*` wrapper (we insert
+  //      ourselves as a previous-sibling so the chip sits above the grid).
+  // If no anchor is found yet (timeline still loading), we noop — the next
+  // mutation tick will retry.
   // ---------------------------------------------------------------------------
 
   const velocityBanner = (() => {
+    const ANCHOR_SELECTORS = [
+      '[data-testid$=".toolbar"]',
+      '[data-testid*="toolbar"][data-testid*="plan"]',
+      '[data-testid*="toolbar"][data-testid*="roadmap"]',
+      '[data-testid="plan.tab-title-controller.container"]',
+      '[data-testid*="plan"][data-testid*="header"]',
+      '[data-testid*="roadmap"][data-testid*="header"]',
+    ];
+
+    function findTimelineRoot() {
+      // Climb from any timeline-table-kit descendant up to the outermost
+      // ancestor that still belongs to that widget. Falls back to the first
+      // descendant if no further ancestor qualifies.
+      const probe = document.querySelector('[data-testid^="roadmap.timeline-table-kit."]');
+      if (!probe) return null;
+      let cursor = probe;
+      let candidate = probe;
+      let steps = 0;
+      while (cursor && cursor !== document.body && steps < 30) {
+        const tid = cursor.getAttribute?.('data-testid') || '';
+        if (tid.startsWith('roadmap.timeline-table-kit.')) candidate = cursor;
+        cursor = cursor.parentElement;
+        steps += 1;
+      }
+      return candidate;
+    }
+
+    function findAnchor() {
+      for (const sel of ANCHOR_SELECTORS) {
+        const el = document.querySelector(sel);
+        if (el) return { el, mode: 'append' };
+      }
+      const root = findTimelineRoot();
+      if (root && root.parentElement) return { el: root, mode: 'before' };
+      return null;
+    }
+
     function build() {
-      const el = document.createElement('div');
+      const el = document.createElement('span');
       el.id = VELOCITY_BANNER_ID;
       el.innerHTML =
-        '<span class="momentum-velocity-banner__label">Vélocité moyenne (3 derniers sprints)</span>' +
+        '<span class="momentum-velocity-banner__label">Vélocité moyenne (5 derniers sprints)</span>' +
         '<span class="momentum-velocity-banner__value">…</span>';
       el.title = 'Cliquez pour rafraîchir';
       el.addEventListener('click', () => {
-        // Force refresh by bypassing the in-memory cache. Cheapest way: clear
-        // the module-level cache via a fresh re-render; since `velocity` owns
-        // its cache, we just re-invoke update after a hard reload of the page.
-        // Simpler UX: reload the banner text to "…" and call update again —
-        // the cache will serve if still valid. A real force-refresh would
-        // need exposing a clear(); keeping minimal for now.
         el.querySelector('.momentum-velocity-banner__value').textContent = '…';
         update();
       });
@@ -815,11 +857,21 @@
     }
 
     function ensure() {
-      let el = document.getElementById(VELOCITY_BANNER_ID);
-      if (el) return el;
-      if (!document.body) return null;
-      el = build();
-      document.body.appendChild(el);
+      const existing = document.getElementById(VELOCITY_BANNER_ID);
+      if (existing && existing.isConnected) return existing;
+      // If the banner was detached by an SPA re-render, drop the orphan and
+      // re-anchor from scratch.
+      if (existing) existing.remove();
+
+      const anchor = findAnchor();
+      if (!anchor) return null;
+
+      const el = build();
+      if (anchor.mode === 'append') {
+        anchor.el.appendChild(el);
+      } else {
+        anchor.el.parentElement.insertBefore(el, anchor.el);
+      }
       return el;
     }
 
@@ -1019,7 +1071,7 @@
     // Initial pass (in case the timeline is already rendered at document-idle).
     runActiveFeatures();
     log(
-      'loaded — version 0.2.0',
+      'loaded — version 0.2.1',
       isDebug()
         ? '(debug on)'
         : '(debug off — enable with: localStorage.setItem(\'momentum-light-debug\', \'1\'))',

@@ -21,8 +21,8 @@ Les mises à jour sont poussées automatiquement (Tampermonkey vérifie le `@upd
 | # | Feature | État |
 |---|---|---|
 | 1 | **Epic Progress Bar** — affiche une barre de progression sur chaque Epic de la Timeline, calculée sur `Σ SP done / Σ SP total` des tickets enfants. | ✅ v0.1.0 |
-| 2 | **Ticket Estimate** — sous les Epics, chaque barre de ticket affiche son chiffrage en Story Points. | ✅ v0.2.0 |
-| 3 | **Sprint Velocity** — bandeau fixe indiquant la vélocité moyenne des 3 derniers sprints clos. | ✅ v0.2.0 |
+| 2 | **Ticket Estimate** — sous les Epics, chaque barre de ticket affiche son chiffrage (centré) en Story Points. | ✅ v0.2.1 |
+| 3 | **Sprint Velocity** — chip intégrée dans le toolbar de la Timeline, affichant la vélocité moyenne des 5 derniers sprints clos. | ✅ v0.2.1 |
 
 ### Configuration
 
