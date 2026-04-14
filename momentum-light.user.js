@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.1.11
+// @version      0.1.12
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — feature #1 : barre de progression sur les Epics, calculée sur SP done / SP total des tickets enfants.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -273,25 +273,22 @@
     const KEY_CELL_SELECTOR =
       '[data-testid="roadmap.timeline-table-kit.ui.list-item-content.summary.key"]';
 
-    // Keywords in a testid that mark it as a widget nested inside the bar
-    // rather than the bar itself. We skip these to avoid decorating the
-    // corner link-creation dots, drag/resize handles, marker handles, etc.
-    // (they also share the chart-item-content prefix on this DOM variant).
-    const BAR_WIDGET_BLACKLIST = [
-      'link-dot',
-      'link-icon',
-      'dependency',
-      'handle',
-      'drag',
-      'resize',
-      'warning',
-      'lozenge',
-    ];
+    // Minimum dimensions (in px) for an element to qualify as a "bar" rather
+    // than a corner widget (link-creation dots, resize handles). Drag handles
+    // are typically 12–16 px squares; even the shortest visible Epic bar is
+    // wider than 24 px. This size filter replaces a testid blacklist — more
+    // robust since Atlassian's testid naming for widgets is not stable.
+    const BAR_MIN_WIDTH = 24;
+    const BAR_MIN_HEIGHT = 12;
 
-    function isChartBarCandidate(el) {
-      const tid = (el.getAttribute('data-testid') || '').toLowerCase();
-      if (!tid.startsWith(CHART_CONTENT_TESTID_PREFIX)) return false;
-      return !BAR_WIDGET_BLACKLIST.some((kw) => tid.includes(kw));
+    function hasChartPrefix(el) {
+      const tid = el.getAttribute('data-testid') || '';
+      return tid.startsWith(CHART_CONTENT_TESTID_PREFIX);
+    }
+
+    function isBarSized(el) {
+      const rect = el.getBoundingClientRect();
+      return rect.width >= BAR_MIN_WIDTH && rect.height >= BAR_MIN_HEIGHT;
     }
 
     // From a list of candidate elements, return only those that do NOT contain
@@ -304,17 +301,22 @@
     }
 
     function findBars(root) {
-      // Strategy 1 — any testid starting with the chart-item-content prefix,
-      // minus known widget leaves (link-dots, drag handles, warning icons…).
-      // Then pick the deepest matches so we decorate the bar itself rather
-      // than its outer container.
-      const prefixHits = [...root.querySelectorAll('[data-testid]')].filter(isChartBarCandidate);
+      // Strategy 1 — every testid starting with the chart-item-content prefix.
+      // Pick the deepest matches (leaves), then drop anything smaller than a
+      // real bar to keep out the corner link-dots / resize handles that share
+      // the same prefix.
+      const prefixHits = [...root.querySelectorAll('[data-testid]')].filter(hasChartPrefix);
       if (prefixHits.length > 0) {
         const leaves = leavesOnly(prefixHits);
+        const bars = leaves.filter(isBarSized);
         if (isDebug()) {
-          debug('findBars → prefix hits:', prefixHits.length, 'leaves:', leaves.length);
+          debug(
+            'findBars → prefix hits:', prefixHits.length,
+            'leaves:', leaves.length,
+            'bars:', bars.length,
+          );
         }
-        return leaves;
+        return bars;
       }
 
       // Strategy 2 — walk up from each progress-wrapper to the row container,
@@ -337,8 +339,8 @@
           steps += 1;
         }
         if (!row) continue;
-        const chartHits = [...row.querySelectorAll('[data-testid]')].filter(isChartBarCandidate);
-        leavesOnly(chartHits).forEach((leaf) => found.add(leaf));
+        const chartHits = [...row.querySelectorAll('[data-testid]')].filter(hasChartPrefix);
+        leavesOnly(chartHits).filter(isBarSized).forEach((leaf) => found.add(leaf));
       }
       if (isDebug()) {
         debug('findBars → prefix:0, wrappers:', wrappers.length, 'row-scan resolved:', found.size);
@@ -656,7 +658,7 @@
     // Initial pass (in case the timeline is already rendered at document-idle).
     runActiveFeatures();
     log(
-      'loaded — version 0.1.11',
+      'loaded — version 0.1.12',
       isDebug()
         ? '(debug on)'
         : '(debug off — enable with: localStorage.setItem(\'momentum-light-debug\', \'1\'))',
