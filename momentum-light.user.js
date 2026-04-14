@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.3.10
-// @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), et indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne.
+// @version      0.4.0
+// @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne, et menu « How-to » guidé qui surligne chaque feature au premier lancement.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
 // @run-at       document-idle
@@ -34,6 +34,9 @@
   const OVERLAY_ESTIMATE_MOD = 'momentum-progress--estimate';
   const OVERLAY_SPRINT_FILL_MOD = 'momentum-progress--sprint-fill';
   const VELOCITY_BANNER_ID = 'momentum-velocity-banner';
+  const HOWTO_BUTTON_ID = 'momentum-howto-button';
+  const HOWTO_OVERLAY_ID = 'momentum-howto-overlay';
+  const HOWTO_SEEN_KEY = 'momentum-light::howto-seen';
 
   // Debug mode is opt-in per session. Enable from DevTools:
   //   localStorage.setItem('momentum-light-debug', '1')
@@ -952,6 +955,152 @@
         background: #F4F5F7;
         color: #6B778C;
       }
+
+      /* ---------------------------------------------------------------------
+       * How-to menu — a small floating "?" button that opens a guided tour
+       * spotlighting each feature one by one with Skip / Previous / Next.
+       * ------------------------------------------------------------------ */
+      #${HOWTO_BUTTON_ID} {
+        position: fixed;
+        bottom: 24px;
+        right: 24px;
+        z-index: 9998;
+        width: 40px;
+        height: 40px;
+        border: none;
+        border-radius: 50%;
+        background: #0052CC;
+        color: #fff;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        font-size: 18px;
+        font-weight: 700;
+        line-height: 1;
+        cursor: pointer;
+        box-shadow: 0 2px 8px rgba(9, 30, 66, 0.30);
+        transition: transform 120ms ease-out, background 120ms ease-out;
+      }
+      #${HOWTO_BUTTON_ID}:hover {
+        background: #0747A6;
+        transform: translateY(-1px);
+      }
+      #${HOWTO_BUTTON_ID}:focus {
+        outline: 2px solid #4C9AFF;
+        outline-offset: 2px;
+      }
+      /* Full-screen backdrop — catches clicks outside the card so the tour
+       * can't be accidentally dismissed by clicking through to the app. */
+      #${HOWTO_OVERLAY_ID} {
+        position: fixed;
+        inset: 0;
+        z-index: 9999;
+        background: rgba(9, 30, 66, 0.55);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        color: #172B4D;
+      }
+      /* Spotlight ring positioned over the currently-highlighted target.
+       * The huge box-shadow darkens everything outside the ring without a
+       * second DOM element; pointer-events:none lets the ring sit on top
+       * without eating clicks. */
+      #${HOWTO_OVERLAY_ID} .momentum-howto__spotlight {
+        position: fixed;
+        border: 2px solid #FFAB00;
+        border-radius: 6px;
+        box-shadow: 0 0 0 9999px rgba(9, 30, 66, 0.55);
+        pointer-events: none;
+        transition: top 180ms ease-out, left 180ms ease-out,
+                    width 180ms ease-out, height 180ms ease-out;
+      }
+      /* Step card — centered by default, repositioned near the spotlight
+       * when a target exists. */
+      #${HOWTO_OVERLAY_ID} .momentum-howto__card {
+        position: fixed;
+        width: 340px;
+        max-width: calc(100vw - 32px);
+        padding: 16px 20px 14px;
+        background: #fff;
+        border-radius: 8px;
+        box-shadow: 0 8px 32px rgba(9, 30, 66, 0.35);
+        box-sizing: border-box;
+      }
+      #${HOWTO_OVERLAY_ID} .momentum-howto__card[data-placement="center"] {
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+      }
+      #${HOWTO_OVERLAY_ID} .momentum-howto__step {
+        margin: 0 0 4px;
+        font-size: 11px;
+        font-weight: 600;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: #6B778C;
+      }
+      #${HOWTO_OVERLAY_ID} .momentum-howto__title {
+        margin: 0 0 8px;
+        font-size: 16px;
+        font-weight: 700;
+        color: #172B4D;
+      }
+      #${HOWTO_OVERLAY_ID} .momentum-howto__body {
+        margin: 0 0 16px;
+        font-size: 13px;
+        line-height: 1.5;
+        color: #42526E;
+      }
+      #${HOWTO_OVERLAY_ID} .momentum-howto__actions {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+      }
+      #${HOWTO_OVERLAY_ID} .momentum-howto__actions-right {
+        display: flex;
+        gap: 8px;
+      }
+      #${HOWTO_OVERLAY_ID} .momentum-howto__btn {
+        padding: 6px 14px;
+        border: none;
+        border-radius: 4px;
+        font-size: 13px;
+        font-weight: 500;
+        cursor: pointer;
+        font-family: inherit;
+      }
+      #${HOWTO_OVERLAY_ID} .momentum-howto__btn--skip {
+        background: transparent;
+        color: #6B778C;
+      }
+      #${HOWTO_OVERLAY_ID} .momentum-howto__btn--skip:hover {
+        background: #F4F5F7;
+        color: #172B4D;
+      }
+      #${HOWTO_OVERLAY_ID} .momentum-howto__btn--secondary {
+        background: #F4F5F7;
+        color: #42526E;
+      }
+      #${HOWTO_OVERLAY_ID} .momentum-howto__btn--secondary:hover {
+        background: #DFE1E6;
+      }
+      #${HOWTO_OVERLAY_ID} .momentum-howto__btn--primary {
+        background: #0052CC;
+        color: #fff;
+      }
+      #${HOWTO_OVERLAY_ID} .momentum-howto__btn--primary:hover {
+        background: #0747A6;
+      }
+      #${HOWTO_OVERLAY_ID} .momentum-howto__btn:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+      #${HOWTO_OVERLAY_ID} .momentum-howto__missing {
+        margin: 0 0 16px;
+        padding: 8px 10px;
+        background: #FFFAE6;
+        border-left: 3px solid #FFAB00;
+        border-radius: 2px;
+        font-size: 12px;
+        color: #42526E;
+      }
     `;
     document.head.appendChild(style);
   }
@@ -1627,6 +1776,357 @@
   })();
 
   // ---------------------------------------------------------------------------
+  // howto — guided "How-to" tour that spotlights each feature one by one.
+  //
+  // Step model: each step has an id, a localized title/body, and a
+  // `findTarget()` callback that returns the DOM element to highlight (or
+  // null if the feature isn't currently in view — e.g. the user is looking
+  // at the top of the plan where no sprint chips are visible yet). When a
+  // step has no target, the card is shown centered with a gentle "feature
+  // not in view" hint; Skip / Previous / Next still work so the tour never
+  // gets stuck.
+  //
+  // Persistence: the first time a user lands on a timeline-like page we
+  // auto-launch the tour. Once they see it all the way through OR skip it
+  // we persist `${HOWTO_SEEN_KEY}=1` so we don't nag them again. They can
+  // always re-open it via the "?" floating button.
+  // ---------------------------------------------------------------------------
+
+  const howto = (() => {
+    const STEPS = [
+      {
+        id: 'intro',
+        title: 'Bienvenue sur Momentum-Light',
+        body:
+          'Découvrez en quelques étapes les 4 features qui augmentent votre ' +
+          'Timeline JIRA. Utilisez « Suivant » pour avancer ou « Passer » pour fermer.',
+        findTarget: () => null,
+      },
+      {
+        id: 'epic-progress',
+        title: '1. Epic Progress Bar',
+        body:
+          'Chaque Epic de la Timeline affiche une barre de progression calculée ' +
+          'sur Σ SP done / Σ SP total de ses tickets enfants. Les chiffres sont ' +
+          'mis en cache pendant 60 s pour rester réactifs.',
+        findTarget: () =>
+          document.querySelector(
+            `.${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})`,
+          ),
+        missingHint:
+          'Aucune barre d\'Epic n\'est visible à l\'écran. Scrollez jusqu\'à un Epic, puis relancez le tour.',
+      },
+      {
+        id: 'ticket-estimate',
+        title: '2. Ticket Estimate',
+        body:
+          'Sous les Epics, chaque barre de ticket affiche son chiffrage en Story ' +
+          'Points, centré pour rester lisible quelle que soit la largeur de la barre.',
+        findTarget: () => document.querySelector(`.${OVERLAY_ESTIMATE_MOD}`),
+        missingHint:
+          'Aucun ticket chiffré n\'est visible. Dépliez un Epic pour voir ses tickets enfants.',
+      },
+      {
+        id: 'sprint-velocity',
+        title: '3. Sprint Velocity',
+        body:
+          'La chip en haut de la Timeline affiche la vélocité moyenne des 5 derniers ' +
+          'sprints clos (calculée comme dans l\'UI Backlog). Cliquez dessus pour ' +
+          'rafraîchir à la demande.',
+        findTarget: () =>
+          document.querySelector(
+            `#${VELOCITY_BANNER_ID} .momentum-velocity-banner__chip`,
+          ),
+        missingHint:
+          'La chip de vélocité n\'est pas encore chargée — réessayez dans quelques secondes.',
+      },
+      {
+        id: 'sprint-fill',
+        title: '4. Sprint Fill Indicator',
+        body:
+          'Chaque chip de sprint actif/futur affiche une barre de remplissage ' +
+          'comparée à la vélocité moyenne : vert < 90 %, ambre 90–110 %, rouge > 110 %. ' +
+          'Survolez une chip pour voir les SP exacts dans la tooltip.',
+        findTarget: () => document.querySelector(`.${OVERLAY_SPRINT_FILL_MOD}`),
+        missingHint:
+          'Aucune chip de sprint actif/futur n\'est visible sur la ligne « Sprints ».',
+      },
+    ];
+
+    let currentIndex = 0;
+    let reflowHandler = null;
+
+    function hasBeenSeen() {
+      try {
+        return localStorage.getItem(HOWTO_SEEN_KEY) === '1';
+      } catch (_) {
+        return false;
+      }
+    }
+
+    function markSeen() {
+      try {
+        localStorage.setItem(HOWTO_SEEN_KEY, '1');
+      } catch (_) { /* private mode, incognito — ignore */ }
+    }
+
+    // Floating "?" button ----------------------------------------------------
+
+    function ensureButton() {
+      let btn = document.getElementById(HOWTO_BUTTON_ID);
+      if (btn && btn.isConnected) return btn;
+      btn = document.createElement('button');
+      btn.id = HOWTO_BUTTON_ID;
+      btn.type = 'button';
+      btn.setAttribute('aria-label', 'Ouvrir le guide Momentum-Light');
+      btn.title = 'Guide Momentum-Light — voir les features';
+      btn.textContent = '?';
+      btn.addEventListener('click', () => start());
+      document.body.appendChild(btn);
+      return btn;
+    }
+
+    function removeButton() {
+      const btn = document.getElementById(HOWTO_BUTTON_ID);
+      if (btn) btn.remove();
+    }
+
+    // Tour lifecycle ---------------------------------------------------------
+
+    function start() {
+      currentIndex = 0;
+      render();
+    }
+
+    function end({ completed = false } = {}) {
+      const overlay = document.getElementById(HOWTO_OVERLAY_ID);
+      if (overlay) overlay.remove();
+      if (reflowHandler) {
+        window.removeEventListener('resize', reflowHandler);
+        window.removeEventListener('scroll', reflowHandler, true);
+        reflowHandler = null;
+      }
+      if (completed) markSeen();
+    }
+
+    function next() {
+      if (currentIndex >= STEPS.length - 1) {
+        end({ completed: true });
+        return;
+      }
+      currentIndex += 1;
+      render();
+    }
+
+    function prev() {
+      if (currentIndex <= 0) return;
+      currentIndex -= 1;
+      render();
+    }
+
+    function skip() {
+      end({ completed: true });
+    }
+
+    // Rendering --------------------------------------------------------------
+
+    function buildOverlay() {
+      const overlay = document.createElement('div');
+      overlay.id = HOWTO_OVERLAY_ID;
+      overlay.setAttribute('role', 'dialog');
+      overlay.setAttribute('aria-modal', 'true');
+      overlay.setAttribute('aria-label', 'Guide Momentum-Light');
+      // Click on the backdrop (not on the card) closes the tour. We detect
+      // this by checking the event target is the overlay itself.
+      overlay.addEventListener('click', (e) => {
+        if (e.target === overlay) skip();
+      });
+      return overlay;
+    }
+
+    function render() {
+      const step = STEPS[currentIndex];
+      if (!step) {
+        end({ completed: true });
+        return;
+      }
+
+      let overlay = document.getElementById(HOWTO_OVERLAY_ID);
+      if (!overlay) {
+        overlay = buildOverlay();
+        document.body.appendChild(overlay);
+      }
+      overlay.innerHTML = '';
+
+      const target = step.findTarget ? step.findTarget() : null;
+
+      // Spotlight ring (only when we actually have a target in view).
+      if (target instanceof Element) {
+        const rect = target.getBoundingClientRect();
+        // Edge case: element is detached or zero-sized (rare but possible
+        // mid-mutation). Treat as "no target" so we still show the card.
+        if (rect.width > 0 && rect.height > 0) {
+          const spotlight = document.createElement('div');
+          spotlight.className = 'momentum-howto__spotlight';
+          const pad = 6;
+          spotlight.style.top = `${rect.top - pad}px`;
+          spotlight.style.left = `${rect.left - pad}px`;
+          spotlight.style.width = `${rect.width + pad * 2}px`;
+          spotlight.style.height = `${rect.height + pad * 2}px`;
+          overlay.appendChild(spotlight);
+          // Bring the target into view if it's offscreen (e.g. sprint chips
+          // scrolled below the fold).
+          try {
+            if (rect.bottom < 0 || rect.top > window.innerHeight) {
+              target.scrollIntoView({ block: 'center', behavior: 'smooth' });
+            }
+          } catch (_) { /* old browsers — ignore */ }
+        }
+      }
+
+      // Step card.
+      const card = document.createElement('div');
+      card.className = 'momentum-howto__card';
+
+      const targetRect =
+        target instanceof Element ? target.getBoundingClientRect() : null;
+      const hasVisibleTarget =
+        targetRect && targetRect.width > 0 && targetRect.height > 0;
+
+      if (hasVisibleTarget) {
+        positionCardNearTarget(card, targetRect);
+      } else {
+        card.dataset.placement = 'center';
+      }
+
+      const stepLabel = document.createElement('p');
+      stepLabel.className = 'momentum-howto__step';
+      stepLabel.textContent = `Étape ${currentIndex + 1} sur ${STEPS.length}`;
+      card.appendChild(stepLabel);
+
+      const title = document.createElement('h2');
+      title.className = 'momentum-howto__title';
+      title.textContent = step.title;
+      card.appendChild(title);
+
+      const body = document.createElement('p');
+      body.className = 'momentum-howto__body';
+      body.textContent = step.body;
+      card.appendChild(body);
+
+      // Only surface the "missing target" hint when the step actually points
+      // to a feature we couldn't find (intro step has no findTarget).
+      if (step.findTarget && !hasVisibleTarget && step.missingHint) {
+        const hint = document.createElement('p');
+        hint.className = 'momentum-howto__missing';
+        hint.textContent = step.missingHint;
+        card.appendChild(hint);
+      }
+
+      const actions = document.createElement('div');
+      actions.className = 'momentum-howto__actions';
+
+      const skipBtn = document.createElement('button');
+      skipBtn.type = 'button';
+      skipBtn.className = 'momentum-howto__btn momentum-howto__btn--skip';
+      skipBtn.textContent = 'Passer';
+      skipBtn.addEventListener('click', skip);
+      actions.appendChild(skipBtn);
+
+      const rightActions = document.createElement('div');
+      rightActions.className = 'momentum-howto__actions-right';
+
+      const prevBtn = document.createElement('button');
+      prevBtn.type = 'button';
+      prevBtn.className = 'momentum-howto__btn momentum-howto__btn--secondary';
+      prevBtn.textContent = 'Précédent';
+      prevBtn.disabled = currentIndex === 0;
+      prevBtn.addEventListener('click', prev);
+      rightActions.appendChild(prevBtn);
+
+      const nextBtn = document.createElement('button');
+      nextBtn.type = 'button';
+      nextBtn.className = 'momentum-howto__btn momentum-howto__btn--primary';
+      nextBtn.textContent =
+        currentIndex === STEPS.length - 1 ? 'Terminer' : 'Suivant';
+      nextBtn.addEventListener('click', next);
+      rightActions.appendChild(nextBtn);
+
+      actions.appendChild(rightActions);
+      card.appendChild(actions);
+      overlay.appendChild(card);
+
+      // Re-render on resize / scroll so the spotlight tracks the target.
+      // We debounce via requestAnimationFrame to avoid layout thrash on
+      // fast scroll.
+      if (!reflowHandler) {
+        let scheduled = false;
+        reflowHandler = () => {
+          if (scheduled) return;
+          scheduled = true;
+          requestAnimationFrame(() => {
+            scheduled = false;
+            // Only re-render if the overlay is still mounted.
+            if (document.getElementById(HOWTO_OVERLAY_ID)) render();
+          });
+        };
+        window.addEventListener('resize', reflowHandler);
+        window.addEventListener('scroll', reflowHandler, true);
+      }
+    }
+
+    // Position the card adjacent to the target rect. Prefer right-of,
+    // fall back to below, then above, then left-of, then centered. Keep
+    // a margin from the viewport edges.
+    function positionCardNearTarget(card, rect) {
+      const MARGIN = 16;
+      const CARD_W = 340;
+      const CARD_H = 200; // conservative estimate — actual height is content-driven
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+
+      // Try right of target.
+      if (rect.right + MARGIN + CARD_W <= vw - MARGIN) {
+        card.style.left = `${rect.right + MARGIN}px`;
+        card.style.top = `${clamp(rect.top, MARGIN, vh - CARD_H - MARGIN)}px`;
+        return;
+      }
+      // Try below.
+      if (rect.bottom + MARGIN + CARD_H <= vh - MARGIN) {
+        card.style.top = `${rect.bottom + MARGIN}px`;
+        card.style.left = `${clamp(rect.left, MARGIN, vw - CARD_W - MARGIN)}px`;
+        return;
+      }
+      // Try above.
+      if (rect.top - MARGIN - CARD_H >= MARGIN) {
+        card.style.top = `${rect.top - CARD_H - MARGIN}px`;
+        card.style.left = `${clamp(rect.left, MARGIN, vw - CARD_W - MARGIN)}px`;
+        return;
+      }
+      // Try left of target.
+      if (rect.left - MARGIN - CARD_W >= MARGIN) {
+        card.style.left = `${rect.left - CARD_W - MARGIN}px`;
+        card.style.top = `${clamp(rect.top, MARGIN, vh - CARD_H - MARGIN)}px`;
+        return;
+      }
+      // Give up and center it.
+      card.dataset.placement = 'center';
+    }
+
+    function clamp(v, min, max) {
+      return Math.max(min, Math.min(max, v));
+    }
+
+    return {
+      ensureButton,
+      removeButton,
+      start,
+      end,
+      hasBeenSeen,
+    };
+  })();
+
+  // ---------------------------------------------------------------------------
   // Feature registry — add future Momentum features here
   // ---------------------------------------------------------------------------
 
@@ -1731,6 +2231,32 @@
         } else if (matched > 0) {
           this._warnedZeroMatch = false;
         }
+      },
+    },
+    {
+      id: 'howto-menu',
+      description:
+        'Floating "?" button + guided tour that spotlights each Momentum-Light feature ' +
+        'step by step, with Skip / Previous / Next controls. Auto-launches once per ' +
+        'browser (localStorage) so new users discover the tool without surprise.',
+      isActive: isTimelineLikePath,
+      _autoLaunched: false,
+      onMutation() {
+        howto.ensureButton();
+        // Auto-launch once per browser, only if the user hasn't seen it yet
+        // and no tour is already open. We defer via setTimeout so the
+        // features around us have a chance to paint first — spotlighting
+        // them immediately wouldn't work if they haven't rendered yet.
+        if (!this._autoLaunched && !howto.hasBeenSeen()) {
+          this._autoLaunched = true;
+          setTimeout(() => {
+            if (!document.getElementById(HOWTO_OVERLAY_ID)) howto.start();
+          }, 1500);
+        }
+      },
+      onInactive() {
+        howto.end();
+        howto.removeButton();
       },
     },
   ];
@@ -2261,7 +2787,7 @@
     // Initial pass (in case the timeline is already rendered at document-idle).
     runActiveFeatures();
     log(
-      'loaded — version 0.3.10',
+      'loaded — version 0.4.0',
       isDebug()
         ? '(debug on)'
         : '(debug off — enable with: localStorage.setItem(\'momentum-light-debug\', \'1\'))',

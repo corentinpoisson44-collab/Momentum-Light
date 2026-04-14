@@ -24,6 +24,7 @@ Les mises à jour sont poussées automatiquement (Tampermonkey vérifie le `@upd
 | 2 | **Ticket Estimate** — sous les Epics, chaque barre de ticket affiche son chiffrage (centré) en Story Points. | ✅ v0.2.1 |
 | 3 | **Sprint Velocity** — chip intégrée dans le toolbar de la Timeline, affichant la vélocité moyenne des 5 derniers sprints clos. | ✅ v0.2.1 |
 | 4 | **Sprint Fill Indicator** — barre de remplissage dans chaque chip de sprint actif/futur de la ligne « Sprints », comparant le SP chargé à la vélocité moyenne (vert < 90 %, ambre 90–110 %, rouge > 110 %). | ✅ v0.3.0 |
+| 5 | **How-to Menu** — bouton flottant `?` qui lance une visite guidée surlignant chaque feature, étape par étape, avec boutons _Précédent_ / _Suivant_ / _Passer_. Auto-lancé au premier chargement d'une Timeline, puis accessible à tout moment via le bouton. | ✅ v0.4.0 |
 
 ### Configuration
 
@@ -32,6 +33,7 @@ Les mises à jour sont poussées automatiquement (Tampermonkey vérifie le `@upd
   localStorage.setItem('momentum-light::velocity-board-id', '123')
   ```
 - **Debug** : `localStorage.setItem('momentum-light-debug', '1')` dans la console du navigateur.
+- **Relancer le guide How-to** : cliquez sur le bouton flottant `?` en bas à droite, ou exécutez `localStorage.removeItem('momentum-light::howto-seen')` puis rechargez la page pour forcer l'auto-lancement.
 
 ## Développement
 
@@ -47,6 +49,7 @@ Structure interne :
 - `timelineDom` — détection des barres, extraction de l'issue key, injection des overlays (progression Epic ou chiffrage ticket)
 - `sprintChipDom` — détection des chips de sprint dans la ligne « Sprints » + injection d'un overlay de remplissage coloré
 - `velocityBanner` — bandeau fixe sur les vues timeline/plan
+- `howto` — bouton flottant `?` + overlay de visite guidée (spotlight + carte étape par étape, navigable via _Précédent_ / _Suivant_ / _Passer_, auto-lancée une fois par navigateur)
 - `features[]` — registre des features, avec cycle de vie `onMutation` / `onInactive`
 
 ## Licence
