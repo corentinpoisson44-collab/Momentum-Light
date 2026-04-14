@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.4.2
+// @version      0.4.3
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne, et menu « How-to » guidé qui surligne chaque feature au premier lancement.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -866,24 +866,28 @@
         display: none;
       }
       /* Sprint-fill variant: a full-height translucent wash that covers the
-         chip background, so the fill level reads at a glance across the
-         whole button while the chip's own text ("FHSBFF Sprint 53…") stays
-         fully legible. A saturated 2px accent strip along the bottom edge
+         chip's body, so the fill level reads at a glance across the whole
+         button while the chip's own text ("FHSBFF Sprint 53…") stays fully
+         legible. A saturated 2px accent strip along the bottom edge
          preserves the strong state-color cue (green / amber / red). The
          numeric label lives in the tooltip, not inside the chip.
 
-         The right-edge inset matters: the chip's border box is a plain
-         rectangle but its visible shape is a flag with a pointed right
-         tip drawn by a pseudo/SVG element inset a few px from the edge.
-         Without the inset, our rectangular overlay bleeds past the tip
-         and a sliver of colored wash sticks out beyond the chip. 8px of
-         breathing room keeps the overlay inside the visible body on the
-         typical Jira Plans timeline chip. clip-path:inherit is a belt-
-         and-suspenders: no-op when the chip has none, else respects it. */
+         Alignment matters. The Jira timeline sprint chip is a flex row:
+           <button>
+             <div> body with rounded-left radius + sprint name </div>
+             <div> 7px SVG flag tip </div>
+           </button>
+         Our overlay sits at inset:0 by default, which fills the ENTIRE
+         button border-box including the 7px tip area — that's why the
+         colored wash used to bleed past the chip's visible right edge.
+         We anchor the overlay to the body's exact bounds: stop 7px short
+         of the button's right edge, and mirror the body's rounded-left-
+         only border-radius (var(--ds-radius-small) token from Atlaskit
+         — the same one the chip body uses inline) so the overlay's
+         corners line up with the chip's visible shape. */
       .${OVERLAY_SPRINT_FILL_MOD} {
-        right: 8px;
-        border-radius: inherit;
-        clip-path: inherit;
+        right: 7px;
+        border-radius: var(--ds-radius-small, 3px) 0 0 var(--ds-radius-small, 3px);
         background-color: transparent;
       }
       .${OVERLAY_SPRINT_FILL_MOD} .${OVERLAY_FILL_CLASS} {
