@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.5.3
+// @version      0.5.4
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne, et menu « How-to » guidé qui surligne chaque feature au premier lancement.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -899,6 +899,10 @@
         overflow: hidden;
         white-space: nowrap;
         text-overflow: ellipsis;
+        /* Keep the SP label above the confidence wash (::before) and the
+           hatch (::after) — the text must stay crisp and full-opacity
+           even when the rest of the bar is faded. */
+        z-index: 2;
       }
       /* Ticket variant: no fill, label keeps the default centered alignment
          inherited from .momentum-progress__label (flex center + padding).
@@ -935,20 +939,34 @@
       /* Confidence treatment on Epic bars — reflects the ETA confidence
          score (done/inProgress/todo/unestimated weighted blend). Two
          orthogonal signals stack:
-           1. Diagonal hatch pattern, painted via a ::after pseudo-element
-              stretched across the entire overlay (filled + unfilled
-              portions). Low and medium share the same hatch.
-           2. Opacity applied to the host bar via inline style (see
-              applyProgress). Opacity on the BAR (not just our overlay)
-              fades the native JIRA-rendered color too — otherwise the
-              "uncertainty" cue would only affect our subtle multiply
-              fill and read as no visible change.
+           1. ::before wash — translucent white layer that lightens the
+              native bar color (more white = lower confidence). Sits
+              BELOW the SP label (label uses z-index: 2) so the text
+              stays crisp and full-opacity even when the bar is faded.
+              We do NOT fade via CSS opacity on the host element, because
+              opacity cascades to descendants and would wash out the label
+              text too.
+           2. ::after hatch — diagonal stripes across the full overlay,
+              reinforcing the "uncertainty" read. Low and medium share
+              the same hatch.
 
-         The ::after rule is guarded against the ticket-estimate and
-         sprint-fill variants, which already have their own visual
-         language and should not pick up the hatch pattern. The bar-
-         opacity treatment is lifecycle-managed by applyProgress /
-         applyEstimate / removeOverlay. */
+         Both pseudo-elements are guarded against the ticket-estimate
+         and sprint-fill variants, which have their own visual language. */
+      .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="medium"]::before,
+      .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="low"]::before {
+        content: '';
+        position: absolute;
+        inset: 0;
+        pointer-events: none;
+        border-radius: inherit;
+        z-index: 0;
+      }
+      .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="medium"]::before {
+        background-color: rgba(255, 255, 255, 0.30);
+      }
+      .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="low"]::before {
+        background-color: rgba(255, 255, 255, 0.60);
+      }
       .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="medium"]::after,
       .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="low"]::after {
         content: '';
@@ -956,6 +974,7 @@
         inset: 0;
         pointer-events: none;
         border-radius: inherit;
+        z-index: 1;
         background-image: repeating-linear-gradient(
           45deg,
           transparent 0,
@@ -1494,32 +1513,21 @@
       return 'high';
     }
 
-    // Opacity is applied to the PARENT of our overlay anchor. JIRA renders
-    // the colored bar on `bar.parentElement` — the element matched by our
-    // chart-item-content selector is just the content layer (icons, link
-    // dots, our overlay) stacked on top. Setting opacity on the content
-    // layer only faded the overlay; we want the native bar color to fade
-    // too, so we target the parent.
+    // Confidence fade is now driven purely by the CSS ::before wash on the
+    // overlay, gated by [data-confidence] — no JS-side opacity writes on
+    // the bar or its parent. The wash paints a translucent white layer
+    // below the SP label so the colored bar fades while the label stays
+    // crisp (opacity on an ancestor would cascade to the label text).
     //
-    // Our known values are tracked so we can restore cleanly without
-    // clobbering any inline opacity JIRA may have set for its own reasons.
+    // This tracker lets us clean up opacity values written by older
+    // versions (v0.5.2 on `bar`, v0.5.3 on `bar.parentElement`) in case
+    // they survived a page-reload during a script upgrade.
     const OUR_BAR_OPACITIES = new Set(['0.4', '0.75']);
 
-    function applyBarConfidence(bar, tier) {
-      const parent = bar.parentElement;
-      if (!parent) return;
-      if (tier === 'low') {
-        parent.style.opacity = '0.4';
-      } else if (tier === 'medium') {
-        parent.style.opacity = '0.75';
-      } else if (OUR_BAR_OPACITIES.has(parent.style.opacity)) {
-        // tier === 'high' → clear, but only if the current value is ours.
-        parent.style.opacity = '';
-      }
-      // Legacy cleanup: v0.5.2 set opacity on `bar` itself (which only
-      // faded our overlay). Strip that so the new parent-level treatment
-      // isn't compounded by a stale child-level one.
-      if (OUR_BAR_OPACITIES.has(bar.style.opacity)) bar.style.opacity = '';
+    function applyBarConfidence(bar /* , tier */) {
+      // No-op on the host DOM — the wash handles it. Only strip legacy
+      // opacities we may have written in earlier versions.
+      resetBarConfidence(bar);
     }
 
     function resetBarConfidence(bar) {
@@ -2064,9 +2072,9 @@
           '(×0.6) et todo (×0.15) puis divise par le nombre total de tickets ' +
           'enfants comptés — les tickets sans chiffrage tirent le score vers ' +
           'le bas. Une confiance faible est signalée par un hachuré diagonal ' +
-          'et une opacité réduite sur toute la barre ; un badge amber ' +
-          '« ⚠ N » apparaît à droite quand N tickets enfants sont encore ' +
-          'sans chiffrage.',
+          'et une atténuation de la couleur de la barre (le label « X / Y SP » ' +
+          'reste lisible) ; un badge amber « ⚠ N » apparaît à droite quand ' +
+          'N tickets enfants sont encore sans chiffrage.',
         findTarget: () =>
           document.querySelector(
             `.${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})`,
