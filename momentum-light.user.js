@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.5.6
+// @version      0.5.7
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne, et menu « How-to » guidé qui surligne chaque feature au premier lancement.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -34,6 +34,7 @@
   const OVERLAY_ESTIMATE_MOD = 'momentum-progress--estimate';
   const OVERLAY_SPRINT_FILL_MOD = 'momentum-progress--sprint-fill';
   const VELOCITY_BANNER_ID = 'momentum-velocity-banner';
+  const CONFIDENCE_LEGEND_CLASS = 'momentum-confidence-legend';
   const HOWTO_BUTTON_ID = 'momentum-howto-button';
   const HOWTO_OVERLAY_ID = 'momentum-howto-overlay';
   const HOWTO_SEEN_KEY = 'momentum-light::howto-seen';
@@ -258,7 +259,11 @@
       try {
         const spFieldId = await storyPointsField.resolve();
         const jql = `key in (${keys.map((k) => `"${k}"`).join(',')})`;
-        const data = await jiraApi.searchIssues(jql, [spFieldId, 'issuetype'], keys.length);
+        const data = await jiraApi.searchIssues(
+          jql,
+          [spFieldId, 'issuetype', 'status'],
+          keys.length,
+        );
         const results = new Map();
         for (const issue of data.issues || []) {
           const sp = Number(issue.fields?.[spFieldId]);
@@ -266,14 +271,23 @@
           const hierarchy = Number(issue.fields?.issuetype?.hierarchyLevel);
           // "Epic" by name OR hierarchyLevel >= 1 (covers custom hierarchies).
           const isEpic = /epic/i.test(typeName) || (Number.isFinite(hierarchy) && hierarchy >= 1);
+          // statusCategory key ∈ {'new' (≈ Open/To Do/Discovery),
+          // 'indeterminate' (≈ In Progress), 'done'}. Used downstream to
+          // restrict the confidence hatch to Epics still in discovery.
+          const statusCategory = issue.fields?.status?.statusCategory?.key || null;
           results.set(issue.key, {
             isEpic,
             storyPoints: Number.isFinite(sp) ? sp : null,
+            statusCategory,
           });
         }
         const expiresAt = Date.now() + ISSUE_TTL_MS;
         for (const key of keys) {
-          const value = results.get(key) || { isEpic: false, storyPoints: null };
+          const value = results.get(key) || {
+            isEpic: false,
+            storyPoints: null,
+            statusCategory: null,
+          };
           cache.set(key, { expiresAt, value });
           const ws = waiters.get(key) || [];
           waiters.delete(key);
@@ -1028,6 +1042,8 @@
         z-index: 100;
         display: flex;
         justify-content: flex-end;
+        align-items: center;
+        gap: 8px;
         box-sizing: border-box;
         width: 100%;
         margin: 0;
@@ -1075,6 +1091,74 @@
       #${VELOCITY_BANNER_ID}[data-state="error"] .momentum-velocity-banner__chip {
         background: #F4F5F7;
         color: #6B778C;
+      }
+
+      /* Confidence legend — compact reference chip that lives inside the
+         sticky velocity banner. Shows the three confidence tiers with
+         swatches whose visual treatment mirrors the actual Epic bars
+         (low wash + hatch / medium wash + hatch / plain), plus the
+         "(Open)" qualifier to remind readers that the hatch only lights
+         up during the Discovery phase. Non-interactive — purely a
+         reference, so no hover affordance. */
+      .${CONFIDENCE_LEGEND_CLASS} {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 10px;
+        border-radius: 14px;
+        background: #F4F5F7;
+        color: #42526E;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        font-size: 11px;
+        line-height: 1.3;
+        user-select: none;
+        white-space: nowrap;
+        pointer-events: auto;
+        box-shadow: 0 1px 2px rgba(9, 30, 66, 0.12);
+      }
+      .${CONFIDENCE_LEGEND_CLASS}__title {
+        font-weight: 600;
+        color: #172B4D;
+      }
+      .${CONFIDENCE_LEGEND_CLASS}__item {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+      }
+      .${CONFIDENCE_LEGEND_CLASS}__swatch {
+        position: relative;
+        display: inline-block;
+        width: 22px;
+        height: 10px;
+        border-radius: 2px;
+        /* Base color mirrors a typical JIRA epic bar (Atlaskit purple). */
+        background-color: #6554C0;
+        overflow: hidden;
+      }
+      .${CONFIDENCE_LEGEND_CLASS}__swatch[data-tier="medium"]::before,
+      .${CONFIDENCE_LEGEND_CLASS}__swatch[data-tier="low"]::before {
+        content: '';
+        position: absolute;
+        inset: 0;
+      }
+      .${CONFIDENCE_LEGEND_CLASS}__swatch[data-tier="medium"]::before {
+        background-color: rgba(255, 255, 255, 0.30);
+      }
+      .${CONFIDENCE_LEGEND_CLASS}__swatch[data-tier="low"]::before {
+        background-color: rgba(255, 255, 255, 0.60);
+      }
+      .${CONFIDENCE_LEGEND_CLASS}__swatch[data-tier="medium"]::after,
+      .${CONFIDENCE_LEGEND_CLASS}__swatch[data-tier="low"]::after {
+        content: '';
+        position: absolute;
+        inset: 0;
+        background-image: repeating-linear-gradient(
+          45deg,
+          transparent 0,
+          transparent 3px,
+          rgba(255, 255, 255, 0.35) 3px,
+          rgba(255, 255, 255, 0.35) 6px
+        );
       }
 
       /* ---------------------------------------------------------------------
@@ -1497,7 +1581,10 @@
       if (OUR_BAR_OPACITIES.has(bar.style.opacity)) bar.style.opacity = '';
     }
 
-    function applyProgress(bar, { done, total, epicKey, childStats, confidence }) {
+    function applyProgress(
+      bar,
+      { done, total, epicKey, childStats, confidence, statusCategory },
+    ) {
       const stats = childStats || { done: 0, inProgress: 0, todo: 0, unestimated: 0, totalChildren: 0 };
       // No children at all → nothing to visualize. Matches legacy behavior.
       if (stats.totalChildren === 0 && (!total || total <= 0)) {
@@ -1509,11 +1596,23 @@
       const pctStr = `${pct.toFixed(1)}%`;
       const conf = Number.isFinite(confidence) ? confidence : 0;
       const tier = confidenceTier(conf);
+      // Confidence hatch is reserved for Epics still in discovery
+      // (statusCategory 'new' — i.e. Open, To Do, Backlog, Discovery…).
+      // Once an Epic moves to In Progress or Done, its low confidence
+      // stops being actionable information — the team is already
+      // executing, so hatching it only adds visual noise. The tooltip
+      // still reports the raw confidence for reference.
+      const showHatch = statusCategory === 'new' && tier !== 'high';
 
       const overlay = ensureOverlay(bar);
       overlay.classList.remove(OVERLAY_ESTIMATE_MOD);
-      overlay.dataset.confidence = tier;
-      applyBarConfidence(bar, tier);
+      if (showHatch) {
+        overlay.dataset.confidence = tier;
+        applyBarConfidence(bar, tier);
+      } else {
+        delete overlay.dataset.confidence;
+        resetBarConfidence(bar);
+      }
       const fill = overlay.querySelector(`.${OVERLAY_FILL_CLASS}`);
       const label = overlay.querySelector(`.${OVERLAY_LABEL_CLASS}`);
       if (fill) fill.style.width = pctStr;
@@ -1528,7 +1627,8 @@
       // Tooltip text — the interceptor (installed at bootstrap) will rewrite
       // JIRA's Atlaskit tooltip with this value when it appears on hover.
       // aria-label and title are set as accessibility/fallback hints.
-      const confidenceLine = `Confiance : ${conf.toFixed(0)}% (${tier})`;
+      const tierLabel = showHatch ? `${tier} · Discovery` : tier;
+      const confidenceLine = `Confiance : ${conf.toFixed(0)}% (${tierLabel})`;
       const breakdownParts = [];
       if (stats.done) breakdownParts.push(`${stats.done} done`);
       if (stats.inProgress) breakdownParts.push(`${stats.inProgress} en cours`);
@@ -1587,10 +1687,18 @@
         if (isDebug() && !isRefresh) {
           debug(
             `${issueKey} (epic): ${done}/${total} SP, confidence=${Math.round(confidence)}%, ` +
-            `unestimated=${childStats?.unestimated ?? 0}/${childStats?.totalChildren ?? 0}`,
+            `unestimated=${childStats?.unestimated ?? 0}/${childStats?.totalChildren ?? 0}, ` +
+            `statusCategory=${meta.statusCategory ?? '—'}`,
           );
         }
-        applyProgress(bar, { done, total, epicKey: issueKey, childStats, confidence });
+        applyProgress(bar, {
+          done,
+          total,
+          epicKey: issueKey,
+          childStats,
+          confidence,
+          statusCategory: meta.statusCategory,
+        });
       } else {
         if (isDebug() && !isRefresh) debug(`${issueKey} (ticket): ${meta.storyPoints ?? '—'} SP`);
         applyEstimate(bar, { sp: meta.storyPoints, issueKey });
@@ -1908,10 +2016,38 @@
       return { el: document.body, mode: 'fixed' };
     }
 
+    function buildLegend() {
+      // Reference-only chip — mirrors the three confidence tier visuals
+      // (wash + hatch for low/medium, plain for high) so readers can
+      // decode an Epic bar at a glance. The "(Open)" qualifier calls
+      // out that the hatch only appears while the Epic is in discovery.
+      const legend = document.createElement('span');
+      legend.className = CONFIDENCE_LEGEND_CLASS;
+      legend.title =
+        'Hachurage des Epics en statut Open selon l\'indice de confiance :\n' +
+        '  • faible  (< 40 %)\n' +
+        '  • moyenne (40-70 %)\n' +
+        '  • haute   (≥ 70 %) — pas de hachurage\n' +
+        'Les Epics en cours / terminés ne sont jamais hachurés.';
+      legend.innerHTML =
+        `<span class="${CONFIDENCE_LEGEND_CLASS}__title">Confiance Epic (Open) :</span>` +
+        `<span class="${CONFIDENCE_LEGEND_CLASS}__item">` +
+          `<span class="${CONFIDENCE_LEGEND_CLASS}__swatch" data-tier="low"></span>faible` +
+        `</span>` +
+        `<span class="${CONFIDENCE_LEGEND_CLASS}__item">` +
+          `<span class="${CONFIDENCE_LEGEND_CLASS}__swatch" data-tier="medium"></span>moyenne` +
+        `</span>` +
+        `<span class="${CONFIDENCE_LEGEND_CLASS}__item">` +
+          `<span class="${CONFIDENCE_LEGEND_CLASS}__swatch" data-tier="high"></span>haute` +
+        `</span>`;
+      return legend;
+    }
+
     function build(mode) {
       const wrapper = document.createElement('div');
       wrapper.id = VELOCITY_BANNER_ID;
       wrapper.dataset.anchor = mode;
+      wrapper.appendChild(buildLegend());
       const chip = document.createElement('span');
       chip.className = 'momentum-velocity-banner__chip';
       chip.title = 'Cliquez pour rafraîchir';
@@ -2032,8 +2168,10 @@
           'tickets enfants comptés — les tickets sans chiffrage tirent le score ' +
           'vers le bas. Une confiance faible est signalée par un hachuré ' +
           'diagonal et une atténuation de la couleur de la barre (le label ' +
-          '« X / Y SP » reste lisible) ; un suffixe « (∅ N) » apparaît dans ' +
-          'le label quand N tickets enfants sont encore sans chiffrage.',
+          '« X / Y SP » reste lisible), uniquement sur les Epics encore en ' +
+          'statut « Open » (Discovery) — les Epics en cours ou terminés restent ' +
+          'unis. Un suffixe « (∅ N) » apparaît dans le label quand N tickets ' +
+          'enfants sont encore sans chiffrage.',
         findTarget: () =>
           document.querySelector(
             `.${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})`,
