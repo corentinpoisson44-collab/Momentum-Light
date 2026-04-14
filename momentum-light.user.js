@@ -1125,11 +1125,17 @@
         align-items: center;
         gap: 4px;
       }
+      /* Swatch dimensions are generous enough to render the same 5px/9px
+         diagonal hatch used on timeline Epic bars — this is the whole
+         point: the legend shows the *exact* treatment viewers will see
+         on the chart, not a stylized approximation. Base color, wash
+         opacities (0.60 / 0.30) and hatch parameters (5px transparent,
+         4px rgba(255,255,255,0.22)) mirror the Epic bar CSS above. */
       .${CONFIDENCE_LEGEND_CLASS}__swatch {
         position: relative;
         display: inline-block;
-        width: 22px;
-        height: 10px;
+        width: 40px;
+        height: 12px;
         border-radius: 2px;
         /* Base color mirrors a typical JIRA epic bar (Atlaskit purple). */
         background-color: #6554C0;
@@ -1155,9 +1161,9 @@
         background-image: repeating-linear-gradient(
           45deg,
           transparent 0,
-          transparent 3px,
-          rgba(255, 255, 255, 0.35) 3px,
-          rgba(255, 255, 255, 0.35) 6px
+          transparent 5px,
+          rgba(255, 255, 255, 0.22) 5px,
+          rgba(255, 255, 255, 0.22) 9px
         );
       }
 
