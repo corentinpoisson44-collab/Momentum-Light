@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.3.0
+// @version      0.3.1
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), et indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -41,18 +41,26 @@
   const warn = (...args) => console.warn(LOG_PREFIX, ...args);
   const error = (...args) => console.error(LOG_PREFIX, ...args);
 
-  // Rate-limited info-level logger for recurring signals we want visible
-  // regardless of debug mode (e.g. bar discovery counts). Deduplicates the
-  // same message so a quiet steady state doesn't spam the console.
+  // Rate-limited heartbeat logger. Suppressed entirely when debug mode is off
+  // (the steady-state mutation loop can emit the same signals tens of times
+  // per minute; useful for diagnosis but noisy for end users). In debug mode,
+  // each unique message fires at most once per 30 s so state changes still
+  // show through without flooding.
   const heartbeat = (() => {
-    let lastMsg = null;
-    let lastAt = 0;
+    const lastByMsg = new Map();
+    const TTL_MS = 30_000;
+    const MAX_KEYS = 40;
     return (...args) => {
+      if (!isDebug()) return;
       const msg = args.map((a) => (typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' ');
       const now = Date.now();
-      if (msg === lastMsg && now - lastAt < 5_000) return;
-      lastMsg = msg;
-      lastAt = now;
+      const prev = lastByMsg.get(msg) || 0;
+      if (now - prev < TTL_MS) return;
+      lastByMsg.set(msg, now);
+      if (lastByMsg.size > MAX_KEYS) {
+        const oldestKey = lastByMsg.keys().next().value;
+        lastByMsg.delete(oldestKey);
+      }
       console.log(LOG_PREFIX, ...args);
     };
   })();
@@ -1103,6 +1111,60 @@
       );
     }
 
+    // Canonicalize a sprint name for resilient matching between the chip's
+    // label and the API's `sprint.name`. Jira's timeline sometimes appends
+    // a counter (e.g. "FHSBFF Sprint 53 (29 issues)") or wraps the label
+    // with whitespace; the API always returns the bare name. Lowercasing
+    // and collapsing whitespace makes the match robust to both.
+    function normalizeSprintName(raw) {
+      if (!raw) return '';
+      return raw
+        .replace(/\s*\(\d+\s+(issues?|tickets?|items?)\)\s*$/i, '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLowerCase();
+    }
+
+    // Build a multi-key index { name → sprint } from the open-sprints list.
+    // `byKey` accepts both raw and normalized lookups; the attached
+    // `__ordered` array preserves the API order for substring fallback
+    // (chip labels may carry a localized prefix like "Sprint sélectionné: <name>").
+    function indexOpenSprints(openSprints) {
+      const byKey = new Map();
+      const ordered = [];
+      for (const s of openSprints) {
+        if (!s?.name) continue;
+        byKey.set(s.name, s);
+        byKey.set(normalizeSprintName(s.name), s);
+        ordered.push({ sprint: s, normKey: normalizeSprintName(s.name) });
+      }
+      byKey.__ordered = ordered;
+      return byKey;
+    }
+
+    function resolveSprint(chipName, byKey) {
+      if (!chipName) return null;
+      const direct =
+        byKey.get(chipName) ||
+        byKey.get(chipName.trim()) ||
+        byKey.get(normalizeSprintName(chipName));
+      if (direct) return direct;
+      // Substring fallback for localized/decorated chip labels. Longest
+      // sprint name wins so partial matches on short names don't hijack
+      // a more specific one.
+      const normChip = normalizeSprintName(chipName);
+      if (!normChip) return null;
+      let best = null;
+      let bestLen = 0;
+      for (const { sprint, normKey } of byKey.__ordered || []) {
+        if (normKey && normChip.includes(normKey) && normKey.length > bestLen) {
+          best = sprint;
+          bestLen = normKey.length;
+        }
+      }
+      return best;
+    }
+
     function fillStateFor(ratio) {
       if (ratio < 0.9) return 'under';
       if (ratio <= 1.1) return 'on-target';
@@ -1143,17 +1205,17 @@
       chip.title = tooltipText;
     }
 
-    async function decorate(chip, openByName, average) {
+    async function decorate(chip, byKey, average) {
       const name = extractSprintName(chip);
-      if (!name) return;
-      const sprint = openByName.get(name);
+      if (!name) return null;
+      const sprint = resolveSprint(name, byKey);
       if (!sprint) {
         // Not an open sprint (closed, or unknown). Leave chip untouched.
         if (decorated.has(chip)) {
           removeOverlay(chip);
           decorated.delete(chip);
         }
-        return;
+        return null;
       }
       const prev = decorated.get(chip);
       const isRefresh = prev && prev.sprintId === sprint.id && prev.state === sprint.state;
@@ -1171,9 +1233,10 @@
         state: sprint.state,
         sprintName: name,
       });
+      return sprint;
     }
 
-    return { findChips, decorate, probe };
+    return { findChips, decorate, probe, indexOpenSprints, extractSprintName };
   })();
 
   // ---------------------------------------------------------------------------
@@ -1346,6 +1409,7 @@
         'Fill overlay on each active/future sprint chip (Sprints row) keyed to the 5-sprint ' +
         'average velocity. Active sprints show remaining SP; future sprints show planned SP.',
       isActive: isTimelineLikePath,
+      _warnedZeroMatch: false,
       async onMutation(root) {
         const chips = sprintChipDom.findChips(root);
         heartbeat('sprint chips found:', chips.length);
@@ -1361,11 +1425,37 @@
           return;
         }
         if (!ctx || !(ctx.average > 0) || !ctx.openSprints?.length) return;
-        const byName = new Map(ctx.openSprints.map((s) => [s.name, s]));
-        for (const chip of chips) {
-          sprintChipDom.decorate(chip, byName, ctx.average).catch((e) => {
-            warn('sprint decorate failed:', e?.message || e);
-          });
+        const byKey = sprintChipDom.indexOpenSprints(ctx.openSprints);
+
+        // Run all decorations in parallel; aggregate match outcomes so we
+        // can surface a "sprint chips matched: X/Y" heartbeat. This gives
+        // us a one-line signal to diagnose the "feature invisible" case
+        // without duplicating the matching logic here.
+        const outcomes = await Promise.all(
+          chips.map((chip) =>
+            sprintChipDom.decorate(chip, byKey, ctx.average).catch((e) => {
+              warn('sprint decorate failed:', e?.message || e);
+              return null;
+            }),
+          ),
+        );
+        const matched = outcomes.filter(Boolean).length;
+        heartbeat(`sprint chips matched: ${matched}/${chips.length}`);
+        if (matched === 0 && !this._warnedZeroMatch) {
+          this._warnedZeroMatch = true;
+          const unmatchedSample = chips
+            .slice(0, 5)
+            .map((c) => sprintChipDom.extractSprintName(c))
+            .filter(Boolean);
+          warn(
+            `sprint-fill: 0/${chips.length} chips matched an active/future sprint. ` +
+              'Chip labels (sample):',
+            unmatchedSample,
+            '| open sprint names (sample):',
+            ctx.openSprints.slice(0, 10).map((s) => s.name),
+          );
+        } else if (matched > 0) {
+          this._warnedZeroMatch = false;
         }
       },
     },
@@ -1476,7 +1566,7 @@
     // Initial pass (in case the timeline is already rendered at document-idle).
     runActiveFeatures();
     log(
-      'loaded — version 0.3.0',
+      'loaded — version 0.3.1',
       isDebug()
         ? '(debug on)'
         : '(debug off — enable with: localStorage.setItem(\'momentum-light-debug\', \'1\'))',
