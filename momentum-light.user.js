@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.1.1
+// @version      0.1.2
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — feature #1 : barre de progression sur les Epics, calculée sur SP done / SP total des tickets enfants.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -264,9 +264,12 @@
         counts.set(id, (counts.get(id) || 0) + 1);
       });
       const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+      const top = sorted.slice(0, 40).map(([testid, count]) => ({ testid, count }));
       warn('no bars found — data-testid probe (top 40):');
       // eslint-disable-next-line no-console
-      console.table(sorted.slice(0, 40).map(([testid, count]) => ({ testid, count })));
+      console.table(top);
+      // Also log a JSON string: easier to copy-paste back to the maintainer.
+      warn('probe JSON (copy everything between the braces):\n' + JSON.stringify(top, null, 2));
     }
 
     function extractIssueKey(bar) {
@@ -403,7 +406,7 @@
     // Initial pass (in case the timeline is already rendered at document-idle).
     runActiveFeatures();
     log(
-      'loaded — version 0.1.1',
+      'loaded — version 0.1.2',
       isDebug()
         ? '(debug on)'
         : '(debug off — enable with: localStorage.setItem(\'momentum-light-debug\', \'1\'))',
