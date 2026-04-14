@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.5.0
+// @version      0.5.1
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne, et menu « How-to » guidé qui surligne chaque feature au premier lancement.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -316,7 +316,7 @@
       // (Legacy "Epic Link" is still honored via `parent` for team-managed projects.)
       const data = await jiraApi.searchIssues(
         `parent = ${epicKey}`,
-        [spFieldId, 'status'],
+        [spFieldId, 'status', 'issuetype'],
         100,
       );
       let done = 0;
@@ -333,7 +333,16 @@
         unestimated: 0,
         totalChildren: 0,
       };
+      // Type allow-list: epic progress & confidence reflect only the
+      // "real work" tickets — Stories, Technical Stories and Bugs. Tasks,
+      // Sub-tasks and Tests are treated as plumbing and excluded from both
+      // the SP progress bar and the confidence score. The regex covers
+      // French/English variants ("User Story", "Story technique", "Bug",
+      // etc.) while rejecting "Task", "Test", "Sub-task", "Epic".
+      const COUNTABLE_TYPE = /story|bug/i;
       for (const issue of data.issues || []) {
+        const typeName = issue.fields?.issuetype?.name || '';
+        if (!COUNTABLE_TYPE.test(typeName)) continue;
         childStats.totalChildren += 1;
         const sp = Number(issue.fields?.[spFieldId]);
         const cat = issue.fields?.status?.statusCategory?.key;
@@ -901,18 +910,22 @@
          score (done/inProgress/todo/unestimated weighted blend). The
          diagonal hatch pattern is painted via a ::after pseudo-element
          stretched across the entire overlay so the "uncertainty" signal
-         covers both the filled and unfilled portions of the bar. The
-         fill opacity is reduced in lockstep: the lower the confidence,
-         the less the multiply-darkening reads as "solid progress".
+         covers both the filled and unfilled portions of the bar.
+
+         Low and medium share the SAME hatch pattern — the differentiator
+         between the two tiers is opacity: low epics fade further so they
+         read as distinctly less "solid" than medium ones. High-confidence
+         epics receive no treatment and display the full mix-blend-mode
+         fill at 100% opacity.
 
          Guarded against the ticket-estimate and sprint-fill variants,
          which already have their own visual language and should not
          pick up the hatch pattern. */
       .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="medium"] .${OVERLAY_FILL_CLASS} {
-        opacity: 0.75;
+        opacity: 0.7;
       }
       .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="low"] .${OVERLAY_FILL_CLASS} {
-        opacity: 0.5;
+        opacity: 0.3;
       }
       .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="medium"]::after,
       .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="low"]::after {
@@ -921,23 +934,12 @@
         inset: 0;
         pointer-events: none;
         border-radius: inherit;
-      }
-      .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="medium"]::after {
         background-image: repeating-linear-gradient(
           45deg,
           transparent 0,
-          transparent 6px,
-          rgba(255, 255, 255, 0.10) 6px,
-          rgba(255, 255, 255, 0.10) 10px
-        );
-      }
-      .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="low"]::after {
-        background-image: repeating-linear-gradient(
-          45deg,
-          transparent 0,
-          transparent 4px,
-          rgba(255, 255, 255, 0.20) 4px,
-          rgba(255, 255, 255, 0.20) 8px
+          transparent 5px,
+          rgba(255, 255, 255, 0.16) 5px,
+          rgba(255, 255, 255, 0.16) 9px
         );
       }
       /* Sprint-fill variant: a full-height translucent wash that covers the
@@ -1969,12 +1971,14 @@
         title: '1. Epic Progress Bar',
         body:
           'Chaque Epic de la Timeline affiche une barre de progression calculée ' +
-          'sur Σ SP done / Σ SP total de ses tickets enfants. Un indice de confiance ' +
-          'pondère done (×1.0), en cours (×0.6) et todo (×0.15) puis divise par le ' +
-          'nombre total de tickets enfants — les tickets sans chiffrage tirent le ' +
-          'score vers le bas. Une confiance faible est signalée par un hachuré ' +
-          'diagonal et une opacité réduite sur la barre ; le badge « N? » indique ' +
-          'le nombre de tickets enfants sans SP.',
+          'sur Σ SP done / Σ SP total de ses tickets enfants (Stories, ' +
+          'Technical Stories et Bugs uniquement — les Tasks et Tests sont ' +
+          'ignorés). Un indice de confiance pondère done (×1.0), en cours ' +
+          '(×0.6) et todo (×0.15) puis divise par le nombre total de tickets ' +
+          'enfants comptés — les tickets sans chiffrage tirent le score vers ' +
+          'le bas. Une confiance faible est signalée par un hachuré diagonal ' +
+          'et une opacité réduite sur la barre ; le badge « N? » indique le ' +
+          'nombre de tickets enfants sans SP.',
         findTarget: () =>
           document.querySelector(
             `.${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})`,
