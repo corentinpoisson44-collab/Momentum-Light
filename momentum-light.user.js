@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.4.0
+// @version      0.4.1
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne, et menu « How-to » guidé qui surligne chaque feature au premier lancement.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -865,30 +865,49 @@
       .${OVERLAY_ESTIMATE_MOD} .${OVERLAY_FILL_CLASS} {
         display: none;
       }
-      /* Sprint-fill variant: a thin colored strip anchored to the bottom
-         of the sprint chip, so the chip's own text ("FHSBFF Sprint 53…")
-         stays fully readable. The overlay overrides .momentum-progress's
-         inset:0 to become a 5px bottom bar; the numeric label lives in
-         the tooltip, not inside the chip. */
+      /* Sprint-fill variant: a full-height translucent wash that covers the
+         entire chip background, so the fill level reads at a glance across
+         the whole button while the chip's own text ("FHSBFF Sprint 53…")
+         stays fully legible. A saturated 2px accent strip along the bottom
+         edge preserves the strong state-color cue (green / amber / red).
+         The numeric label lives in the tooltip, not inside the chip. */
       .${OVERLAY_SPRINT_FILL_MOD} {
-        top: auto;
-        height: 5px;
-        border-radius: 0 0 inherit inherit;
-        background-color: rgba(9, 30, 66, 0.12); /* subtle track */
+        border-radius: inherit;
+        background-color: rgba(9, 30, 66, 0.04); /* barely-there track */
       }
       .${OVERLAY_SPRINT_FILL_MOD} .${OVERLAY_FILL_CLASS} {
-        background-color: #36B37E;
         mix-blend-mode: normal;
-        opacity: 0.95;
+        opacity: 1;
+        /* 2px bottom accent line in the saturated state color, drawn via
+           an inset box-shadow so it hugs the fill's trailing edge and
+           reinforces the color cue without needing an extra element. */
+        box-shadow:
+          inset 0 -2px 0 0 var(--momentum-sprint-fill-accent, transparent),
+          inset -1px 0 0 rgba(9, 30, 66, 0.08);
       }
       .${OVERLAY_SPRINT_FILL_MOD}[data-fill-state="under"] .${OVERLAY_FILL_CLASS} {
-        background-color: #36B37E;
+        background: linear-gradient(
+          90deg,
+          rgba(54, 179, 126, 0.32) 0%,
+          rgba(54, 179, 126, 0.22) 100%
+        );
+        --momentum-sprint-fill-accent: #36B37E;
       }
       .${OVERLAY_SPRINT_FILL_MOD}[data-fill-state="on-target"] .${OVERLAY_FILL_CLASS} {
-        background-color: #FFAB00;
+        background: linear-gradient(
+          90deg,
+          rgba(255, 171, 0, 0.36) 0%,
+          rgba(255, 171, 0, 0.26) 100%
+        );
+        --momentum-sprint-fill-accent: #FFAB00;
       }
       .${OVERLAY_SPRINT_FILL_MOD}[data-fill-state="over"] .${OVERLAY_FILL_CLASS} {
-        background-color: #DE350B;
+        background: linear-gradient(
+          90deg,
+          rgba(222, 53, 11, 0.30) 0%,
+          rgba(222, 53, 11, 0.22) 100%
+        );
+        --momentum-sprint-fill-accent: #DE350B;
       }
       /* No in-chip numeric label — the sprint name stays clean and the
          exact numbers live in the tooltip via dataset.momentumTooltip. */
