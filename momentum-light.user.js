@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.2.4
-// @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, et chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog).
+// @version      0.3.0
+// @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), et indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
 // @run-at       document-idle
@@ -26,6 +26,7 @@
   const OVERLAY_FILL_CLASS = 'momentum-progress__fill';
   const OVERLAY_LABEL_CLASS = 'momentum-progress__label';
   const OVERLAY_ESTIMATE_MOD = 'momentum-progress--estimate';
+  const OVERLAY_SPRINT_FILL_MOD = 'momentum-progress--sprint-fill';
   const VELOCITY_BANNER_ID = 'momentum-velocity-banner';
 
   // Debug mode is opt-in per session. Enable from DevTools:
@@ -326,6 +327,24 @@
       return all;
     }
 
+    // Active + future sprints of a board — the "open" sprints we overlay
+    // with a fill indicator on the timeline's Sprints row.
+    async function listOpenSprints(boardId) {
+      const all = [];
+      let startAt = 0;
+      const pageSize = 50;
+      while (all.length < 200) {
+        const data = await jiraApi.request(
+          `/rest/agile/1.0/board/${boardId}/sprint?state=active,future&startAt=${startAt}&maxResults=${pageSize}`,
+        );
+        const values = data.values || [];
+        all.push(...values);
+        if (data.isLast || values.length < pageSize) break;
+        startAt += pageSize;
+      }
+      return all;
+    }
+
     // Authoritative per-sprint velocity via the Sprint Report endpoint.
     // Returns the SP sum of issues that were completed WITHIN the sprint
     // window — ignores issues that were moved out and completed elsewhere.
@@ -389,45 +408,125 @@
         resolveBoardId(),
       ]);
 
-      const sprints = await listClosedSprints(boardId);
-      if (!sprints.length) {
-        return { average: 0, sprints: [], boardId, note: 'no closed sprints' };
-      }
-      // Most recently closed first. `completeDate` is the actual close time;
-      // fall back to `endDate` then `startDate` so sprints without a close
-      // stamp still sort reasonably.
-      const byCloseDesc = (a, b) => {
-        const ka = new Date(a.completeDate || a.endDate || a.startDate || 0).getTime();
-        const kb = new Date(b.completeDate || b.endDate || b.startDate || 0).getTime();
-        return kb - ka;
-      };
-      const recent = sprints.sort(byCloseDesc).slice(0, SPRINT_WINDOW);
+      // Fetch closed (for average) and open (for planning overlays) in
+      // parallel — they are independent.
+      const [closed, openSprints] = await Promise.all([
+        listClosedSprints(boardId),
+        listOpenSprints(boardId).catch((e) => {
+          warn('listOpenSprints failed:', e?.message || e);
+          return [];
+        }),
+      ]);
 
-      const perSprint = [];
-      for (const s of recent) {
-        const done = await sprintCompletedSP(boardId, s.id, spFieldId);
-        perSprint.push({ id: s.id, name: s.name, velocity: done });
+      let average = 0;
+      let perSprint = [];
+      if (closed.length) {
+        // Most recently closed first. `completeDate` is the actual close time;
+        // fall back to `endDate` then `startDate` so sprints without a close
+        // stamp still sort reasonably.
+        const byCloseDesc = (a, b) => {
+          const ka = new Date(a.completeDate || a.endDate || a.startDate || 0).getTime();
+          const kb = new Date(b.completeDate || b.endDate || b.startDate || 0).getTime();
+          return kb - ka;
+        };
+        const recent = closed.sort(byCloseDesc).slice(0, SPRINT_WINDOW);
+        for (const s of recent) {
+          const done = await sprintCompletedSP(boardId, s.id, spFieldId);
+          perSprint.push({ id: s.id, name: s.name, velocity: done });
+        }
+        const total = perSprint.reduce((acc, s) => acc + s.velocity, 0);
+        average = perSprint.length ? total / perSprint.length : 0;
       }
-      const total = perSprint.reduce((acc, s) => acc + s.velocity, 0);
-      const average = perSprint.length ? total / perSprint.length : 0;
-      return { average, sprints: perSprint, boardId };
+
+      const openLite = openSprints.map((s) => ({
+        id: s.id,
+        name: s.name,
+        state: s.state, // 'active' | 'future'
+      }));
+
+      return { average, sprints: perSprint, boardId, openSprints: openLite };
+    }
+
+    async function getCached() {
+      const now = Date.now();
+      if (cache && cache.expiresAt > now) return cache.value;
+      if (inflight) return inflight;
+      inflight = (async () => {
+        try {
+          const value = await compute();
+          cache = { expiresAt: Date.now() + CACHE_TTL_MS, value };
+          return value;
+        } finally {
+          inflight = null;
+        }
+      })();
+      return inflight;
     }
 
     return {
-      async get() {
+      // Kept for compatibility with the velocity-banner (returns
+      // { average, sprints, boardId } — extra fields are ignored).
+      get: getCached,
+      // Planning view: everything `get()` returns + `openSprints` (active
+      // and future sprints on the board).
+      getPlanningContext: getCached,
+    };
+  })();
+
+  // ---------------------------------------------------------------------------
+  // sprintCapacity — per-sprint planned SP load, for the timeline Sprints
+  // row overlays. Same TTL + inflight-dedup pattern as `epicProgress`.
+  //
+  // Metric depends on the sprint state:
+  //   - `active`  → sum of SP of issues NOT in a done statusCategory
+  //                 (remaining work, matching what a team would still
+  //                 need to deliver before sprint close).
+  //   - `future`  → sum of SP of ALL assigned issues (what's been planned
+  //                 into the sprint so far).
+  // Issues without a valid SP value are ignored (SP 0 = not estimated).
+  // ---------------------------------------------------------------------------
+
+  const sprintCapacity = (() => {
+    const TTL_MS = 60_000;
+    const cache = new Map(); // sprintId -> { expiresAt, value }
+    const inflight = new Map(); // sprintId -> Promise
+
+    async function fetchOne(sprintId, state) {
+      const spFieldId = await storyPointsField.resolve();
+      const data = await jiraApi.request(
+        `/rest/agile/1.0/sprint/${sprintId}/issue?fields=${encodeURIComponent(spFieldId)},status&maxResults=500`,
+      );
+      let total = 0;
+      let remaining = 0;
+      for (const issue of data.issues || []) {
+        const sp = Number(issue.fields?.[spFieldId]);
+        if (!Number.isFinite(sp) || sp <= 0) continue;
+        total += sp;
+        if (issue.fields?.status?.statusCategory?.key !== 'done') remaining += sp;
+      }
+      const load = state === 'active' ? remaining : total;
+      return { total, remaining, load, state };
+    }
+
+    return {
+      async get(sprintId, state) {
+        const key = `${sprintId}:${state}`;
         const now = Date.now();
-        if (cache && cache.expiresAt > now) return cache.value;
-        if (inflight) return inflight;
-        inflight = (async () => {
+        const hit = cache.get(key);
+        if (hit && hit.expiresAt > now) return hit.value;
+        if (inflight.has(key)) return inflight.get(key);
+
+        const promise = (async () => {
           try {
-            const value = await compute();
-            cache = { expiresAt: Date.now() + CACHE_TTL_MS, value };
+            const value = await fetchOne(sprintId, state);
+            cache.set(key, { expiresAt: Date.now() + TTL_MS, value });
             return value;
           } finally {
-            inflight = null;
+            inflight.delete(key);
           }
         })();
-        return inflight;
+        inflight.set(key, promise);
+        return promise;
       },
     };
   })();
@@ -488,6 +587,31 @@
          the mix-blend-mode fill. */
       .${OVERLAY_ESTIMATE_MOD} .${OVERLAY_FILL_CLASS} {
         display: none;
+      }
+      /* Sprint-fill variant: overlay dropped on Sprints-row chips. Unlike
+         the Epic overlay (which darkens the host bar), we paint a flat
+         color keyed to the load-vs-average-velocity ratio. Kept at 55%
+         opacity so the chip text below remains readable without a label
+         shadow war. */
+      .${OVERLAY_SPRINT_FILL_MOD} .${OVERLAY_FILL_CLASS} {
+        background-color: #36B37E;
+        mix-blend-mode: normal;
+        opacity: 0.55;
+      }
+      .${OVERLAY_SPRINT_FILL_MOD}[data-fill-state="under"] .${OVERLAY_FILL_CLASS} {
+        background-color: #36B37E;
+      }
+      .${OVERLAY_SPRINT_FILL_MOD}[data-fill-state="on-target"] .${OVERLAY_FILL_CLASS} {
+        background-color: #FFAB00;
+      }
+      .${OVERLAY_SPRINT_FILL_MOD}[data-fill-state="over"] .${OVERLAY_FILL_CLASS} {
+        background-color: #DE350B;
+      }
+      .${OVERLAY_SPRINT_FILL_MOD} .${OVERLAY_LABEL_CLASS} {
+        font-size: 10px;
+        padding: 0 4px;
+        color: #172B4D;
+        text-shadow: 0 1px 0 rgba(255, 255, 255, 0.6);
       }
       /* Full-width sticky banner anchored at the top of the plan's main
          content area. "pointer-events: none" on the wrapper lets clicks
@@ -855,6 +979,204 @@
   })();
 
   // ---------------------------------------------------------------------------
+  // sprintChipDom — detect sprint chips on the timeline's "Sprints" row and
+  // paint a fill overlay that reports load vs. the 5-sprint average velocity.
+  //
+  // Detection strategy (first hit wins):
+  //   1. Semantic — find a list-side cell whose trimmed text is exactly
+  //      "Sprints", climb to its row container, then pick every <button>
+  //      descendant on the chart-side. This survives Atlaskit class-name
+  //      churn because it keys off the visible label, not generated CSS.
+  //   2. Testid probe — if step 1 yields nothing, we rate-limit-dump the
+  //      DOM's testid distribution to `window.__MOMENTUM_PROBE__` (same
+  //      pattern as `timelineDom.probeCandidates`) so a future build can
+  //      add the right selector without re-releasing.
+  //
+  // Geometric filter: chips narrower than 40px or taller than 32px are
+  // skipped (too small to render a readable overlay, or not actually a
+  // sprint chip).
+  // ---------------------------------------------------------------------------
+
+  const sprintChipDom = (() => {
+    const CHIP_MIN_WIDTH = 40;
+    const CHIP_MIN_HEIGHT = 14;
+    const CHIP_MAX_HEIGHT = 32;
+    const decorated = new WeakMap(); // chip -> { sprintId, state }
+
+    // Find the "Sprints" row on the list side of the timeline. Relies on
+    // the visible label rather than Atlaskit testids (which change).
+    function findSprintsRow(root) {
+      const candidates = root.querySelectorAll('div, span, th, td');
+      for (const el of candidates) {
+        // Cheap reject before reading textContent (which can be huge on
+        // container nodes). Only consider leaf-ish elements.
+        if (el.children.length > 2) continue;
+        const text = (el.textContent || '').trim();
+        if (text !== 'Sprints') continue;
+        // Climb to the enclosing row. Rows in the Atlaskit timeline are
+        // typically several levels up; stop at the first ancestor that
+        // also contains at least one <button> sibling further right.
+        let cursor = el.parentElement;
+        let steps = 0;
+        while (cursor && cursor !== document.body && steps < 12) {
+          if (cursor.querySelector('button')) return cursor;
+          cursor = cursor.parentElement;
+          steps += 1;
+        }
+      }
+      return null;
+    }
+
+    function isChipSized(el) {
+      const r = el.getBoundingClientRect();
+      if (r.width < CHIP_MIN_WIDTH) return false;
+      if (r.height < CHIP_MIN_HEIGHT || r.height > CHIP_MAX_HEIGHT) return false;
+      return true;
+    }
+
+    function findChips(root) {
+      const row = findSprintsRow(root);
+      if (!row) return [];
+      return [...row.querySelectorAll('button')].filter(isChipSized);
+    }
+
+    let lastProbeAt = 0;
+    function probe(root) {
+      const now = Date.now();
+      if (now - lastProbeAt < 3_000) return;
+      lastProbeAt = now;
+      // Collect every element whose trimmed text starts with "Sprint" to
+      // help us tune the detection heuristic offline.
+      const hits = [];
+      root.querySelectorAll('button, span, div').forEach((el) => {
+        if (el.children.length > 0) return;
+        const t = (el.textContent || '').trim();
+        if (t && /sprint/i.test(t) && t.length < 60) {
+          hits.push({
+            text: t,
+            tag: el.tagName.toLowerCase(),
+            testid: el.getAttribute('data-testid') || null,
+          });
+        }
+      });
+      window.__MOMENTUM_SPRINT_PROBE__ = {
+        timestamp: new Date().toISOString(),
+        sprintRowFound: !!findSprintsRow(root),
+        sampleSprintLabels: hits.slice(0, 40),
+      };
+      warn(
+        `sprintChipDom probe — row found: ${!!findSprintsRow(root)}, sample sprint-label hits: ${hits.length}. ` +
+          'Dump at window.__MOMENTUM_SPRINT_PROBE__',
+      );
+    }
+
+    function ensureOverlay(chip) {
+      let overlay = chip.querySelector(`:scope > .${OVERLAY_CLASS}`);
+      if (overlay) return overlay;
+      const computed = getComputedStyle(chip);
+      if (computed.position === 'static') chip.style.position = 'relative';
+      overlay = document.createElement('div');
+      overlay.className = `${OVERLAY_CLASS} ${OVERLAY_SPRINT_FILL_MOD}`;
+      const fill = document.createElement('div');
+      fill.className = OVERLAY_FILL_CLASS;
+      overlay.appendChild(fill);
+      const label = document.createElement('div');
+      label.className = OVERLAY_LABEL_CLASS;
+      overlay.appendChild(label);
+      chip.insertBefore(overlay, chip.firstChild);
+      return overlay;
+    }
+
+    function removeOverlay(chip) {
+      const overlay = chip.querySelector(`:scope > .${OVERLAY_CLASS}`);
+      if (overlay) overlay.remove();
+    }
+
+    function extractSprintName(chip) {
+      // The chip's visible label might be truncated ("FHSBFF Sprint..."),
+      // so prefer aria-label / title which carry the full name. Fallback
+      // to textContent for older builds.
+      return (
+        (chip.getAttribute('aria-label') || '').trim() ||
+        (chip.getAttribute('title') || '').trim() ||
+        (chip.textContent || '').trim()
+      );
+    }
+
+    function fillStateFor(ratio) {
+      if (ratio < 0.9) return 'under';
+      if (ratio <= 1.1) return 'on-target';
+      return 'over';
+    }
+
+    function applyFill(chip, { load, average, state, sprintName }) {
+      if (!Number.isFinite(load) || !Number.isFinite(average) || average <= 0) {
+        removeOverlay(chip);
+        delete chip.dataset.momentumTooltip;
+        return;
+      }
+      const ratio = load / average;
+      const pct = Math.max(0, Math.min(100, ratio * 100));
+      const overlay = ensureOverlay(chip);
+      overlay.dataset.fillState = fillStateFor(ratio);
+      const fill = overlay.querySelector(`.${OVERLAY_FILL_CLASS}`);
+      const label = overlay.querySelector(`.${OVERLAY_LABEL_CLASS}`);
+      if (fill) fill.style.width = `${pct.toFixed(1)}%`;
+
+      // Compact label inside the chip. 80px is the rough breakpoint below
+      // which the "X / Y SP" form no longer fits; fall back to a bare
+      // percentage there.
+      const w = chip.getBoundingClientRect().width;
+      if (label) {
+        label.textContent =
+          w >= 80
+            ? `${Math.round(load)} / ${Math.round(average)}`
+            : `${Math.round(ratio * 100)}%`;
+      }
+
+      const stateSuffix = state === 'active' ? ' (restant)' : ' (planifié)';
+      const tooltipText = `${sprintName} — ${Math.round(load)} SP${stateSuffix} / ${Math.round(
+        average,
+      )} SP moyenne (${Math.round(ratio * 100)}%)`;
+      chip.dataset.momentumTooltip = tooltipText;
+      chip.setAttribute('aria-label', tooltipText);
+      chip.title = tooltipText;
+    }
+
+    async function decorate(chip, openByName, average) {
+      const name = extractSprintName(chip);
+      if (!name) return;
+      const sprint = openByName.get(name);
+      if (!sprint) {
+        // Not an open sprint (closed, or unknown). Leave chip untouched.
+        if (decorated.has(chip)) {
+          removeOverlay(chip);
+          decorated.delete(chip);
+        }
+        return;
+      }
+      const prev = decorated.get(chip);
+      const isRefresh = prev && prev.sprintId === sprint.id && prev.state === sprint.state;
+      if (!isRefresh) decorated.set(chip, { sprintId: sprint.id, state: sprint.state });
+
+      const capacity = await sprintCapacity.get(sprint.id, sprint.state);
+      if (isDebug() && !isRefresh) {
+        debug(
+          `sprint ${sprint.id} "${name}" (${sprint.state}): load=${capacity.load} SP, avg=${average}`,
+        );
+      }
+      applyFill(chip, {
+        load: capacity.load,
+        average,
+        state: sprint.state,
+        sprintName: name,
+      });
+    }
+
+    return { findChips, decorate, probe };
+  })();
+
+  // ---------------------------------------------------------------------------
   // velocityBanner — sticky chip rendered at the top of the plan's main
   // content region, showing the average velocity of the last N closed
   // sprints. Click the chip to refresh.
@@ -1005,7 +1327,7 @@
     },
     {
       id: 'sprint-velocity-banner',
-      description: 'Fixed banner showing the average velocity of the last 3 closed sprints.',
+      description: 'Fixed banner showing the average velocity of the last 5 closed sprints.',
       isActive: isTimelineLikePath,
       onMutation() {
         // `update()` is idempotent and piggybacks on the 5 min velocity cache,
@@ -1016,6 +1338,35 @@
         // User navigated away from a timeline/plan page — clean up so the
         // banner doesn't linger on unrelated views.
         velocityBanner.remove();
+      },
+    },
+    {
+      id: 'sprint-fill-indicator',
+      description:
+        'Fill overlay on each active/future sprint chip (Sprints row) keyed to the 5-sprint ' +
+        'average velocity. Active sprints show remaining SP; future sprints show planned SP.',
+      isActive: isTimelineLikePath,
+      async onMutation(root) {
+        const chips = sprintChipDom.findChips(root);
+        heartbeat('sprint chips found:', chips.length);
+        if (chips.length === 0) {
+          sprintChipDom.probe(root);
+          return;
+        }
+        let ctx;
+        try {
+          ctx = await velocity.getPlanningContext();
+        } catch (e) {
+          warn('planning context unavailable:', e?.message || e);
+          return;
+        }
+        if (!ctx || !(ctx.average > 0) || !ctx.openSprints?.length) return;
+        const byName = new Map(ctx.openSprints.map((s) => [s.name, s]));
+        for (const chip of chips) {
+          sprintChipDom.decorate(chip, byName, ctx.average).catch((e) => {
+            warn('sprint decorate failed:', e?.message || e);
+          });
+        }
       },
     },
   ];
@@ -1125,7 +1476,7 @@
     // Initial pass (in case the timeline is already rendered at document-idle).
     runActiveFeatures();
     log(
-      'loaded — version 0.2.4',
+      'loaded — version 0.3.0',
       isDebug()
         ? '(debug on)'
         : '(debug off — enable with: localStorage.setItem(\'momentum-light-debug\', \'1\'))',
