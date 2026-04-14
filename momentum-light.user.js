@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.1.9
+// @version      0.1.10
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — feature #1 : barre de progression sur les Epics, calculée sur SP done / SP total des tickets enfants.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -208,22 +208,20 @@
     style.textContent = `
       .${OVERLAY_CLASS} {
         position: absolute;
-        left: 0;
-        right: 0;
-        bottom: 0;
-        height: 35%;
-        min-height: 6px;
+        inset: 0;
         pointer-events: none;
-        overflow: hidden;
-        border-radius: 0 0 3px 3px;
-        background-color: rgba(255, 255, 255, 0.35);
-        box-shadow: inset 0 1px 0 rgba(0, 0, 0, 0.08);
-        z-index: 2;
+        /* No z-index / overflow: the overlay is inserted as the bar's FIRST
+           child so native widgets (edge link-dots, warning icons, link icons)
+           paint on top of us via natural DOM painting order. */
       }
       .${OVERLAY_FILL_CLASS} {
         height: 100%;
         width: 0%;
-        background-color: rgba(9, 30, 66, 0.75);
+        /* Darken the bar's own color instead of overlaying a fixed hue.
+           A 30%-opaque black multiplied over the bar produces a shaded version
+           of the bar color — orange stays orange, blue stays blue, etc. */
+        background-color: rgba(0, 0, 0, 0.30);
+        mix-blend-mode: multiply;
         transition: width 200ms ease-out;
       }
     `;
@@ -416,7 +414,11 @@
       const fill = document.createElement('div');
       fill.className = OVERLAY_FILL_CLASS;
       overlay.appendChild(fill);
-      bar.appendChild(overlay);
+      // Insert as the FIRST child of the bar so the native widgets that JIRA
+      // renders inside the bar (edge link-creation dots, link icons, warning
+      // triangles) paint on top of our overlay via natural DOM order — no
+      // z-index juggling needed.
+      bar.insertBefore(overlay, bar.firstChild);
       return overlay;
     }
 
@@ -606,7 +608,7 @@
     // Initial pass (in case the timeline is already rendered at document-idle).
     runActiveFeatures();
     log(
-      'loaded — version 0.1.9',
+      'loaded — version 0.1.10',
       isDebug()
         ? '(debug on)'
         : '(debug off — enable with: localStorage.setItem(\'momentum-light-debug\', \'1\'))',
