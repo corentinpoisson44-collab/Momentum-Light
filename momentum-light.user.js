@@ -2024,10 +2024,13 @@
       const legend = document.createElement('span');
       legend.className = CONFIDENCE_LEGEND_CLASS;
       legend.title =
-        'Hachurage des Epics en statut Open selon l\'indice de confiance :\n' +
+        'Hachurage des Epics en statut Open\n' +
+        '\n' +
+        'Opacité selon l\'indice de confiance :\n' +
         '  • faible  (< 40 %)\n' +
         '  • moyenne (40-70 %)\n' +
-        '  • haute   (≥ 70 %) — pas de hachurage\n' +
+        '  • haute   (≥ 70 %)\n' +
+        '\n' +
         'Les Epics en cours / terminés ne sont jamais hachurés.';
       legend.innerHTML =
         `<span class="${CONFIDENCE_LEGEND_CLASS}__title">Confiance Epic (Open) :</span>` +
