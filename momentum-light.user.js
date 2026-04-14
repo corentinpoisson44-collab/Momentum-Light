@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.2.1
-// @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, et chip de vélocité moyenne des 5 derniers sprints intégrée dans le toolbar.
+// @version      0.2.2
+// @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, et chip de vélocité moyenne des 5 derniers sprints ancrée au-dessus de la grille timeline.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
 // @run-at       document-idle
@@ -450,16 +450,25 @@
       .${OVERLAY_ESTIMATE_MOD} .${OVERLAY_FILL_CLASS} {
         display: none;
       }
-      /* Inline chip, designed to sit naturally in the plan/timeline top bar
-         next to native Atlassian controls. Colors are pulled from Atlassian's
-         neutral palette so it reads as part of the UI, not a floating addon. */
+      /* Block-level wrapper so the banner always takes its own line above the
+         timeline grid, regardless of whether the parent is flex-row or
+         flex-column. The "contain: layout style" rule isolates us from any
+         inherited flex/grid constraints that would otherwise squeeze the chip. */
       #${VELOCITY_BANNER_ID} {
+        display: block;
+        box-sizing: border-box;
+        margin: 0;
+        padding: 8px 16px;
+        background: transparent;
+        flex-shrink: 0;
+        contain: layout style;
+      }
+      #${VELOCITY_BANNER_ID} .momentum-velocity-banner__chip {
         display: inline-flex;
         align-items: center;
-        gap: 6px;
-        margin: 4px 8px;
-        padding: 4px 10px;
-        border-radius: 12px;
+        gap: 8px;
+        padding: 6px 12px;
+        border-radius: 14px;
         background: #DFE1E6;
         color: #172B4D;
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -467,9 +476,9 @@
         line-height: 1.3;
         cursor: pointer;
         user-select: none;
-        vertical-align: middle;
+        white-space: nowrap;
       }
-      #${VELOCITY_BANNER_ID}:hover {
+      #${VELOCITY_BANNER_ID} .momentum-velocity-banner__chip:hover {
         background: #C1C7D0;
       }
       #${VELOCITY_BANNER_ID} .momentum-velocity-banner__label {
@@ -480,7 +489,7 @@
         font-weight: 700;
         font-variant-numeric: tabular-nums;
       }
-      #${VELOCITY_BANNER_ID}[data-state="error"] {
+      #${VELOCITY_BANNER_ID}[data-state="error"] .momentum-velocity-banner__chip {
         background: #F4F5F7;
         color: #6B778C;
       }
@@ -790,34 +799,25 @@
   })();
 
   // ---------------------------------------------------------------------------
-  // velocityBanner — inline chip embedded in the plan/timeline UI that
-  // surfaces the average velocity of the last N closed sprints. Click to
-  // refresh (bypasses the in-memory velocity cache).
+  // velocityBanner — block wrapper rendered directly above the timeline grid
+  // that shows the average velocity of the last N closed sprints. Click the
+  // chip to refresh (bypasses the in-memory velocity cache).
   //
-  // Anchor search order (first match wins):
-  //   1. An explicit toolbar (`data-testid` ending in `.toolbar` or
-  //      containing "controls" under a plan/roadmap scope).
-  //   2. The plan tab-title / header container.
-  //   3. The outermost `roadmap.timeline-table-kit.*` wrapper (we insert
-  //      ourselves as a previous-sibling so the chip sits above the grid).
-  // If no anchor is found yet (timeline still loading), we noop — the next
-  // mutation tick will retry.
+  // Anchor strategy: insert ourselves as the previous sibling of the
+  // outermost `roadmap.timeline-table-kit.*` wrapper. Any other anchor we
+  // tried (ending-in-`.toolbar`, header testids, …) risked landing inside
+  // an Atlaskit button/tooltip and getting re-rendered as a popup — see
+  // v0.2.2 fix. The timeline-root sibling is the only stable, unambiguous
+  // slot in the plan view.
+  //
+  // If the timeline root isn't there yet (page still loading), we noop —
+  // the next mutation tick will retry.
   // ---------------------------------------------------------------------------
 
   const velocityBanner = (() => {
-    const ANCHOR_SELECTORS = [
-      '[data-testid$=".toolbar"]',
-      '[data-testid*="toolbar"][data-testid*="plan"]',
-      '[data-testid*="toolbar"][data-testid*="roadmap"]',
-      '[data-testid="plan.tab-title-controller.container"]',
-      '[data-testid*="plan"][data-testid*="header"]',
-      '[data-testid*="roadmap"][data-testid*="header"]',
-    ];
-
     function findTimelineRoot() {
       // Climb from any timeline-table-kit descendant up to the outermost
-      // ancestor that still belongs to that widget. Falls back to the first
-      // descendant if no further ancestor qualifies.
+      // ancestor that still belongs to that widget.
       const probe = document.querySelector('[data-testid^="roadmap.timeline-table-kit."]');
       if (!probe) return null;
       let cursor = probe;
@@ -832,46 +832,39 @@
       return candidate;
     }
 
-    function findAnchor() {
-      for (const sel of ANCHOR_SELECTORS) {
-        const el = document.querySelector(sel);
-        if (el) return { el, mode: 'append' };
-      }
-      const root = findTimelineRoot();
-      if (root && root.parentElement) return { el: root, mode: 'before' };
-      return null;
-    }
-
     function build() {
-      const el = document.createElement('span');
-      el.id = VELOCITY_BANNER_ID;
-      el.innerHTML =
+      const wrapper = document.createElement('div');
+      wrapper.id = VELOCITY_BANNER_ID;
+      const chip = document.createElement('span');
+      chip.className = 'momentum-velocity-banner__chip';
+      chip.title = 'Cliquez pour rafraîchir';
+      chip.innerHTML =
         '<span class="momentum-velocity-banner__label">Vélocité moyenne (5 derniers sprints)</span>' +
         '<span class="momentum-velocity-banner__value">…</span>';
-      el.title = 'Cliquez pour rafraîchir';
-      el.addEventListener('click', () => {
-        el.querySelector('.momentum-velocity-banner__value').textContent = '…';
+      chip.addEventListener('click', () => {
+        const value = chip.querySelector('.momentum-velocity-banner__value');
+        if (value) value.textContent = '…';
         update();
       });
-      return el;
+      wrapper.appendChild(chip);
+      return wrapper;
     }
 
     function ensure() {
+      const root = findTimelineRoot();
+      if (!root || !root.parentElement) return null;
+
       const existing = document.getElementById(VELOCITY_BANNER_ID);
-      if (existing && existing.isConnected) return existing;
-      // If the banner was detached by an SPA re-render, drop the orphan and
-      // re-anchor from scratch.
+      // Happy path: still in the DOM AND still directly before the current
+      // timeline root. Otherwise, re-anchor from scratch (covers React
+      // re-renders that move the root around).
+      if (existing && existing.isConnected && existing.nextElementSibling === root) {
+        return existing;
+      }
       if (existing) existing.remove();
 
-      const anchor = findAnchor();
-      if (!anchor) return null;
-
       const el = build();
-      if (anchor.mode === 'append') {
-        anchor.el.appendChild(el);
-      } else {
-        anchor.el.parentElement.insertBefore(el, anchor.el);
-      }
+      root.parentElement.insertBefore(el, root);
       return el;
     }
 
@@ -887,11 +880,12 @@
       updating = true;
       try {
         const { average, sprints } = await velocity.get();
+        const chip = el.querySelector('.momentum-velocity-banner__chip');
         const value = el.querySelector('.momentum-velocity-banner__value');
         if (sprints.length === 0) {
           value.textContent = 'N/A';
           el.dataset.state = 'error';
-          el.title = 'Aucun sprint clos trouvé';
+          if (chip) chip.title = 'Aucun sprint clos trouvé';
           return;
         }
         value.textContent = `${Math.round(average)} SP`;
@@ -899,12 +893,15 @@
         const breakdown = sprints
           .map((s) => `${s.name}: ${s.velocity} SP`)
           .join('\n');
-        el.title = `Moyenne de ${sprints.length} sprint(s) clos :\n${breakdown}\n(cliquer pour rafraîchir)`;
+        if (chip) {
+          chip.title = `Moyenne de ${sprints.length} sprint(s) clos :\n${breakdown}\n(cliquer pour rafraîchir)`;
+        }
       } catch (e) {
+        const chip = el.querySelector('.momentum-velocity-banner__chip');
         const value = el.querySelector('.momentum-velocity-banner__value');
         if (value) value.textContent = 'N/A';
         el.dataset.state = 'error';
-        el.title = `Vélocité indisponible : ${e?.message || e}`;
+        if (chip) chip.title = `Vélocité indisponible : ${e?.message || e}`;
         warn('velocity error:', e?.message || e);
       } finally {
         updating = false;
@@ -1071,7 +1068,7 @@
     // Initial pass (in case the timeline is already rendered at document-idle).
     runActiveFeatures();
     log(
-      'loaded — version 0.2.1',
+      'loaded — version 0.2.2',
       isDebug()
         ? '(debug on)'
         : '(debug off — enable with: localStorage.setItem(\'momentum-light-debug\', \'1\'))',
