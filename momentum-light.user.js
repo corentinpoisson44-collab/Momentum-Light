@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.1.7
+// @version      0.1.8
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — feature #1 : barre de progression sur les Epics, calculée sur SP done / SP total des tickets enfants.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -282,31 +282,55 @@
       return [...found];
     }
 
-    // Diagnostic probe: when findBars returns empty, dump every data-testid value
-    // in the document that contains a timeline-related keyword. Paste the output
-    // back to the maintainer to calibrate BAR_SELECTORS. Rate-limited to once
-    // per 3s to keep the console readable.
+    // Diagnostic probe — runs unconditionally when findBars returns empty (not
+    // gated on debug mode, so the user always gets actionable feedback).
+    // Three sections:
+    //   1. Top unique testids overall (signals what's rendered on the page).
+    //   2. All testids containing "chart" (the chart side we're targeting).
+    //   3. Ancestor chain of the first progress-wrapper (shows whether the
+    //      wrapper is on the list side or the chart side, and what testids
+    //      sit between it and the row).
+    // Rate-limited to once per 3 s to keep the console readable.
     let lastProbeAt = 0;
     function probeCandidates(root) {
       const now = Date.now();
       if (now - lastProbeAt < 3_000) return;
       lastProbeAt = now;
-      const KEYWORDS = ['bar', 'timeline', 'roadmap', 'epic', 'issue', 'lozenge', 'row'];
+
       const counts = new Map();
       root.querySelectorAll('[data-testid]').forEach((el) => {
         const id = el.getAttribute('data-testid');
         if (!id) return;
-        const lower = id.toLowerCase();
-        if (!KEYWORDS.some((k) => lower.includes(k))) return;
         counts.set(id, (counts.get(id) || 0) + 1);
       });
       const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1]);
-      const top = sorted.slice(0, 40).map(([testid, count]) => ({ testid, count }));
-      warn('no bars found — data-testid probe (top 40):');
-      // eslint-disable-next-line no-console
-      console.table(top);
-      // Also log a JSON string: easier to copy-paste back to the maintainer.
-      warn('probe JSON (copy everything between the braces):\n' + JSON.stringify(top, null, 2));
+
+      const top = sorted.slice(0, 20).map(([testid, count]) => ({ testid, count }));
+      warn(`probe — ${sorted.length} unique testids on page. Top 20:`);
+      warn(JSON.stringify(top, null, 2));
+
+      const chartHits = sorted
+        .filter(([id]) => id.toLowerCase().includes('chart'))
+        .map(([testid, count]) => ({ testid, count }));
+      warn(`probe — chart-related testids (${chartHits.length}):`);
+      warn(JSON.stringify(chartHits, null, 2));
+
+      const firstPw = root.querySelector(PROGRESS_WRAPPER_SELECTOR);
+      if (firstPw) {
+        const chain = [];
+        let cursor = firstPw;
+        let steps = 0;
+        while (cursor && cursor !== document.body && steps < 15) {
+          const tid = cursor.getAttribute?.('data-testid') || '';
+          const tag = (cursor.tagName || '').toLowerCase();
+          chain.push(tid ? `${tag}[testid="${tid}"]` : `${tag}`);
+          cursor = cursor.parentElement;
+          steps += 1;
+        }
+        warn('probe — ancestor chain of first progress-wrapper:\n' + chain.join('\n  ↑ '));
+      } else {
+        warn('probe — no progress-wrapper found either');
+      }
     }
 
     function extractIssueKey(bar) {
@@ -419,7 +443,9 @@
         // Always-on heartbeat (rate-limited) so we can tell from console whether
         // the feature is finding bars, without having to enable debug mode.
         heartbeat('epic-progress-bar bars found:', bars.length);
-        if (bars.length === 0 && isDebug()) {
+        if (bars.length === 0) {
+          // Unconditional probe — we need the diagnostic data even if the user
+          // didn't flip on debug mode. Rate-limited internally.
           timelineDom.probeCandidates(root);
           return;
         }
@@ -535,7 +561,7 @@
     // Initial pass (in case the timeline is already rendered at document-idle).
     runActiveFeatures();
     log(
-      'loaded — version 0.1.7',
+      'loaded — version 0.1.8',
       isDebug()
         ? '(debug on)'
         : '(debug off — enable with: localStorage.setItem(\'momentum-light-debug\', \'1\'))',
