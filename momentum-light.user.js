@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.1.0
+// @version      0.1.1
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — feature #1 : barre de progression sur les Epics, calculée sur SP done / SP total des tickets enfants.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -25,7 +25,15 @@
   const OVERLAY_CLASS = 'momentum-progress';
   const OVERLAY_FILL_CLASS = 'momentum-progress__fill';
 
+  // Debug mode is opt-in per session. Enable from DevTools:
+  //   localStorage.setItem('momentum-light-debug', '1')
+  // Or force-enable by setting window.__MOMENTUM_DEBUG = true before the script runs.
+  const isDebug = () =>
+    window.__MOMENTUM_DEBUG === true ||
+    localStorage.getItem('momentum-light-debug') === '1';
+
   const log = (...args) => console.log(LOG_PREFIX, ...args);
+  const debug = (...args) => { if (isDebug()) console.log(LOG_PREFIX, ...args); };
   const warn = (...args) => console.warn(LOG_PREFIX, ...args);
   const error = (...args) => console.error(LOG_PREFIX, ...args);
 
@@ -207,21 +215,58 @@
     const decorated = new WeakMap();
 
     // JIRA obfuscates classes, so we probe multiple candidate selectors.
-    // These are the public-facing hooks observed on modern Cloud Plans/Timeline.
+    // These are the public-facing hooks observed on modern Cloud Plans/Timeline
+    // and project-board Timeline (software.c.projects/.../boards/.../timeline).
     // Adjust here if Atlassian ships a DOM change.
     const BAR_SELECTORS = [
+      // Project-board Timeline (software-roadmap / software.c.projects)
+      '[data-testid*="software-roadmap" i][data-testid*="bar" i]',
+      '[data-testid*="roadmap.timeline" i][data-testid*="bar" i]',
+      // Plans / Advanced Roadmaps
+      '[data-testid*="plan-timeline" i][data-testid*="bar" i]',
       '[data-testid*="timeline-bar" i]',
       '[data-testid*="roadmap-bar" i]',
       '[data-testid*="epic-bar" i]',
+      // Generic fallbacks
+      '[data-testid*="issue-bar" i]',
+      '[data-testid*="bar.ui" i]',
       '[data-testid*="lozenge" i][role="button"]',
     ];
 
     function findBars(root) {
       const nodes = new Set();
+      const perSelector = {};
       for (const sel of BAR_SELECTORS) {
-        root.querySelectorAll(sel).forEach((n) => nodes.add(n));
+        const hits = root.querySelectorAll(sel);
+        perSelector[sel] = hits.length;
+        hits.forEach((n) => nodes.add(n));
       }
+      if (isDebug()) debug('findBars per-selector counts:', perSelector, '→ total:', nodes.size);
       return [...nodes];
+    }
+
+    // Diagnostic probe: when findBars returns empty, dump every data-testid value
+    // in the document that contains a timeline-related keyword. Paste the output
+    // back to the maintainer to calibrate BAR_SELECTORS. Rate-limited to once
+    // per 3s to keep the console readable.
+    let lastProbeAt = 0;
+    function probeCandidates(root) {
+      const now = Date.now();
+      if (now - lastProbeAt < 3_000) return;
+      lastProbeAt = now;
+      const KEYWORDS = ['bar', 'timeline', 'roadmap', 'epic', 'issue', 'lozenge', 'row'];
+      const counts = new Map();
+      root.querySelectorAll('[data-testid]').forEach((el) => {
+        const id = el.getAttribute('data-testid');
+        if (!id) return;
+        const lower = id.toLowerCase();
+        if (!KEYWORDS.some((k) => lower.includes(k))) return;
+        counts.set(id, (counts.get(id) || 0) + 1);
+      });
+      const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+      warn('no bars found — data-testid probe (top 40):');
+      // eslint-disable-next-line no-console
+      console.table(sorted.slice(0, 40).map(([testid, count]) => ({ testid, count })));
     }
 
     function extractIssueKey(bar) {
@@ -302,7 +347,7 @@
       applyProgress(bar, { done, total });
     }
 
-    return { findBars, decorateBar };
+    return { findBars, decorateBar, probeCandidates };
   })();
 
   // ---------------------------------------------------------------------------
@@ -319,6 +364,10 @@
       },
       async onMutation(root) {
         const bars = timelineDom.findBars(root);
+        if (bars.length === 0 && isDebug()) {
+          timelineDom.probeCandidates(root);
+          return;
+        }
         // Fire & forget: errors on a single bar must not cascade to the others.
         for (const bar of bars) {
           timelineDom.decorateBar(bar).catch((e) => {
@@ -353,7 +402,12 @@
     observer.observe(document.body, { childList: true, subtree: true });
     // Initial pass (in case the timeline is already rendered at document-idle).
     runActiveFeatures();
-    log('loaded — version 0.1.0');
+    log(
+      'loaded — version 0.1.1',
+      isDebug()
+        ? '(debug on)'
+        : '(debug off — enable with: localStorage.setItem(\'momentum-light-debug\', \'1\'))',
+    );
   }
 
   try {
