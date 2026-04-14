@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.3.9
+// @version      0.3.10
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), et indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -82,17 +82,25 @@
   // perfMark / perfStamp — tiny timing instrument used to trace the
   // sprint-fill update pipeline in debug mode. `perfMark(reason)` starts
   // a fresh clock; `perfStamp(reason)` logs ms elapsed since the last
-  // mark. No-op when debug mode is off.
+  // mark, but only within PERF_WINDOW_MS of that mark — otherwise the
+  // stamp has no meaningful correlation with any user action (the DOM
+  // observer re-runs the pipeline every ~200 ms regardless). No-op when
+  // debug mode is off.
+  const PERF_WINDOW_MS = 5_000;
   let lastPerfMarkAt = null;
+  function perfNow() {
+    return typeof performance !== 'undefined' ? performance.now() : Date.now();
+  }
   function perfMark(reason) {
-    lastPerfMarkAt = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    lastPerfMarkAt = perfNow();
     if (isDebug()) console.log(LOG_PREFIX, `[t=0] ${reason}`);
   }
   function perfStamp(reason) {
     if (!isDebug()) return;
-    const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
-    const t = lastPerfMarkAt != null ? Math.round(now - lastPerfMarkAt) : '?';
-    console.log(LOG_PREFIX, `[t=${t}] ${reason}`);
+    if (lastPerfMarkAt == null) return;
+    const t = perfNow() - lastPerfMarkAt;
+    if (t > PERF_WINDOW_MS) return; // stale mark → skip silently
+    console.log(LOG_PREFIX, `[t=${Math.round(t)}] ${reason}`);
   }
 
   // ---------------------------------------------------------------------------
@@ -1013,13 +1021,15 @@
       if (prefixHits.length > 0) {
         const leaves = leavesOnly(prefixHits);
         const bars = leaves.filter(isBarSized);
-        if (isDebug()) {
-          debug(
-            'findBars → prefix hits:', prefixHits.length,
-            'leaves:', leaves.length,
-            'bars:', bars.length,
-          );
-        }
+        // Heartbeat (not raw debug): this log fires on every pipeline
+        // pass (~200ms) and the numbers are identical across passes
+        // while the DOM is stable — dedup via heartbeat's 30s TTL so a
+        // steady-state timeline doesn't flood the console.
+        heartbeat(
+          'findBars → prefix hits:', prefixHits.length,
+          'leaves:', leaves.length,
+          'bars:', bars.length,
+        );
         return bars;
       }
 
@@ -2251,7 +2261,7 @@
     // Initial pass (in case the timeline is already rendered at document-idle).
     runActiveFeatures();
     log(
-      'loaded — version 0.3.9',
+      'loaded — version 0.3.10',
       isDebug()
         ? '(debug on)'
         : '(debug off — enable with: localStorage.setItem(\'momentum-light-debug\', \'1\'))',
