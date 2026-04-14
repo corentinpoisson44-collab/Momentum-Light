@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.4.4
+// @version      0.5.0
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne, et menu « How-to » guidé qui surligne chaque feature au premier lancement.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -322,15 +322,47 @@
       let done = 0;
       let total = 0;
       let countedChildren = 0;
+      // childStats counts TICKETS (not SP) across all children, including
+      // those without SP — used by the confidence score to reflect both
+      // delivery progress and chiffrage completeness. A child with no SP
+      // contributes 0 to confidence regardless of its status.
+      const childStats = {
+        done: 0,
+        inProgress: 0,
+        todo: 0,
+        unestimated: 0,
+        totalChildren: 0,
+      };
       for (const issue of data.issues || []) {
+        childStats.totalChildren += 1;
         const sp = Number(issue.fields?.[spFieldId]);
-        if (!Number.isFinite(sp) || sp <= 0) continue;
+        const cat = issue.fields?.status?.statusCategory?.key;
+        const hasSp = Number.isFinite(sp) && sp > 0;
+        if (!hasSp) {
+          childStats.unestimated += 1;
+          continue;
+        }
         countedChildren += 1;
         total += sp;
-        const cat = issue.fields?.status?.statusCategory?.key;
-        if (cat === 'done') done += sp;
+        if (cat === 'done') {
+          done += sp;
+          childStats.done += 1;
+        } else if (cat === 'indeterminate') {
+          childStats.inProgress += 1;
+        } else {
+          childStats.todo += 1;
+        }
       }
-      return { done, total, countedChildren };
+      // Confidence = (done × 1.0 + inProgress × 0.6 + todo × 0.15) / total × 100
+      // Unestimated children count in the denominator but contribute 0 to
+      // the numerator — so incomplete chiffrage drags the score down.
+      const denom = childStats.totalChildren;
+      const confidence = denom > 0
+        ? ((childStats.done * 1.0
+            + childStats.inProgress * 0.6
+            + childStats.todo * 0.15) / denom) * 100
+        : 0;
+      return { done, total, countedChildren, childStats, confidence };
     }
 
     return {
@@ -865,6 +897,49 @@
       .${OVERLAY_ESTIMATE_MOD} .${OVERLAY_FILL_CLASS} {
         display: none;
       }
+      /* Confidence treatment on Epic bars — reflects the ETA confidence
+         score (done/inProgress/todo/unestimated weighted blend). The
+         diagonal hatch pattern is painted via a ::after pseudo-element
+         stretched across the entire overlay so the "uncertainty" signal
+         covers both the filled and unfilled portions of the bar. The
+         fill opacity is reduced in lockstep: the lower the confidence,
+         the less the multiply-darkening reads as "solid progress".
+
+         Guarded against the ticket-estimate and sprint-fill variants,
+         which already have their own visual language and should not
+         pick up the hatch pattern. */
+      .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="medium"] .${OVERLAY_FILL_CLASS} {
+        opacity: 0.75;
+      }
+      .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="low"] .${OVERLAY_FILL_CLASS} {
+        opacity: 0.5;
+      }
+      .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="medium"]::after,
+      .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="low"]::after {
+        content: '';
+        position: absolute;
+        inset: 0;
+        pointer-events: none;
+        border-radius: inherit;
+      }
+      .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="medium"]::after {
+        background-image: repeating-linear-gradient(
+          45deg,
+          transparent 0,
+          transparent 6px,
+          rgba(255, 255, 255, 0.10) 6px,
+          rgba(255, 255, 255, 0.10) 10px
+        );
+      }
+      .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="low"]::after {
+        background-image: repeating-linear-gradient(
+          45deg,
+          transparent 0,
+          transparent 4px,
+          rgba(255, 255, 255, 0.20) 4px,
+          rgba(255, 255, 255, 0.20) 8px
+        );
+      }
       /* Sprint-fill variant: a full-height translucent wash that covers the
          chip's body, so the fill level reads at a glance across the whole
          button while the chip's own text ("FHSBFF Sprint 53…") stays fully
@@ -1362,26 +1437,58 @@
       if (overlay) overlay.remove();
     }
 
-    function applyProgress(bar, { done, total, epicKey }) {
-      if (!total || total <= 0) {
+    // Confidence tiers drive the opacity / hatch treatment applied to the
+    // epic bar: low-confidence epics read as "uncertain" at a glance via
+    // diagonal stripes + faded fill, without requiring a tooltip hover.
+    function confidenceTier(confidence) {
+      if (!(confidence >= 0)) return 'high'; // treat NaN/undefined as neutral
+      if (confidence < 40) return 'low';
+      if (confidence < 70) return 'medium';
+      return 'high';
+    }
+
+    function applyProgress(bar, { done, total, epicKey, childStats, confidence }) {
+      const stats = childStats || { done: 0, inProgress: 0, todo: 0, unestimated: 0, totalChildren: 0 };
+      // No children at all → nothing to visualize. Matches legacy behavior.
+      if (stats.totalChildren === 0 && (!total || total <= 0)) {
         removeOverlay(bar);
         delete bar.dataset.momentumTooltip;
         return;
       }
-      const pct = Math.max(0, Math.min(100, (done / total) * 100));
+      const pct = total > 0 ? Math.max(0, Math.min(100, (done / total) * 100)) : 0;
       const pctStr = `${pct.toFixed(1)}%`;
+      const conf = Number.isFinite(confidence) ? confidence : 0;
+      const tier = confidenceTier(conf);
 
       const overlay = ensureOverlay(bar);
       overlay.classList.remove(OVERLAY_ESTIMATE_MOD);
+      overlay.dataset.confidence = tier;
       const fill = overlay.querySelector(`.${OVERLAY_FILL_CLASS}`);
       const label = overlay.querySelector(`.${OVERLAY_LABEL_CLASS}`);
       if (fill) fill.style.width = pctStr;
-      if (label) label.textContent = `${done} / ${total} SP`;
+      if (label) {
+        // In-bar label stays compact: append "· N?" only when there are
+        // unestimated children, so the "chiffrage incomplet" badge is
+        // visible at a glance without cluttering well-estimated epics.
+        const suffix = stats.unestimated > 0 ? ` · ${stats.unestimated}?` : '';
+        label.textContent = `${done} / ${total} SP${suffix}`;
+      }
 
       // Tooltip text — the interceptor (installed at bootstrap) will rewrite
       // JIRA's Atlaskit tooltip with this value when it appears on hover.
       // aria-label and title are set as accessibility/fallback hints.
-      const tooltipText = `${epicKey} — ${done} / ${total} SP (${pct.toFixed(0)}%)`;
+      const confidenceLine = `Confiance : ${conf.toFixed(0)}% (${tier})`;
+      const breakdownParts = [];
+      if (stats.done) breakdownParts.push(`${stats.done} done`);
+      if (stats.inProgress) breakdownParts.push(`${stats.inProgress} en cours`);
+      if (stats.todo) breakdownParts.push(`${stats.todo} todo`);
+      if (stats.unestimated) breakdownParts.push(`${stats.unestimated} sans SP`);
+      const breakdown = breakdownParts.length
+        ? ` — ${breakdownParts.join(', ')}`
+        : '';
+      const tooltipText =
+        `${epicKey} — ${done} / ${total} SP (${pct.toFixed(0)}%)\n` +
+        `${confidenceLine}${breakdown}`;
       bar.dataset.momentumTooltip = tooltipText;
       bar.setAttribute('aria-label', tooltipText);
       bar.title = tooltipText;
@@ -1420,9 +1527,14 @@
 
       const meta = await issueMeta.get(issueKey);
       if (meta.isEpic) {
-        const { done, total } = await epicProgress.get(issueKey);
-        if (isDebug() && !isRefresh) debug(`${issueKey} (epic): ${done}/${total} SP`);
-        applyProgress(bar, { done, total, epicKey: issueKey });
+        const { done, total, childStats, confidence } = await epicProgress.get(issueKey);
+        if (isDebug() && !isRefresh) {
+          debug(
+            `${issueKey} (epic): ${done}/${total} SP, confidence=${Math.round(confidence)}%, ` +
+            `unestimated=${childStats?.unestimated ?? 0}/${childStats?.totalChildren ?? 0}`,
+          );
+        }
+        applyProgress(bar, { done, total, epicKey: issueKey, childStats, confidence });
       } else {
         if (isDebug() && !isRefresh) debug(`${issueKey} (ticket): ${meta.storyPoints ?? '—'} SP`);
         applyEstimate(bar, { sp: meta.storyPoints, issueKey });
@@ -1857,8 +1969,12 @@
         title: '1. Epic Progress Bar',
         body:
           'Chaque Epic de la Timeline affiche une barre de progression calculée ' +
-          'sur Σ SP done / Σ SP total de ses tickets enfants. Les chiffres sont ' +
-          'mis en cache pendant 60 s pour rester réactifs.',
+          'sur Σ SP done / Σ SP total de ses tickets enfants. Un indice de confiance ' +
+          'pondère done (×1.0), en cours (×0.6) et todo (×0.15) puis divise par le ' +
+          'nombre total de tickets enfants — les tickets sans chiffrage tirent le ' +
+          'score vers le bas. Une confiance faible est signalée par un hachuré ' +
+          'diagonal et une opacité réduite sur la barre ; le badge « N? » indique ' +
+          'le nombre de tickets enfants sans SP.',
         findTarget: () =>
           document.querySelector(
             `.${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})`,
