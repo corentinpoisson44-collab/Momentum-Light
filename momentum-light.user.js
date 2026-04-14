@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.2.4
-// @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, et chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog).
+// @version      0.3.10
+// @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), et indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
 // @run-at       document-idle
@@ -21,11 +21,18 @@
   const LOG_PREFIX = '[Momentum-Light]';
   const ISSUE_KEY_REGEX = /\b([A-Z][A-Z0-9]+-\d+)\b/;
   const EPIC_CHILDREN_TTL_MS = 60_000;
+  // DOM-side: Jira re-renders the timeline in dozens of micro-mutations, so we
+  // wait a bit to coalesce them into a single feature pass.
   const MUTATION_DEBOUNCE_MS = 200;
+  // API-side: a ticket move fires at most a couple of requests (REST + GraphQL
+  // mirror). We just want to coalesce that burst, not wait for anything else,
+  // so this debounce is kept tight to minimise perceived update latency.
+  const API_MUTATION_DEBOUNCE_MS = 50;
   const OVERLAY_CLASS = 'momentum-progress';
   const OVERLAY_FILL_CLASS = 'momentum-progress__fill';
   const OVERLAY_LABEL_CLASS = 'momentum-progress__label';
   const OVERLAY_ESTIMATE_MOD = 'momentum-progress--estimate';
+  const OVERLAY_SPRINT_FILL_MOD = 'momentum-progress--sprint-fill';
   const VELOCITY_BANNER_ID = 'momentum-velocity-banner';
 
   // Debug mode is opt-in per session. Enable from DevTools:
@@ -40,18 +47,26 @@
   const warn = (...args) => console.warn(LOG_PREFIX, ...args);
   const error = (...args) => console.error(LOG_PREFIX, ...args);
 
-  // Rate-limited info-level logger for recurring signals we want visible
-  // regardless of debug mode (e.g. bar discovery counts). Deduplicates the
-  // same message so a quiet steady state doesn't spam the console.
+  // Rate-limited heartbeat logger. Suppressed entirely when debug mode is off
+  // (the steady-state mutation loop can emit the same signals tens of times
+  // per minute; useful for diagnosis but noisy for end users). In debug mode,
+  // each unique message fires at most once per 30 s so state changes still
+  // show through without flooding.
   const heartbeat = (() => {
-    let lastMsg = null;
-    let lastAt = 0;
+    const lastByMsg = new Map();
+    const TTL_MS = 30_000;
+    const MAX_KEYS = 40;
     return (...args) => {
+      if (!isDebug()) return;
       const msg = args.map((a) => (typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' ');
       const now = Date.now();
-      if (msg === lastMsg && now - lastAt < 5_000) return;
-      lastMsg = msg;
-      lastAt = now;
+      const prev = lastByMsg.get(msg) || 0;
+      if (now - prev < TTL_MS) return;
+      lastByMsg.set(msg, now);
+      if (lastByMsg.size > MAX_KEYS) {
+        const oldestKey = lastByMsg.keys().next().value;
+        lastByMsg.delete(oldestKey);
+      }
       console.log(LOG_PREFIX, ...args);
     };
   })();
@@ -62,6 +77,30 @@
       if (t) clearTimeout(t);
       t = setTimeout(() => fn.apply(this, args), delay);
     };
+  }
+
+  // perfMark / perfStamp — tiny timing instrument used to trace the
+  // sprint-fill update pipeline in debug mode. `perfMark(reason)` starts
+  // a fresh clock; `perfStamp(reason)` logs ms elapsed since the last
+  // mark, but only within PERF_WINDOW_MS of that mark — otherwise the
+  // stamp has no meaningful correlation with any user action (the DOM
+  // observer re-runs the pipeline every ~200 ms regardless). No-op when
+  // debug mode is off.
+  const PERF_WINDOW_MS = 5_000;
+  let lastPerfMarkAt = null;
+  function perfNow() {
+    return typeof performance !== 'undefined' ? performance.now() : Date.now();
+  }
+  function perfMark(reason) {
+    lastPerfMarkAt = perfNow();
+    if (isDebug()) console.log(LOG_PREFIX, `[t=0] ${reason}`);
+  }
+  function perfStamp(reason) {
+    if (!isDebug()) return;
+    if (lastPerfMarkAt == null) return;
+    const t = perfNow() - lastPerfMarkAt;
+    if (t > PERF_WINDOW_MS) return; // stale mark → skip silently
+    console.log(LOG_PREFIX, `[t=${Math.round(t)}] ${reason}`);
   }
 
   // ---------------------------------------------------------------------------
@@ -147,7 +186,48 @@
   })();
 
   // ---------------------------------------------------------------------------
-  // issueMeta — batched fetch of { isEpic, storyPoints } per issue key.
+  // sprintField — dynamic discovery of the Sprint custom field id (mirror of
+  // storyPointsField). Needed so we can bucket issues returned by a single
+  // "sprint in (a,b,c)" JQL into their respective sprints without issuing one
+  // /rest/agile/1.0/sprint/{id}/issue call per sprint.
+  // ---------------------------------------------------------------------------
+
+  const sprintField = (() => {
+    const CACHE_KEY = 'momentum-light::sprint-field-id';
+    let inflight = null;
+
+    return {
+      async resolve() {
+        const cached = sessionStorage.getItem(CACHE_KEY);
+        if (cached) return cached;
+        if (inflight) return inflight;
+
+        inflight = (async () => {
+          const fields = await jiraApi.listFields();
+          // The sprint field is an Atlassian-managed custom field whose
+          // schema.custom ends with ":gh-sprint". Match on that primarily,
+          // fall back to name === "sprint" for older instances.
+          const match =
+            fields.find((f) => String(f.schema?.custom || '').endsWith(':gh-sprint')) ||
+            fields.find((f) => (f.name || '').toLowerCase().trim() === 'sprint');
+          if (!match) {
+            throw new Error('Sprint custom field not found on this instance');
+          }
+          sessionStorage.setItem(CACHE_KEY, match.id);
+          log('Sprint field resolved:', match.id, `(${match.name})`);
+          return match.id;
+        })();
+
+        try {
+          return await inflight;
+        } finally {
+          inflight = null;
+        }
+      },
+    };
+  })();
+
+  // ---------------------------------------------------------------------------
   // Multiple concurrent requests within a 50 ms window are coalesced into a
   // single `key in (...)` JQL query so expanding an Epic with 20 children
   // costs one API round-trip instead of 20.
@@ -326,6 +406,24 @@
       return all;
     }
 
+    // Active + future sprints of a board — the "open" sprints we overlay
+    // with a fill indicator on the timeline's Sprints row.
+    async function listOpenSprints(boardId) {
+      const all = [];
+      let startAt = 0;
+      const pageSize = 50;
+      while (all.length < 200) {
+        const data = await jiraApi.request(
+          `/rest/agile/1.0/board/${boardId}/sprint?state=active,future&startAt=${startAt}&maxResults=${pageSize}`,
+        );
+        const values = data.values || [];
+        all.push(...values);
+        if (data.isLast || values.length < pageSize) break;
+        startAt += pageSize;
+      }
+      return all;
+    }
+
     // Authoritative per-sprint velocity via the Sprint Report endpoint.
     // Returns the SP sum of issues that were completed WITHIN the sprint
     // window — ignores issues that were moved out and completed elsewhere.
@@ -389,45 +487,320 @@
         resolveBoardId(),
       ]);
 
-      const sprints = await listClosedSprints(boardId);
-      if (!sprints.length) {
-        return { average: 0, sprints: [], boardId, note: 'no closed sprints' };
-      }
-      // Most recently closed first. `completeDate` is the actual close time;
-      // fall back to `endDate` then `startDate` so sprints without a close
-      // stamp still sort reasonably.
-      const byCloseDesc = (a, b) => {
-        const ka = new Date(a.completeDate || a.endDate || a.startDate || 0).getTime();
-        const kb = new Date(b.completeDate || b.endDate || b.startDate || 0).getTime();
-        return kb - ka;
-      };
-      const recent = sprints.sort(byCloseDesc).slice(0, SPRINT_WINDOW);
+      // Fetch closed (for average) and open (for planning overlays) in
+      // parallel — they are independent.
+      const [closed, openSprints] = await Promise.all([
+        listClosedSprints(boardId),
+        listOpenSprints(boardId).catch((e) => {
+          warn('listOpenSprints failed:', e?.message || e);
+          return [];
+        }),
+      ]);
 
-      const perSprint = [];
-      for (const s of recent) {
-        const done = await sprintCompletedSP(boardId, s.id, spFieldId);
-        perSprint.push({ id: s.id, name: s.name, velocity: done });
+      let average = 0;
+      let perSprint = [];
+      if (closed.length) {
+        // Most recently closed first. `completeDate` is the actual close time;
+        // fall back to `endDate` then `startDate` so sprints without a close
+        // stamp still sort reasonably.
+        const byCloseDesc = (a, b) => {
+          const ka = new Date(a.completeDate || a.endDate || a.startDate || 0).getTime();
+          const kb = new Date(b.completeDate || b.endDate || b.startDate || 0).getTime();
+          return kb - ka;
+        };
+        const recent = closed.sort(byCloseDesc).slice(0, SPRINT_WINDOW);
+        // Fetch all N sprint-reports in parallel. Jira comfortably handles
+        // a handful of concurrent requests against the same endpoint, and
+        // this cuts the velocity first-paint from ~N× round-trip to ~1×.
+        const velocities = await Promise.all(
+          recent.map((s) =>
+            sprintCompletedSP(boardId, s.id, spFieldId).catch((e) => {
+              warn(`velocity: sprint ${s.id} failed:`, e?.message || e);
+              return 0;
+            }),
+          ),
+        );
+        perSprint = recent.map((s, i) => ({ id: s.id, name: s.name, velocity: velocities[i] }));
+        const total = perSprint.reduce((acc, s) => acc + s.velocity, 0);
+        average = perSprint.length ? total / perSprint.length : 0;
       }
-      const total = perSprint.reduce((acc, s) => acc + s.velocity, 0);
-      const average = perSprint.length ? total / perSprint.length : 0;
-      return { average, sprints: perSprint, boardId };
+
+      const openLite = openSprints.map((s) => ({
+        id: s.id,
+        name: s.name,
+        state: s.state, // 'active' | 'future'
+      }));
+
+      return { average, sprints: perSprint, boardId, openSprints: openLite };
+    }
+
+    async function getCached() {
+      const now = Date.now();
+      if (cache && cache.expiresAt > now) return cache.value;
+      if (inflight) return inflight;
+      inflight = (async () => {
+        try {
+          const value = await compute();
+          cache = { expiresAt: Date.now() + CACHE_TTL_MS, value };
+          return value;
+        } finally {
+          inflight = null;
+        }
+      })();
+      return inflight;
     }
 
     return {
-      async get() {
-        const now = Date.now();
-        if (cache && cache.expiresAt > now) return cache.value;
-        if (inflight) return inflight;
-        inflight = (async () => {
-          try {
-            const value = await compute();
-            cache = { expiresAt: Date.now() + CACHE_TTL_MS, value };
-            return value;
-          } finally {
-            inflight = null;
+      // Kept for compatibility with the velocity-banner (returns
+      // { average, sprints, boardId } — extra fields are ignored).
+      get: getCached,
+      // Planning view: everything `get()` returns + `openSprints` (active
+      // and future sprints on the board).
+      getPlanningContext: getCached,
+      // Sync best-effort access to the open-sprint id set. Returns an
+      // empty set before the first resolution; used by the API
+      // interceptor to sanity-check candidate sprint ids extracted from
+      // GraphQL variables (no schema means we need a reality check).
+      getKnownOpenSprintIds() {
+        if (!cache || !cache.value) return new Set();
+        return new Set((cache.value.openSprints || []).map((s) => Number(s.id)));
+      },
+    };
+  })();
+
+  // ---------------------------------------------------------------------------
+  // sprintCapacity — per-sprint planned SP load, for the timeline Sprints
+  // row overlays. Same TTL + inflight-dedup pattern as `epicProgress`.
+  //
+  // Metric depends on the sprint state:
+  //   - `active`  → sum of SP of issues NOT in a done statusCategory
+  //                 (remaining work, matching what a team would still
+  //                 need to deliver before sprint close).
+  //   - `future`  → sum of SP of ALL assigned issues (what's been planned
+  //                 into the sprint so far).
+  // Issues without a valid SP value are ignored (SP 0 = not estimated).
+  // ---------------------------------------------------------------------------
+
+  const sprintCapacity = (() => {
+    // Short TTL: the sprint-fill overlay is primarily read while the user
+    // is actively moving tickets between sprints, so fresh data matters
+    // more than request economy. The interceptor invalidates explicitly
+    // on mutation but may miss proprietary/graphql paths — the TTL is
+    // the safety net that bounds staleness even in the miss case.
+    const TTL_MS = 15_000;
+    // Batching window: concurrent get() calls within this window coalesce
+    // into a single JQL round-trip. 20ms is enough to catch the burst of
+    // chip decorations fired by one runActiveFeatures pass, short enough
+    // that it doesn't contribute meaningfully to perceived latency.
+    const FLUSH_DELAY_MS = 20;
+
+    const cache = new Map(); // `${id}:${state}` -> { expiresAt, value }
+    const inflight = new Map(); // `${id}:${state}` -> Promise<value>
+    const batchWaiters = new Map(); // `${id}:${state}` -> [{ resolve, reject }]
+    let pending = new Map(); // sprintId -> state (last state wins; states are stable per sprint)
+    let flushTimer = null;
+    let onFreshListener = null;
+
+    // Issue catalog — populated as a side-effect of runBatch. For every
+    // issue that appears in a batch response we remember its SP, the set
+    // of sprint IDs it belonged to, and its done-ness. This is what makes
+    // optimistic updates possible: when Jira fires a sprint-change
+    // mutation we look up the issue's prior state here, compute the delta
+    // locally, and repaint instantly — no round-trip wait.
+    const issueCatalog = new Map(); // issueKey -> { sp, sprintIds: Set<number>, isDone }
+
+    async function runBatch(entries) {
+      // entries: [[sprintId, state], ...]
+      const [spFieldId, sprintFieldId] = await Promise.all([
+        storyPointsField.resolve(),
+        sprintField.resolve(),
+      ]);
+      const ids = entries.map(([id]) => id);
+      const idSet = new Set(ids);
+      const jql = `sprint in (${ids.join(',')})`;
+      // maxResults=1000: covers the vast majority of plans (20 sprints ×
+      // ~50 issues). If a user has a giant plan we'll undercount the
+      // tail — acceptable; matches the previous /sprint/{id}/issue limit
+      // of 500 per sprint in practice.
+      const data = await jiraApi.searchIssues(
+        jql,
+        [spFieldId, 'status', sprintFieldId],
+        1000,
+      );
+
+      const perSprint = new Map();
+      for (const [id] of entries) perSprint.set(id, { total: 0, remaining: 0 });
+
+      for (const issue of data.issues || []) {
+        const sp = Number(issue.fields?.[spFieldId]);
+        if (!Number.isFinite(sp) || sp <= 0) continue;
+        const isDone = issue.fields?.status?.statusCategory?.key === 'done';
+        const sprintsRaw = issue.fields?.[sprintFieldId];
+        const sprintList = Array.isArray(sprintsRaw) ? sprintsRaw : [];
+        const issueSprintIds = new Set();
+        for (const s of sprintList) {
+          const sid = Number(s?.id);
+          if (!Number.isFinite(sid) || sid <= 0) continue;
+          issueSprintIds.add(sid);
+          if (!idSet.has(sid)) continue;
+          const bucket = perSprint.get(sid);
+          bucket.total += sp;
+          if (!isDone) bucket.remaining += sp;
+        }
+        // Catalog the issue (for optimistic updates on sprint moves).
+        // Keep a record even if no requested sprint matched — the issue
+        // might still be moved INTO one of our tracked sprints later.
+        if (issue.key) {
+          issueCatalog.set(issue.key, { sp, sprintIds: issueSprintIds, isDone });
+        }
+      }
+
+      const results = new Map();
+      for (const [id, state] of entries) {
+        const b = perSprint.get(id) || { total: 0, remaining: 0 };
+        const load = state === 'active' ? b.remaining : b.total;
+        results.set(`${id}:${state}`, { total: b.total, remaining: b.remaining, load, state });
+      }
+      return results;
+    }
+
+    async function flushBatch() {
+      flushTimer = null;
+      const entries = [...pending.entries()];
+      pending = new Map();
+      if (entries.length === 0) return;
+
+      perfStamp(`JQL batch start (${entries.length} sprints)`);
+      let results;
+      try {
+        results = await runBatch(entries);
+      } catch (e) {
+        for (const [id, state] of entries) {
+          const key = `${id}:${state}`;
+          const w = batchWaiters.get(key);
+          if (w) {
+            w.forEach(({ reject }) => reject(e));
+            batchWaiters.delete(key);
           }
-        })();
-        return inflight;
+          inflight.delete(key);
+        }
+        return;
+      }
+
+      const now = Date.now();
+      for (const [id, state] of entries) {
+        const key = `${id}:${state}`;
+        const value = results.get(key);
+        if (value) cache.set(key, { expiresAt: now + TTL_MS, value });
+        const w = batchWaiters.get(key);
+        if (w) {
+          w.forEach(({ resolve }) => resolve(value));
+          batchWaiters.delete(key);
+        }
+        inflight.delete(key);
+      }
+      perfStamp(`JQL batch done (${entries.length} sprints, ${cache.size} cache entries)`);
+      // Let the feature pipeline re-run so stale-while-revalidate consumers
+      // repaint with the freshly-landed numbers.
+      if (onFreshListener) {
+        try { onFreshListener(); } catch (e) { /* listener error shouldn't poison batch */ }
+      }
+    }
+
+    function enqueue(sprintId, state) {
+      pending.set(sprintId, state);
+      if (!flushTimer) flushTimer = setTimeout(flushBatch, FLUSH_DELAY_MS);
+    }
+
+    function awaitBatch(key) {
+      return new Promise((resolve, reject) => {
+        if (!batchWaiters.has(key)) batchWaiters.set(key, []);
+        batchWaiters.get(key).push({ resolve, reject });
+      });
+    }
+
+    function scheduleRefresh(sprintId, state) {
+      const key = `${sprintId}:${state}`;
+      if (inflight.has(key)) return inflight.get(key);
+      const p = awaitBatch(key);
+      // Swallow rejections on the inflight reference; callers that await
+      // will still observe them.
+      p.catch(() => {});
+      inflight.set(key, p);
+      enqueue(sprintId, state);
+      return p;
+    }
+
+    function adjustCachedBucket(sprintId, deltaSp, isDone) {
+      for (const state of ['active', 'future']) {
+        const hit = cache.get(`${sprintId}:${state}`);
+        if (!hit) continue;
+        const v = hit.value;
+        v.total = Math.max(0, v.total + deltaSp);
+        if (!isDone) v.remaining = Math.max(0, v.remaining + deltaSp);
+        v.load = state === 'active' ? v.remaining : v.total;
+      }
+    }
+
+    return {
+      async get(sprintId, state) {
+        const key = `${sprintId}:${state}`;
+        const now = Date.now();
+        const hit = cache.get(key);
+        if (hit && hit.expiresAt > now) return hit.value;
+        // Stale-while-revalidate: return old value immediately so the chip
+        // stays painted (no flicker / no empty state), while a background
+        // batch refreshes the numbers. The onFresh listener triggers a
+        // re-run of runActiveFeatures once the batch lands.
+        if (hit) {
+          scheduleRefresh(sprintId, state);
+          return hit.value;
+        }
+        // Cold cache: must wait for the first batch to complete.
+        return scheduleRefresh(sprintId, state);
+      },
+      invalidate(sprintId) {
+        // Mark expired but keep the last known value for stale-while-
+        // revalidate — so the user sees the old numbers during the refetch
+        // instead of an empty overlay or pre-mutation stale data.
+        const a = cache.get(`${sprintId}:active`);
+        const f = cache.get(`${sprintId}:future`);
+        if (a) a.expiresAt = 0;
+        if (f) f.expiresAt = 0;
+      },
+      invalidateAll() {
+        for (const entry of cache.values()) entry.expiresAt = 0;
+      },
+      onFresh(listener) {
+        onFreshListener = listener;
+      },
+      // Optimistic update: called from the API interceptor the moment a
+      // ticket-sprint change is detected. We mutate the cached load/total
+      // in place so the next SWR read (triggered synchronously via the
+      // onFresh listener) paints the correct numbers without waiting for
+      // the JQL refresh to land. The real batch still fires in the
+      // background and will overwrite with authoritative values.
+      //
+      // Returns true if the delta was applied, false if we didn't know
+      // about the issue (catalog miss → fall back to JQL-refresh timing).
+      applyOptimisticMove(issueKey, targetSprintIds) {
+        const meta = issueCatalog.get(issueKey);
+        if (!meta) return false;
+        const prevIds = meta.sprintIds;
+        const newIds = new Set(targetSprintIds.filter((n) => Number.isFinite(n) && n > 0));
+        const removed = [...prevIds].filter((id) => !newIds.has(id));
+        const added = [...newIds].filter((id) => !prevIds.has(id));
+        if (removed.length === 0 && added.length === 0) return false;
+        for (const id of removed) adjustCachedBucket(id, -meta.sp, meta.isDone);
+        for (const id of added) adjustCachedBucket(id, +meta.sp, meta.isDone);
+        // Mirror the move in the catalog so repeated moves compose correctly.
+        meta.sprintIds = newIds;
+        return true;
+      },
+      getSprintFieldIdSync() {
+        // Synchronous read of the resolved sprint field id (if any).
+        // Used by the interceptor to parse mutation bodies without awaiting.
+        return sessionStorage.getItem('momentum-light::sprint-field-id');
       },
     };
   })();
@@ -487,6 +860,36 @@
          The text-shadow keeps it legible on any bar color without needing
          the mix-blend-mode fill. */
       .${OVERLAY_ESTIMATE_MOD} .${OVERLAY_FILL_CLASS} {
+        display: none;
+      }
+      /* Sprint-fill variant: a thin colored strip anchored to the bottom
+         of the sprint chip, so the chip's own text ("FHSBFF Sprint 53…")
+         stays fully readable. The overlay overrides .momentum-progress's
+         inset:0 to become a 5px bottom bar; the numeric label lives in
+         the tooltip, not inside the chip. */
+      .${OVERLAY_SPRINT_FILL_MOD} {
+        top: auto;
+        height: 5px;
+        border-radius: 0 0 inherit inherit;
+        background-color: rgba(9, 30, 66, 0.12); /* subtle track */
+      }
+      .${OVERLAY_SPRINT_FILL_MOD} .${OVERLAY_FILL_CLASS} {
+        background-color: #36B37E;
+        mix-blend-mode: normal;
+        opacity: 0.95;
+      }
+      .${OVERLAY_SPRINT_FILL_MOD}[data-fill-state="under"] .${OVERLAY_FILL_CLASS} {
+        background-color: #36B37E;
+      }
+      .${OVERLAY_SPRINT_FILL_MOD}[data-fill-state="on-target"] .${OVERLAY_FILL_CLASS} {
+        background-color: #FFAB00;
+      }
+      .${OVERLAY_SPRINT_FILL_MOD}[data-fill-state="over"] .${OVERLAY_FILL_CLASS} {
+        background-color: #DE350B;
+      }
+      /* No in-chip numeric label — the sprint name stays clean and the
+         exact numbers live in the tooltip via dataset.momentumTooltip. */
+      .${OVERLAY_SPRINT_FILL_MOD} .${OVERLAY_LABEL_CLASS} {
         display: none;
       }
       /* Full-width sticky banner anchored at the top of the plan's main
@@ -618,13 +1021,15 @@
       if (prefixHits.length > 0) {
         const leaves = leavesOnly(prefixHits);
         const bars = leaves.filter(isBarSized);
-        if (isDebug()) {
-          debug(
-            'findBars → prefix hits:', prefixHits.length,
-            'leaves:', leaves.length,
-            'bars:', bars.length,
-          );
-        }
+        // Heartbeat (not raw debug): this log fires on every pipeline
+        // pass (~200ms) and the numbers are identical across passes
+        // while the DOM is stable — dedup via heartbeat's 30s TTL so a
+        // steady-state timeline doesn't flood the console.
+        heartbeat(
+          'findBars → prefix hits:', prefixHits.length,
+          'leaves:', leaves.length,
+          'bars:', bars.length,
+        );
         return bars;
       }
 
@@ -855,6 +1260,259 @@
   })();
 
   // ---------------------------------------------------------------------------
+  // sprintChipDom — detect sprint chips on the timeline's "Sprints" row and
+  // paint a fill overlay that reports load vs. the 5-sprint average velocity.
+  //
+  // Detection strategy (first hit wins):
+  //   1. Semantic — find a list-side cell whose trimmed text is exactly
+  //      "Sprints", climb to its row container, then pick every <button>
+  //      descendant on the chart-side. This survives Atlaskit class-name
+  //      churn because it keys off the visible label, not generated CSS.
+  //   2. Testid probe — if step 1 yields nothing, we rate-limit-dump the
+  //      DOM's testid distribution to `window.__MOMENTUM_PROBE__` (same
+  //      pattern as `timelineDom.probeCandidates`) so a future build can
+  //      add the right selector without re-releasing.
+  //
+  // Geometric filter: chips narrower than 40px or taller than 32px are
+  // skipped (too small to render a readable overlay, or not actually a
+  // sprint chip).
+  // ---------------------------------------------------------------------------
+
+  const sprintChipDom = (() => {
+    const CHIP_MIN_WIDTH = 40;
+    const CHIP_MIN_HEIGHT = 14;
+    const CHIP_MAX_HEIGHT = 32;
+    const decorated = new WeakMap(); // chip -> { sprintId, state }
+
+    // Find the "Sprints" row on the list side of the timeline. Relies on
+    // the visible label rather than Atlaskit testids (which change).
+    function findSprintsRow(root) {
+      const candidates = root.querySelectorAll('div, span, th, td');
+      for (const el of candidates) {
+        // Cheap reject before reading textContent (which can be huge on
+        // container nodes). Only consider leaf-ish elements.
+        if (el.children.length > 2) continue;
+        const text = (el.textContent || '').trim();
+        if (text !== 'Sprints') continue;
+        // Climb to the enclosing row. Rows in the Atlaskit timeline are
+        // typically several levels up; stop at the first ancestor that
+        // also contains at least one <button> sibling further right.
+        let cursor = el.parentElement;
+        let steps = 0;
+        while (cursor && cursor !== document.body && steps < 12) {
+          if (cursor.querySelector('button')) return cursor;
+          cursor = cursor.parentElement;
+          steps += 1;
+        }
+      }
+      return null;
+    }
+
+    function isChipSized(el) {
+      const r = el.getBoundingClientRect();
+      if (r.width < CHIP_MIN_WIDTH) return false;
+      if (r.height < CHIP_MIN_HEIGHT || r.height > CHIP_MAX_HEIGHT) return false;
+      return true;
+    }
+
+    function findChips(root) {
+      const row = findSprintsRow(root);
+      if (!row) return [];
+      return [...row.querySelectorAll('button')].filter(isChipSized);
+    }
+
+    let lastProbeAt = 0;
+    function probe(root) {
+      const now = Date.now();
+      if (now - lastProbeAt < 3_000) return;
+      lastProbeAt = now;
+      // Collect every element whose trimmed text starts with "Sprint" to
+      // help us tune the detection heuristic offline.
+      const hits = [];
+      root.querySelectorAll('button, span, div').forEach((el) => {
+        if (el.children.length > 0) return;
+        const t = (el.textContent || '').trim();
+        if (t && /sprint/i.test(t) && t.length < 60) {
+          hits.push({
+            text: t,
+            tag: el.tagName.toLowerCase(),
+            testid: el.getAttribute('data-testid') || null,
+          });
+        }
+      });
+      window.__MOMENTUM_SPRINT_PROBE__ = {
+        timestamp: new Date().toISOString(),
+        sprintRowFound: !!findSprintsRow(root),
+        sampleSprintLabels: hits.slice(0, 40),
+      };
+      warn(
+        `sprintChipDom probe — row found: ${!!findSprintsRow(root)}, sample sprint-label hits: ${hits.length}. ` +
+          'Dump at window.__MOMENTUM_SPRINT_PROBE__',
+      );
+    }
+
+    function ensureOverlay(chip) {
+      let overlay = chip.querySelector(`:scope > .${OVERLAY_CLASS}`);
+      if (overlay) return overlay;
+      const computed = getComputedStyle(chip);
+      if (computed.position === 'static') chip.style.position = 'relative';
+      overlay = document.createElement('div');
+      overlay.className = `${OVERLAY_CLASS} ${OVERLAY_SPRINT_FILL_MOD}`;
+      const fill = document.createElement('div');
+      fill.className = OVERLAY_FILL_CLASS;
+      overlay.appendChild(fill);
+      const label = document.createElement('div');
+      label.className = OVERLAY_LABEL_CLASS;
+      overlay.appendChild(label);
+      chip.insertBefore(overlay, chip.firstChild);
+      return overlay;
+    }
+
+    function removeOverlay(chip) {
+      const overlay = chip.querySelector(`:scope > .${OVERLAY_CLASS}`);
+      if (overlay) overlay.remove();
+    }
+
+    function extractSprintName(chip) {
+      // The chip's visible label might be truncated ("FHSBFF Sprint..."),
+      // so prefer aria-label / title which carry the full name. Fallback
+      // to textContent for older builds.
+      return (
+        (chip.getAttribute('aria-label') || '').trim() ||
+        (chip.getAttribute('title') || '').trim() ||
+        (chip.textContent || '').trim()
+      );
+    }
+
+    // Canonicalize a sprint name for resilient matching between the chip's
+    // label and the API's `sprint.name`. Jira's timeline sometimes appends
+    // a counter (e.g. "FHSBFF Sprint 53 (29 issues)") or wraps the label
+    // with whitespace; the API always returns the bare name. Lowercasing
+    // and collapsing whitespace makes the match robust to both.
+    function normalizeSprintName(raw) {
+      if (!raw) return '';
+      return raw
+        .replace(/\s*\(\d+\s+(issues?|tickets?|items?)\)\s*$/i, '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLowerCase();
+    }
+
+    // Build a multi-key index { name → sprint } from the open-sprints list.
+    // `byKey` accepts both raw and normalized lookups; the attached
+    // `__ordered` array preserves the API order for substring fallback
+    // (chip labels may carry a localized prefix like "Sprint sélectionné: <name>").
+    function indexOpenSprints(openSprints) {
+      const byKey = new Map();
+      const ordered = [];
+      for (const s of openSprints) {
+        if (!s?.name) continue;
+        byKey.set(s.name, s);
+        byKey.set(normalizeSprintName(s.name), s);
+        ordered.push({ sprint: s, normKey: normalizeSprintName(s.name) });
+      }
+      byKey.__ordered = ordered;
+      return byKey;
+    }
+
+    function resolveSprint(chipName, byKey) {
+      if (!chipName) return null;
+      const direct =
+        byKey.get(chipName) ||
+        byKey.get(chipName.trim()) ||
+        byKey.get(normalizeSprintName(chipName));
+      if (direct) return direct;
+      // Substring fallback for localized/decorated chip labels. Longest
+      // sprint name wins so partial matches on short names don't hijack
+      // a more specific one.
+      const normChip = normalizeSprintName(chipName);
+      if (!normChip) return null;
+      let best = null;
+      let bestLen = 0;
+      for (const { sprint, normKey } of byKey.__ordered || []) {
+        if (normKey && normChip.includes(normKey) && normKey.length > bestLen) {
+          best = sprint;
+          bestLen = normKey.length;
+        }
+      }
+      return best;
+    }
+
+    function fillStateFor(ratio) {
+      if (ratio < 0.9) return 'under';
+      if (ratio <= 1.1) return 'on-target';
+      return 'over';
+    }
+
+    function applyFill(chip, { load, average, state, sprintName }) {
+      if (!Number.isFinite(load) || !Number.isFinite(average) || average <= 0) {
+        removeOverlay(chip);
+        delete chip.dataset.momentumTooltip;
+        return;
+      }
+      const ratio = load / average;
+      const pct = Math.max(0, Math.min(100, ratio * 100));
+      const overlay = ensureOverlay(chip);
+      overlay.dataset.fillState = fillStateFor(ratio);
+      const fill = overlay.querySelector(`.${OVERLAY_FILL_CLASS}`);
+      const label = overlay.querySelector(`.${OVERLAY_LABEL_CLASS}`);
+      if (fill) fill.style.width = `${pct.toFixed(1)}%`;
+
+      // Compact label inside the chip. 80px is the rough breakpoint below
+      // which the "X / Y SP" form no longer fits; fall back to a bare
+      // percentage there.
+      // Label node is hidden via CSS for the sprint-fill variant (the chip's
+      // own text is enough and the numbers live in the tooltip). We still
+      // populate its textContent as a no-op safety so CSS keeps it the only
+      // source of truth for the label visibility.
+      if (label) label.textContent = '';
+
+      // Tooltip override via dataset.momentumTooltip — picked up by
+      // tooltipInterceptor when Atlaskit's React tooltip appears on hover.
+      // Intentionally NOT writing aria-label/title on the chip: doing so
+      // would overwrite Jira's own a11y label and pollute the name that
+      // extractSprintName reads on the next cycle.
+      const stateSuffix = state === 'active' ? ' (restant)' : ' (planifié)';
+      chip.dataset.momentumTooltip = `${sprintName} — ${Math.round(
+        load,
+      )} SP${stateSuffix} / ${Math.round(average)} SP moyenne (${Math.round(ratio * 100)}%)`;
+    }
+
+    async function decorate(chip, byKey, average) {
+      const name = extractSprintName(chip);
+      if (!name) return null;
+      const sprint = resolveSprint(name, byKey);
+      if (!sprint) {
+        // Not an open sprint (closed, or unknown). Leave chip untouched.
+        if (decorated.has(chip)) {
+          removeOverlay(chip);
+          decorated.delete(chip);
+        }
+        return null;
+      }
+      const prev = decorated.get(chip);
+      const isRefresh = prev && prev.sprintId === sprint.id && prev.state === sprint.state;
+      if (!isRefresh) decorated.set(chip, { sprintId: sprint.id, state: sprint.state });
+
+      const capacity = await sprintCapacity.get(sprint.id, sprint.state);
+      if (isDebug() && !isRefresh) {
+        debug(
+          `sprint ${sprint.id} "${name}" (${sprint.state}): load=${capacity.load} SP, avg=${average}`,
+        );
+      }
+      applyFill(chip, {
+        load: capacity.load,
+        average,
+        state: sprint.state,
+        sprintName: name,
+      });
+      return sprint;
+    }
+
+    return { findChips, decorate, probe, indexOpenSprints, extractSprintName };
+  })();
+
+  // ---------------------------------------------------------------------------
   // velocityBanner — sticky chip rendered at the top of the plan's main
   // content region, showing the average velocity of the last N closed
   // sprints. Click the chip to refresh.
@@ -1005,7 +1663,7 @@
     },
     {
       id: 'sprint-velocity-banner',
-      description: 'Fixed banner showing the average velocity of the last 3 closed sprints.',
+      description: 'Fixed banner showing the average velocity of the last 5 closed sprints.',
       isActive: isTimelineLikePath,
       onMutation() {
         // `update()` is idempotent and piggybacks on the 5 min velocity cache,
@@ -1016,6 +1674,63 @@
         // User navigated away from a timeline/plan page — clean up so the
         // banner doesn't linger on unrelated views.
         velocityBanner.remove();
+      },
+    },
+    {
+      id: 'sprint-fill-indicator',
+      description:
+        'Fill overlay on each active/future sprint chip (Sprints row) keyed to the 5-sprint ' +
+        'average velocity. Active sprints show remaining SP; future sprints show planned SP.',
+      isActive: isTimelineLikePath,
+      _warnedZeroMatch: false,
+      async onMutation(root) {
+        const chips = sprintChipDom.findChips(root);
+        heartbeat('sprint chips found:', chips.length);
+        if (chips.length === 0) {
+          sprintChipDom.probe(root);
+          return;
+        }
+        perfStamp(`sprint-fill: decorating ${chips.length} chips`);
+        let ctx;
+        try {
+          ctx = await velocity.getPlanningContext();
+        } catch (e) {
+          warn('planning context unavailable:', e?.message || e);
+          return;
+        }
+        if (!ctx || !(ctx.average > 0) || !ctx.openSprints?.length) return;
+        const byKey = sprintChipDom.indexOpenSprints(ctx.openSprints);
+
+        // Run all decorations in parallel; aggregate match outcomes so we
+        // can surface a "sprint chips matched: X/Y" heartbeat. This gives
+        // us a one-line signal to diagnose the "feature invisible" case
+        // without duplicating the matching logic here.
+        const outcomes = await Promise.all(
+          chips.map((chip) =>
+            sprintChipDom.decorate(chip, byKey, ctx.average).catch((e) => {
+              warn('sprint decorate failed:', e?.message || e);
+              return null;
+            }),
+          ),
+        );
+        const matched = outcomes.filter(Boolean).length;
+        heartbeat(`sprint chips matched: ${matched}/${chips.length}`);
+        if (matched === 0 && !this._warnedZeroMatch) {
+          this._warnedZeroMatch = true;
+          const unmatchedSample = chips
+            .slice(0, 5)
+            .map((c) => sprintChipDom.extractSprintName(c))
+            .filter(Boolean);
+          warn(
+            `sprint-fill: 0/${chips.length} chips matched an active/future sprint. ` +
+              'Chip labels (sample):',
+            unmatchedSample,
+            '| open sprint names (sample):',
+            ctx.openSprints.slice(0, 10).map((s) => s.name),
+          );
+        } else if (matched > 0) {
+          this._warnedZeroMatch = false;
+        }
       },
     },
   ];
@@ -1097,6 +1812,415 @@
   })();
 
   // ---------------------------------------------------------------------------
+  // apiMutationInterceptor — monkey-patch window.fetch AND XMLHttpRequest so
+  // we can invalidate sprintCapacity the moment Jira commits a ticket-sprint
+  // change. Plans / Advanced Roadmaps persists scope changes through a
+  // patchwork of endpoints (classic REST, proprietary /rest/jpo, gateway
+  // routes, GraphQL) so the match list is intentionally broad.
+  //
+  // Strategy: any non-GET request to an Atlassian backend path that returns
+  // 2xx triggers invalidation unless it is on a read-only allowlist
+  // (search/jql, graphql queries that are safe to ignore). False positives
+  // are harmless — worst case we refetch sprint capacity once, which is
+  // cheap and rate-limited by the inflight-dedup.
+  // ---------------------------------------------------------------------------
+
+  const apiMutationInterceptor = (() => {
+    const MUTATING = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+
+    // Paths whose mutating method is definitely a sprint-membership
+    // change. Broad enough to cover Plans, Agile API, Greenhopper, and
+    // proprietary /rest/jpo routes.
+    const INVALIDATE_PATTERNS = [
+      /\/rest\/api\/\d+\/issue\b/i,              // REST v3 issue edits
+      /\/rest\/agile\/[^/]+\/(sprint|backlog|board|issue)\b/i, // Agile API
+      /\/rest\/greenhopper\/1\.0\//i,            // Greenhopper scope/sprint
+      /\/rest\/plans\//i,                        // Advanced Roadmaps REST
+      /\/rest\/jpo\//i,                          // Legacy Portfolio/Plans API
+      /\/gateway\/api\/.*\/(issues?|sprints?|plans?)\b/i, // Gateway routes
+    ];
+
+    // GraphQL is multiplexed (queries + mutations over the same POST).
+    // For non-persisted requests we match on URL but require the body
+    // to contain a `mutation` operation to avoid invalidating on every
+    // read query.
+    const GRAPHQL_URL_PATTERNS = [
+      /\/gateway\/api\/graphql\b/i,
+      /\/graphql\b/i,
+    ];
+
+    // Persisted-query mutations — Jira Cloud and Plans use these
+    // extensively (e.g. POST /gateway/api/graphql/pq/<hash>?operation=
+    // updateRoadmapItemMutation). The body is just { operationName,
+    // variables, extensions } — no literal `mutation` keyword, so
+    // isGraphqlMutationBody would miss them. Detect via the ?operation=
+    // query param whose value conventionally ends in "Mutation".
+    const GRAPHQL_PERSISTED_PATH = /\/graphql\/pq\//i;
+
+    // Read-only endpoints that happen to use POST. Excluded to avoid
+    // invalidating the cache when *we* search, or when Jira fetches lists.
+    const READONLY_EXCLUDES = [
+      /\/rest\/api\/\d+\/search(\b|\/jql)/i,     // POST /search/jql (our calls too)
+      /\/rest\/agile\/[^/]+\/board\b.*\/sprint\?/i, // sprint listing (GET-like)
+    ];
+
+    function isGraphqlMutationBody(body) {
+      if (!body) return false;
+      let text = body;
+      if (typeof text !== 'string') {
+        // Could be FormData/URLSearchParams/Blob; we don't peek those,
+        // treat as "possibly mutation" to stay safe.
+        return true;
+      }
+      // Look for a top-level `mutation` operation. Regex is forgiving to
+      // whitespace/named operations: `mutation Foo(...)` and bare
+      // `mutation { ... }` both match.
+      return /(^|["\\s{])mutation\s*[\s({]/i.test(text);
+    }
+
+    function isGraphqlPersistedMutation(url) {
+      if (!GRAPHQL_PERSISTED_PATH.test(url)) return false;
+      // Persisted queries carry the operation name in the query string
+      // (or occasionally in the body — we stick with URL for the fast
+      // path since it doesn't require parsing).
+      const m = url.match(/[?&]operation=([^&]+)/);
+      if (!m) return false;
+      return /mutation/i.test(decodeURIComponent(m[1]));
+    }
+
+    function extractSprintId(url) {
+      const m = url.match(/\/sprint\/(\d+)(\/|\?|$)/i);
+      return m ? Number(m[1]) : null;
+    }
+
+    function extractIssueKey(url) {
+      // Matches /rest/api/3/issue/ABC-123 (and variants). Anchored on
+      // `/issue/` so we don't accidentally grab keys appearing elsewhere
+      // in the URL (e.g. query params).
+      const m = url.match(/\/issue\/([A-Z][A-Z0-9]+-\d+)(\b|\/|\?|$)/);
+      return m ? m[1] : null;
+    }
+
+    // GraphQL mutations (Plans) carry their payload in a typed `variables`
+    // object whose shape depends on the operation. Rather than enumerate
+    // every mutation's schema (they change without notice), we walk the
+    // body heuristically:
+    //   - any string matching the issue-key regex is a candidate issue.
+    //   - any numeric value (or numeric-string) that coincides with a
+    //     known open-sprint id is a candidate target sprint.
+    // Cross-referencing against velocity.getKnownOpenSprintIds() keeps
+    // false positives near zero: a random number in the variables won't
+    // accidentally match a real sprint.
+    function extractGraphqlMove(body, openSprintIdSet) {
+      if (!body || typeof body !== 'string') return null;
+      if (!openSprintIdSet || openSprintIdSet.size === 0) return null;
+      let json;
+      try { json = JSON.parse(body); } catch { return null; }
+      const variables = json?.variables;
+      if (!variables || typeof variables !== 'object') return null;
+
+      const issueKeys = new Set();
+      const targetIds = new Set();
+      const walk = (node, depth) => {
+        if (depth > 6 || node == null) return;
+        if (typeof node === 'string') {
+          if (/^[A-Z][A-Z0-9]+-\d+$/.test(node)) issueKeys.add(node);
+          else if (/^\d+$/.test(node)) {
+            const n = Number(node);
+            if (openSprintIdSet.has(n)) targetIds.add(n);
+          }
+          return;
+        }
+        if (typeof node === 'number') {
+          if (openSprintIdSet.has(node)) targetIds.add(node);
+          return;
+        }
+        if (Array.isArray(node)) {
+          for (const item of node) walk(item, depth + 1);
+          return;
+        }
+        if (typeof node === 'object') {
+          for (const v of Object.values(node)) walk(v, depth + 1);
+        }
+      };
+      walk(variables, 0);
+
+      if (issueKeys.size !== 1 || targetIds.size === 0) return null;
+      return { issueKey: [...issueKeys][0], targetIds: [...targetIds] };
+    }
+
+    // Extract target sprint IDs from a mutation body. Jira's REST accepts
+    // the sprint change in several shapes depending on the client:
+    //   { fields: { customfield_XXXX: [id, ...] } }          (bulk set)
+    //   { fields: { customfield_XXXX: id } }                 (single)
+    //   { update: { customfield_XXXX: [{ set: [ids] }] } }   (operation-style)
+    //   { update: { customfield_XXXX: [{ add: id }] } }      (incremental)
+    // We handle the common set-style shapes; incremental add is treated as
+    // "at least one new sprint" (the optimistic delta will still be right
+    // if that's the actual move Jira is persisting).
+    function extractTargetSprintIds(body, sprintFieldId) {
+      if (!body || !sprintFieldId) return null;
+      let text = body;
+      if (typeof text !== 'string') {
+        // ArrayBuffer / Blob / FormData — we'd need async reads to peek.
+        // Skip optimistic path; SWR + JQL still kicks in as a fallback.
+        return null;
+      }
+      let json;
+      try { json = JSON.parse(text); } catch { return null; }
+      if (!json || typeof json !== 'object') return null;
+
+      const ids = new Set();
+      const normalize = (v) => {
+        if (v == null) return null;
+        const n = typeof v === 'object' ? Number(v.id) : Number(v);
+        return Number.isFinite(n) && n > 0 ? n : null;
+      };
+
+      const fieldsVal = json.fields?.[sprintFieldId];
+      if (fieldsVal !== undefined) {
+        const arr = Array.isArray(fieldsVal) ? fieldsVal : [fieldsVal];
+        for (const v of arr) {
+          const n = normalize(v);
+          if (n) ids.add(n);
+        }
+      }
+      const updateOps = json.update?.[sprintFieldId];
+      if (Array.isArray(updateOps)) {
+        for (const op of updateOps) {
+          if (op.set !== undefined) {
+            // `set` replaces everything — reset accumulator to match.
+            ids.clear();
+            const setArr = Array.isArray(op.set) ? op.set : [op.set];
+            for (const v of setArr) {
+              const n = normalize(v);
+              if (n) ids.add(n);
+            }
+          } else if (op.add !== undefined) {
+            const n = normalize(op.add);
+            if (n) ids.add(n);
+          }
+          // `remove` left alone: caller's prev-sprints minus removed
+          // would give us the target, but we don't know prev-sprints
+          // outside the catalog lookup (which is done by applyOptimisticMove
+          // itself). Skip — SWR still catches up.
+        }
+      }
+      if (ids.size === 0) return null;
+      return [...ids];
+    }
+
+    function isMutation(method, status) {
+      if (!MUTATING.has(method.toUpperCase())) return false;
+      if (status < 200 || status >= 300) return false;
+      return true;
+    }
+
+    function matchesInvalidationPath(url, body) {
+      if (READONLY_EXCLUDES.some((re) => re.test(url))) return false;
+      if (INVALIDATE_PATTERNS.some((re) => re.test(url))) return true;
+      // Plans / Advanced Roadmaps fires mutations through persisted GraphQL
+      // operations; detect those by the ?operation=*Mutation query param
+      // rather than by body content (the body is just a hash reference).
+      if (isGraphqlPersistedMutation(url)) return true;
+      if (GRAPHQL_URL_PATTERNS.some((re) => re.test(url))) {
+        return isGraphqlMutationBody(body);
+      }
+      return false;
+    }
+
+    let onAfterInvalidate = null;
+
+    // Send-time: fires the moment we see the request leaving the browser,
+    // before the server has acknowledged anything. We apply an optimistic
+    // delta locally so the overlay updates in the same animation frame as
+    // Jira's own optimistic UI (the ticket card moving). We deliberately
+    // DO NOT invalidate/refetch here — a JQL that races the persist might
+    // return pre-mutation data and overwrite our optimistic value with
+    // stale numbers. Invalidation is deferred to response-time.
+    function onMutationSend(url, body) {
+      perfMark(`api-mutation send ${url.replace(/\?.*/, '')}`);
+      let applied = false;
+      try {
+        // REST path: issue key in URL, sprint ids in body.fields[<sprintFieldId>].
+        const issueKeyFromUrl = extractIssueKey(url);
+        const sprintFieldId = sprintCapacity.getSprintFieldIdSync();
+        if (issueKeyFromUrl && sprintFieldId) {
+          const targetIds = extractTargetSprintIds(body, sprintFieldId);
+          if (targetIds && targetIds.length > 0) {
+            applied = sprintCapacity.applyOptimisticMove(issueKeyFromUrl, targetIds);
+            perfStamp(
+              `optimistic(REST) ${applied ? 'applied' : 'skipped(catalog miss)'} ` +
+                `${issueKeyFromUrl} → [${targetIds.join(',')}]`,
+            );
+          }
+        }
+        // GraphQL path: issue key + sprint ids heuristically inside
+        // body.variables. Walk the tree looking for a single issue key +
+        // known sprint ids.
+        if (!applied) {
+          const openIds = velocity.getKnownOpenSprintIds();
+          const move = extractGraphqlMove(body, openIds);
+          if (move) {
+            applied = sprintCapacity.applyOptimisticMove(move.issueKey, move.targetIds);
+            perfStamp(
+              `optimistic(GraphQL) ${applied ? 'applied' : 'skipped(catalog miss)'} ` +
+                `${move.issueKey} → [${move.targetIds.join(',')}]`,
+            );
+          } else if (isDebug()) {
+            perfStamp('optimistic: no move extractable from body (REST+GraphQL both missed)');
+          }
+        }
+      } catch (e) {
+        if (isDebug()) debug('onMutationSend error:', e?.message || e);
+      }
+      // If we applied, trigger a repaint now so the chip updates before
+      // the server even responds. If we didn't, no paint yet — the
+      // response-time path will invalidate and refresh.
+      if (applied && onAfterInvalidate) {
+        perfStamp('repaint scheduled (optimistic applied)');
+        onAfterInvalidate();
+      }
+    }
+
+    // Response-time: authoritative. Server has committed (2xx), so a JQL
+    // refresh now is guaranteed to see the post-mutation state. We mark
+    // cache entries stale (keeping their values for SWR) and schedule a
+    // re-run; the confirming JQL will overwrite any optimistic value that
+    // was wrong.
+    function onMutationConfirmed(url) {
+      perfStamp(`api-mutation confirmed ${url.replace(/\?.*/, '')}`);
+      const sprintId = extractSprintId(url);
+      if (sprintId) sprintCapacity.invalidate(sprintId);
+      else sprintCapacity.invalidateAll();
+      if (onAfterInvalidate) {
+        perfStamp('repaint scheduled (confirm-invalidate)');
+        onAfterInvalidate();
+      }
+    }
+
+    // In debug mode, dump every mutating same-origin request (matched or
+    // not) so we can tune INVALIDATE_PATTERNS when Jira introduces new
+    // routes. Cross-origin calls (Sentry, Segment, ad trackers) are
+    // filtered out — they can't affect Jira's own sprint state. The log
+    // is exposed at window.__MOMENTUM_API_LOG__ for offline inspection.
+    const apiLog = [];
+    function isSameOriginJiraPath(url) {
+      try {
+        const u = new URL(url, location.origin);
+        return u.origin === location.origin;
+      } catch {
+        // Relative URLs without an origin are same-origin by definition.
+        return url.startsWith('/');
+      }
+    }
+    function recordObservation(method, url, status, matched) {
+      if (!isDebug()) return;
+      if (!isSameOriginJiraPath(url)) return;
+      apiLog.push({ ts: Date.now(), method, url, status, matched });
+      if (apiLog.length > 100) apiLog.shift();
+      window.__MOMENTUM_API_LOG__ = apiLog;
+      if (!matched) {
+        debug(`api-mutation observed (not acted on): ${method} ${url} → ${status}`);
+      }
+    }
+
+    let installed = false;
+    return {
+      install(afterInvalidateCb) {
+        if (installed) return;
+        installed = true;
+        onAfterInvalidate = afterInvalidateCb || null;
+
+        // ------ fetch patch
+        const originalFetch = window.fetch.bind(window);
+        window.fetch = async function momentumPatchedFetch(input, init) {
+          // Peek request details BEFORE awaiting the server — so we can
+          // fire optimistic updates at send-time rather than waiting the
+          // full request round-trip before even starting to repaint.
+          let url = '';
+          let method = 'GET';
+          let body = null;
+          try {
+            url = typeof input === 'string' ? input : input?.url || '';
+            method =
+              (init && init.method) ||
+              (typeof input !== 'string' && input?.method) ||
+              'GET';
+            body =
+              (init && init.body) ||
+              (typeof input !== 'string' && input?.body) ||
+              null;
+            if (
+              url &&
+              MUTATING.has(method.toUpperCase()) &&
+              matchesInvalidationPath(url, body)
+            ) {
+              onMutationSend(url, body);
+            }
+          } catch (e) {
+            if (isDebug()) debug('fetch send-time error:', e?.message || e);
+          }
+
+          const res = await originalFetch(input, init);
+
+          try {
+            if (url && isMutation(method, res.status)) {
+              const matched = matchesInvalidationPath(url, body);
+              recordObservation(method, url, res.status, matched);
+              if (matched) onMutationConfirmed(url);
+            }
+          } catch (e) {
+            if (isDebug()) debug('api-mutation interceptor error (fetch):', e?.message || e);
+          }
+          return res;
+        };
+
+        // ------ XHR patch
+        // Some Jira flows (legacy admin widgets, older Plans gestures)
+        // still fire via XMLHttpRequest. Hooking `open` captures the URL
+        // + method; `load` reads the final status.
+        const origOpen = XMLHttpRequest.prototype.open;
+        const origSend = XMLHttpRequest.prototype.send;
+        XMLHttpRequest.prototype.open = function momentumXhrOpen(method, url) {
+          this.__momentumMethod = method;
+          this.__momentumUrl = url;
+          return origOpen.apply(this, arguments);
+        };
+        XMLHttpRequest.prototype.send = function momentumXhrSend(body) {
+          this.__momentumBody = body;
+          const method = this.__momentumMethod || 'GET';
+          const url = this.__momentumUrl || '';
+          // Send-time optimistic, before origSend kicks off the network.
+          try {
+            if (
+              url &&
+              MUTATING.has(method.toUpperCase()) &&
+              matchesInvalidationPath(url, body)
+            ) {
+              onMutationSend(url, body);
+            }
+          } catch (e) {
+            if (isDebug()) debug('xhr send-time error:', e?.message || e);
+          }
+          this.addEventListener('load', () => {
+            try {
+              if (url && isMutation(method, this.status)) {
+                const matched = matchesInvalidationPath(url, this.__momentumBody);
+                recordObservation(method, url, this.status, matched);
+                if (matched) onMutationConfirmed(url);
+              }
+            } catch (e) {
+              if (isDebug()) debug('api-mutation interceptor error (xhr):', e?.message || e);
+            }
+          });
+          return origSend.apply(this, arguments);
+        };
+      },
+    };
+  })();
+
+  // ---------------------------------------------------------------------------
   // Bootstrap
   // ---------------------------------------------------------------------------
 
@@ -1119,13 +2243,25 @@
   function bootstrap() {
     ensureStyles();
     tooltipInterceptor.install();
-    const onMutation = debounce(runActiveFeatures, MUTATION_DEBOUNCE_MS);
-    const observer = new MutationObserver(onMutation);
+    // Two debounces: the DOM one is conservative (coalesces Jira's re-render
+    // storm), the API one is tight — once the server has acknowledged a sprint
+    // mutation the user is waiting on the overlay, so we want the refresh to
+    // land as quickly as possible. Both share the same underlying runner, so
+    // overlapping triggers still coalesce via the feature pipeline's own
+    // inflight dedup.
+    const onMutationFromDom = debounce(runActiveFeatures, MUTATION_DEBOUNCE_MS);
+    const onMutationFromApi = debounce(runActiveFeatures, API_MUTATION_DEBOUNCE_MS);
+    apiMutationInterceptor.install(onMutationFromApi);
+    // When a background sprint-capacity refresh lands (stale-while-revalidate
+    // consumers got the stale value, the fresh one arrives async), trigger a
+    // re-paint so chips actually update on screen.
+    sprintCapacity.onFresh(onMutationFromApi);
+    const observer = new MutationObserver(onMutationFromDom);
     observer.observe(document.body, { childList: true, subtree: true });
     // Initial pass (in case the timeline is already rendered at document-idle).
     runActiveFeatures();
     log(
-      'loaded — version 0.2.4',
+      'loaded — version 0.3.10',
       isDebug()
         ? '(debug on)'
         : '(debug off — enable with: localStorage.setItem(\'momentum-light-debug\', \'1\'))',

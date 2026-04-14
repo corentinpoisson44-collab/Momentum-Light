@@ -23,6 +23,7 @@ Les mises à jour sont poussées automatiquement (Tampermonkey vérifie le `@upd
 | 1 | **Epic Progress Bar** — affiche une barre de progression sur chaque Epic de la Timeline, calculée sur `Σ SP done / Σ SP total` des tickets enfants. | ✅ v0.1.0 |
 | 2 | **Ticket Estimate** — sous les Epics, chaque barre de ticket affiche son chiffrage (centré) en Story Points. | ✅ v0.2.1 |
 | 3 | **Sprint Velocity** — chip intégrée dans le toolbar de la Timeline, affichant la vélocité moyenne des 5 derniers sprints clos. | ✅ v0.2.1 |
+| 4 | **Sprint Fill Indicator** — barre de remplissage dans chaque chip de sprint actif/futur de la ligne « Sprints », comparant le SP chargé à la vélocité moyenne (vert < 90 %, ambre 90–110 %, rouge > 110 %). | ✅ v0.3.0 |
 
 ### Configuration
 
@@ -41,8 +42,10 @@ Structure interne :
 - `storyPointsField` — découverte dynamique du custom field Story Points (cache `sessionStorage`)
 - `issueMeta` — lookup `{ isEpic, storyPoints }` batché via JQL `key in (...)` (cache mémoire 60 s)
 - `epicProgress` — calcul SP done / total des enfants d'un Epic (cache mémoire 60 s)
-- `velocity` — vélocité moyenne des N derniers sprints clos (cache mémoire 5 min)
+- `velocity` — vélocité moyenne des N derniers sprints clos + liste des sprints actifs/futurs pour le planning (cache mémoire 5 min)
+- `sprintCapacity` — SP total/restant d'un sprint donné via `/rest/agile/1.0/sprint/{id}/issue` (cache mémoire 60 s)
 - `timelineDom` — détection des barres, extraction de l'issue key, injection des overlays (progression Epic ou chiffrage ticket)
+- `sprintChipDom` — détection des chips de sprint dans la ligne « Sprints » + injection d'un overlay de remplissage coloré
 - `velocityBanner` — bandeau fixe sur les vues timeline/plan
 - `features[]` — registre des features, avec cycle de vie `onMutation` / `onInactive`
 
