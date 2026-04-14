@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.3.2
+// @version      0.3.3
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), et indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -535,6 +535,15 @@
         })();
         inflight.set(key, promise);
         return promise;
+      },
+      invalidate(sprintId) {
+        // Invalidate both state slots so a sprint transitioning from
+        // future → active (or any flip) picks up fresh data.
+        cache.delete(`${sprintId}:active`);
+        cache.delete(`${sprintId}:future`);
+      },
+      invalidateAll() {
+        cache.clear();
       },
     };
   })();
@@ -1543,6 +1552,85 @@
   })();
 
   // ---------------------------------------------------------------------------
+  // apiMutationInterceptor — monkey-patch window.fetch so we can invalidate
+  // sprintCapacity the moment Jira commits a ticket-sprint change. Without
+  // this, moving an issue between sprints would leave the sprint-fill
+  // indicator stale until the 60 s TTL expires.
+  //
+  // We match a small set of Jira REST paths that mutate sprint membership
+  // (issue edit, direct sprint-move, backlog move, plans commit) and only
+  // act on successful (2xx) mutating methods (POST/PUT/PATCH/DELETE).
+  // Misses are cheap; false positives at worst trigger a single refetch.
+  // ---------------------------------------------------------------------------
+
+  const apiMutationInterceptor = (() => {
+    const MUTATING = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+    const PATTERNS = [
+      // Issue edit — carries the sprint custom field in most cases.
+      /\/rest\/api\/\d+\/issue\/[^/?#]+(\/|\?|$)/i,
+      // Direct sprint membership change (add an issue to a sprint).
+      /\/rest\/agile\/[^/]+\/sprint\/\d+\/issue(\?|$)/i,
+      // Back-to-backlog.
+      /\/rest\/agile\/[^/]+\/backlog\/issue(\?|$)/i,
+      // Plans mutations: scope changes, commits, etc.
+      /\/rest\/plans\//i,
+      // Greenhopper scope + sprint mutations.
+      /\/rest\/greenhopper\/1\.0\/(sprint|xboard)\//i,
+    ];
+
+    // Extract a specific sprintId from URL when possible so we can do a
+    // targeted invalidation; falls back to a broad cache clear.
+    function extractSprintId(url) {
+      const m = url.match(/\/sprint\/(\d+)\//i);
+      return m ? Number(m[1]) : null;
+    }
+
+    function shouldInvalidate(url, method, status) {
+      if (!MUTATING.has(method.toUpperCase())) return false;
+      if (status < 200 || status >= 300) return false;
+      return PATTERNS.some((re) => re.test(url));
+    }
+
+    function onMutation(url) {
+      const sprintId = extractSprintId(url);
+      if (sprintId) {
+        sprintCapacity.invalidate(sprintId);
+        if (isDebug()) debug(`api-mutation → invalidated sprint ${sprintId} (${url})`);
+      } else {
+        sprintCapacity.invalidateAll();
+        if (isDebug()) debug(`api-mutation → invalidated all sprintCapacity (${url})`);
+      }
+    }
+
+    let installed = false;
+    return {
+      install() {
+        if (installed) return;
+        installed = true;
+        const originalFetch = window.fetch.bind(window);
+        window.fetch = async function momentumPatchedFetch(input, init) {
+          const res = await originalFetch(input, init);
+          // Best-effort URL/method extraction; never let interceptor
+          // errors bubble into Jira's own request pipeline.
+          try {
+            const url = typeof input === 'string' ? input : input?.url || '';
+            const method =
+              (init && init.method) ||
+              (typeof input !== 'string' && input?.method) ||
+              'GET';
+            if (url && shouldInvalidate(url, method, res.status)) {
+              onMutation(url);
+            }
+          } catch (e) {
+            if (isDebug()) debug('api-mutation interceptor error:', e?.message || e);
+          }
+          return res;
+        };
+      },
+    };
+  })();
+
+  // ---------------------------------------------------------------------------
   // Bootstrap
   // ---------------------------------------------------------------------------
 
@@ -1565,13 +1653,14 @@
   function bootstrap() {
     ensureStyles();
     tooltipInterceptor.install();
+    apiMutationInterceptor.install();
     const onMutation = debounce(runActiveFeatures, MUTATION_DEBOUNCE_MS);
     const observer = new MutationObserver(onMutation);
     observer.observe(document.body, { childList: true, subtree: true });
     // Initial pass (in case the timeline is already rendered at document-idle).
     runActiveFeatures();
     log(
-      'loaded — version 0.3.2',
+      'loaded — version 0.3.3',
       isDebug()
         ? '(debug on)'
         : '(debug off — enable with: localStorage.setItem(\'momentum-light-debug\', \'1\'))',
