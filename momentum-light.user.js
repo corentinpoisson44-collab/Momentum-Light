@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.3.1
+// @version      0.3.2
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), et indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -596,15 +596,21 @@
       .${OVERLAY_ESTIMATE_MOD} .${OVERLAY_FILL_CLASS} {
         display: none;
       }
-      /* Sprint-fill variant: overlay dropped on Sprints-row chips. Unlike
-         the Epic overlay (which darkens the host bar), we paint a flat
-         color keyed to the load-vs-average-velocity ratio. Kept at 55%
-         opacity so the chip text below remains readable without a label
-         shadow war. */
+      /* Sprint-fill variant: a thin colored strip anchored to the bottom
+         of the sprint chip, so the chip's own text ("FHSBFF Sprint 53…")
+         stays fully readable. The overlay overrides .momentum-progress's
+         inset:0 to become a 5px bottom bar; the numeric label lives in
+         the tooltip, not inside the chip. */
+      .${OVERLAY_SPRINT_FILL_MOD} {
+        top: auto;
+        height: 5px;
+        border-radius: 0 0 inherit inherit;
+        background-color: rgba(9, 30, 66, 0.12); /* subtle track */
+      }
       .${OVERLAY_SPRINT_FILL_MOD} .${OVERLAY_FILL_CLASS} {
         background-color: #36B37E;
         mix-blend-mode: normal;
-        opacity: 0.55;
+        opacity: 0.95;
       }
       .${OVERLAY_SPRINT_FILL_MOD}[data-fill-state="under"] .${OVERLAY_FILL_CLASS} {
         background-color: #36B37E;
@@ -615,11 +621,10 @@
       .${OVERLAY_SPRINT_FILL_MOD}[data-fill-state="over"] .${OVERLAY_FILL_CLASS} {
         background-color: #DE350B;
       }
+      /* No in-chip numeric label — the sprint name stays clean and the
+         exact numbers live in the tooltip via dataset.momentumTooltip. */
       .${OVERLAY_SPRINT_FILL_MOD} .${OVERLAY_LABEL_CLASS} {
-        font-size: 10px;
-        padding: 0 4px;
-        color: #172B4D;
-        text-shadow: 0 1px 0 rgba(255, 255, 255, 0.6);
+        display: none;
       }
       /* Full-width sticky banner anchored at the top of the plan's main
          content area. "pointer-events: none" on the wrapper lets clicks
@@ -1188,21 +1193,21 @@
       // Compact label inside the chip. 80px is the rough breakpoint below
       // which the "X / Y SP" form no longer fits; fall back to a bare
       // percentage there.
-      const w = chip.getBoundingClientRect().width;
-      if (label) {
-        label.textContent =
-          w >= 80
-            ? `${Math.round(load)} / ${Math.round(average)}`
-            : `${Math.round(ratio * 100)}%`;
-      }
+      // Label node is hidden via CSS for the sprint-fill variant (the chip's
+      // own text is enough and the numbers live in the tooltip). We still
+      // populate its textContent as a no-op safety so CSS keeps it the only
+      // source of truth for the label visibility.
+      if (label) label.textContent = '';
 
+      // Tooltip override via dataset.momentumTooltip — picked up by
+      // tooltipInterceptor when Atlaskit's React tooltip appears on hover.
+      // Intentionally NOT writing aria-label/title on the chip: doing so
+      // would overwrite Jira's own a11y label and pollute the name that
+      // extractSprintName reads on the next cycle.
       const stateSuffix = state === 'active' ? ' (restant)' : ' (planifié)';
-      const tooltipText = `${sprintName} — ${Math.round(load)} SP${stateSuffix} / ${Math.round(
-        average,
-      )} SP moyenne (${Math.round(ratio * 100)}%)`;
-      chip.dataset.momentumTooltip = tooltipText;
-      chip.setAttribute('aria-label', tooltipText);
-      chip.title = tooltipText;
+      chip.dataset.momentumTooltip = `${sprintName} — ${Math.round(
+        load,
+      )} SP${stateSuffix} / ${Math.round(average)} SP moyenne (${Math.round(ratio * 100)}%)`;
     }
 
     async function decorate(chip, byKey, average) {
@@ -1566,7 +1571,7 @@
     // Initial pass (in case the timeline is already rendered at document-idle).
     runActiveFeatures();
     log(
-      'loaded — version 0.3.1',
+      'loaded — version 0.3.2',
       isDebug()
         ? '(debug on)'
         : '(debug off — enable with: localStorage.setItem(\'momentum-light-debug\', \'1\'))',
