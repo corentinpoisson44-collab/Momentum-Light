@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.1.12
+// @version      0.1.13
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — feature #1 : barre de progression sur les Epics, calculée sur SP done / SP total des tickets enfants.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -273,13 +273,19 @@
     const KEY_CELL_SELECTOR =
       '[data-testid="roadmap.timeline-table-kit.ui.list-item-content.summary.key"]';
 
-    // Minimum dimensions (in px) for an element to qualify as a "bar" rather
-    // than a corner widget (link-creation dots, resize handles). Drag handles
-    // are typically 12–16 px squares; even the shortest visible Epic bar is
-    // wider than 24 px. This size filter replaces a testid blacklist — more
-    // robust since Atlassian's testid naming for widgets is not stable.
+    // Geometric filters to tell a real Epic bar from a corner widget (link
+    // dots, resize handles) or a near-square chip (warning lozenges, link
+    // icons). Replaces a testid blacklist — Atlassian's widget naming is
+    // not stable enough to rely on.
+    //
+    //   - Drag handles / link dots: ~12–16 px squares → caught by min width.
+    //   - Warning lozenges / link icons: ~22–32 px squares (aspect ≈ 1) →
+    //     caught by the aspect-ratio rule.
+    //   - Real Epic bars: always significantly wider than tall (they span
+    //     days/weeks/months) → pass both filters.
     const BAR_MIN_WIDTH = 24;
     const BAR_MIN_HEIGHT = 12;
+    const BAR_MIN_ASPECT = 2; // width / height
 
     function hasChartPrefix(el) {
       const tid = el.getAttribute('data-testid') || '';
@@ -288,7 +294,9 @@
 
     function isBarSized(el) {
       const rect = el.getBoundingClientRect();
-      return rect.width >= BAR_MIN_WIDTH && rect.height >= BAR_MIN_HEIGHT;
+      if (rect.width < BAR_MIN_WIDTH || rect.height < BAR_MIN_HEIGHT) return false;
+      if (rect.width < rect.height * BAR_MIN_ASPECT) return false;
+      return true;
     }
 
     // From a list of candidate elements, return only those that do NOT contain
@@ -658,7 +666,7 @@
     // Initial pass (in case the timeline is already rendered at document-idle).
     runActiveFeatures();
     log(
-      'loaded — version 0.1.12',
+      'loaded — version 0.1.13',
       isDebug()
         ? '(debug on)'
         : '(debug off — enable with: localStorage.setItem(\'momentum-light-debug\', \'1\'))',
