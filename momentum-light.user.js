@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.1.3
+// @version      0.1.4
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — feature #1 : barre de progression sur les Epics, calculée sur SP done / SP total des tickets enfants.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -51,29 +51,36 @@
   // ---------------------------------------------------------------------------
 
   const jiraApi = {
-    async getJson(path) {
+    async request(path, { method = 'GET', body } = {}) {
       const res = await fetch(path, {
-        method: 'GET',
+        method,
         credentials: 'same-origin',
-        headers: { Accept: 'application/json' },
+        headers: {
+          Accept: 'application/json',
+          ...(body ? { 'Content-Type': 'application/json' } : {}),
+          'X-Atlassian-Token': 'no-check',
+        },
+        body: body ? JSON.stringify(body) : undefined,
       });
       if (!res.ok) {
-        throw new Error(`JIRA API ${path} → HTTP ${res.status}`);
+        throw new Error(`JIRA API ${method} ${path} → HTTP ${res.status}`);
       }
       return res.json();
     },
 
     listFields() {
-      return this.getJson('/rest/api/3/field');
+      return this.request('/rest/api/3/field');
     },
 
-    searchIssues(jql, fields, maxResults = 100) {
-      const params = new URLSearchParams({
-        jql,
-        fields: fields.join(','),
-        maxResults: String(maxResults),
+    // /rest/api/3/search (GET) was sunsetted by Atlassian (HTTP 410 Gone).
+    // The replacement is POST /rest/api/3/search/jql with a JSON body.
+    // https://developer.atlassian.com/cloud/jira/platform/changelog/#CHANGE-1304
+    async searchIssues(jql, fields, maxResults = 100) {
+      const data = await this.request('/rest/api/3/search/jql', {
+        method: 'POST',
+        body: { jql, fields, maxResults },
       });
-      return this.getJson(`/rest/api/3/search?${params.toString()}`);
+      return data;
     },
   };
 
@@ -382,7 +389,7 @@
     // Initial pass (in case the timeline is already rendered at document-idle).
     runActiveFeatures();
     log(
-      'loaded — version 0.1.3',
+      'loaded — version 0.1.4',
       isDebug()
         ? '(debug on)'
         : '(debug off — enable with: localStorage.setItem(\'momentum-light-debug\', \'1\'))',
