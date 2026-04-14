@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.5.5
+// @version      0.5.6
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne, et menu « How-to » guidé qui surligne chaque feature au premier lancement.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -33,7 +33,6 @@
   const OVERLAY_LABEL_CLASS = 'momentum-progress__label';
   const OVERLAY_ESTIMATE_MOD = 'momentum-progress--estimate';
   const OVERLAY_SPRINT_FILL_MOD = 'momentum-progress--sprint-fill';
-  const OVERLAY_MISSING_BADGE_CLASS = 'momentum-progress__missing-badge';
   const VELOCITY_BANNER_ID = 'momentum-velocity-banner';
   const HOWTO_BUTTON_ID = 'momentum-howto-button';
   const HOWTO_OVERLAY_ID = 'momentum-howto-overlay';
@@ -916,31 +915,6 @@
       .${OVERLAY_ESTIMATE_MOD} .${OVERLAY_FILL_CLASS} {
         display: none;
       }
-      /* "Chiffrage incomplet" badge — small amber pill at the right edge
-         of the overlay ("∅ N"). Uses an atlassian-style warning yellow so
-         it reads as a distinct signal without competing with the main SP
-         label. Anchored right/center via absolute positioning so the main
-         label can still ellipsis-truncate without pushing the badge out.
-         High z-index keeps it above the main label if the label's width
-         ever expands that far. */
-      .${OVERLAY_MISSING_BADGE_CLASS} {
-        position: absolute;
-        top: 50%;
-        right: 4px;
-        transform: translateY(-50%);
-        background: rgba(255, 171, 0, 0.95);
-        color: #172B4D;
-        font-size: 9px;
-        font-weight: 700;
-        line-height: 1;
-        letter-spacing: 0.02em;
-        padding: 2px 5px;
-        border-radius: 3px;
-        white-space: nowrap;
-        pointer-events: none;
-        z-index: 2;
-        box-shadow: 0 1px 2px rgba(9, 30, 66, 0.25);
-      }
       /* Confidence treatment on Epic bars — reflects the ETA confidence
          score (done/inProgress/todo/unestimated weighted blend). Two
          orthogonal signals stack:
@@ -1488,27 +1462,6 @@
       resetBarConfidence(bar);
     }
 
-    // "Chiffrage incomplet" badge — a small amber pill pinned to the
-    // right edge of the overlay ("∅ N") that signals how many child
-    // tickets still lack Story Points. The empty-set glyph reads as
-    // "missing value" — more precise than a generic warning sign.
-    // Lives alongside the main label rather than inside it, so it stays
-    // legible even when the bar is narrow (the main label truncates
-    // with ellipsis; the badge keeps its own reserved space on the right).
-    function ensureMissingBadge(overlay, unestimatedCount) {
-      let badge = overlay.querySelector(`:scope > .${OVERLAY_MISSING_BADGE_CLASS}`);
-      if (!unestimatedCount || unestimatedCount <= 0) {
-        if (badge) badge.remove();
-        return;
-      }
-      if (!badge) {
-        badge = document.createElement('div');
-        badge.className = OVERLAY_MISSING_BADGE_CLASS;
-        overlay.appendChild(badge);
-      }
-      badge.textContent = `∅ ${unestimatedCount}`;
-    }
-
     // Confidence tiers drive the opacity / hatch treatment applied to the
     // epic bar: low-confidence epics read as "uncertain" at a glance via
     // diagonal stripes + a faded host bar, without requiring a tooltip hover.
@@ -1564,12 +1517,13 @@
       const fill = overlay.querySelector(`.${OVERLAY_FILL_CLASS}`);
       const label = overlay.querySelector(`.${OVERLAY_LABEL_CLASS}`);
       if (fill) fill.style.width = pctStr;
-      if (label) label.textContent = `${done} / ${total} SP`;
-      // Dedicated "chiffrage incomplet" badge — pinned to the right edge
-      // of the bar in a distinct warning color so it reads at a glance
-      // without competing with the main SP label. Only rendered when
-      // there are unestimated children.
-      ensureMissingBadge(overlay, stats.unestimated);
+      // Inline "chiffrage incomplet" suffix — "X / Y SP (∅ N)" where N is
+      // the count of child tickets without Story Points. The empty-set
+      // glyph reads as "missing value" and sits inside the main label so
+      // it fades alongside the rest of the text on narrow bars instead of
+      // competing for its own reserved space.
+      const missingSuffix = stats.unestimated > 0 ? ` (∅ ${stats.unestimated})` : '';
+      if (label) label.textContent = `${done} / ${total} SP${missingSuffix}`;
 
       // Tooltip text — the interceptor (installed at bootstrap) will rewrite
       // JIRA's Atlaskit tooltip with this value when it appears on hover.
@@ -1603,11 +1557,10 @@
       const overlay = ensureOverlay(bar);
       overlay.classList.add(OVERLAY_ESTIMATE_MOD);
       // Ticket variant never carries a confidence tier — strip any stale
-      // attribute, bar opacity, and "chiffrage incomplet" badge left over
-      // if this bar was previously decorated as an epic.
+      // attribute and bar opacity left over if this bar was previously
+      // decorated as an epic.
       delete overlay.dataset.confidence;
       resetBarConfidence(bar);
-      ensureMissingBadge(overlay, 0);
       const label = overlay.querySelector(`.${OVERLAY_LABEL_CLASS}`);
       if (label) label.textContent = `${sp} SP`;
 
@@ -2079,8 +2032,8 @@
           'tickets enfants comptés — les tickets sans chiffrage tirent le score ' +
           'vers le bas. Une confiance faible est signalée par un hachuré ' +
           'diagonal et une atténuation de la couleur de la barre (le label ' +
-          '« X / Y SP » reste lisible) ; un badge amber « ∅ N » apparaît à ' +
-          'droite quand N tickets enfants sont encore sans chiffrage.',
+          '« X / Y SP » reste lisible) ; un suffixe « (∅ N) » apparaît dans ' +
+          'le label quand N tickets enfants sont encore sans chiffrage.',
         findTarget: () =>
           document.querySelector(
             `.${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})`,
