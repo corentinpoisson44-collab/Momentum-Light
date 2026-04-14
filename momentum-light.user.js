@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.1.6
+// @version      0.1.7
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — feature #1 : barre de progression sur les Epics, calculée sur SP done / SP total des tickets enfants.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -36,6 +36,22 @@
   const debug = (...args) => { if (isDebug()) console.log(LOG_PREFIX, ...args); };
   const warn = (...args) => console.warn(LOG_PREFIX, ...args);
   const error = (...args) => console.error(LOG_PREFIX, ...args);
+
+  // Rate-limited info-level logger for recurring signals we want visible
+  // regardless of debug mode (e.g. bar discovery counts). Deduplicates the
+  // same message so a quiet steady state doesn't spam the console.
+  const heartbeat = (() => {
+    let lastMsg = null;
+    let lastAt = 0;
+    return (...args) => {
+      const msg = args.map((a) => (typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' ');
+      const now = Date.now();
+      if (msg === lastMsg && now - lastAt < 5_000) return;
+      lastMsg = msg;
+      lastAt = now;
+      console.log(LOG_PREFIX, ...args);
+    };
+  })();
 
   function debounce(fn, delay) {
     let t = null;
@@ -195,18 +211,19 @@
         left: 0;
         right: 0;
         bottom: 0;
-        height: 28%;
-        min-height: 4px;
+        height: 35%;
+        min-height: 6px;
         pointer-events: none;
         overflow: hidden;
         border-radius: 0 0 3px 3px;
-        background-color: rgba(9, 30, 66, 0.08);
-        z-index: 1;
+        background-color: rgba(255, 255, 255, 0.35);
+        box-shadow: inset 0 1px 0 rgba(0, 0, 0, 0.08);
+        z-index: 2;
       }
       .${OVERLAY_FILL_CLASS} {
         height: 100%;
         width: 0%;
-        background-color: rgba(9, 30, 66, 0.55);
+        background-color: rgba(9, 30, 66, 0.75);
         transition: width 200ms ease-out;
       }
     `;
@@ -222,26 +239,47 @@
     // Holds { epicKey, overlay } so we can update without rebuilding.
     const decorated = new WeakMap();
 
-    // JIRA obfuscates classes, so we target the public data-testid hooks observed
-    // on real Timelines. Primary target: the chart bar representing the Epic's
-    // timespan on the timeline. We inject our own progress overlay inside it.
-    // Adjust here if Atlassian ships a DOM change.
-    const BAR_SELECTORS = [
-      '[data-testid="roadmap.timeline-table-kit.ui.chart-item-content.date-content.bar"]',
-    ];
+    // Primary target: the chart bar representing the Epic's timespan on the
+    // timeline. Adjust here if Atlassian ships a DOM change.
+    const CHART_BAR_SELECTOR =
+      '[data-testid="roadmap.timeline-table-kit.ui.chart-item-content.date-content.bar"]';
+    // Anchor used as a fallback — the native progress-wrapper is reliably rendered
+    // per Epic; from it we can walk up to find the chart bar even if its testid
+    // changes.
+    const PROGRESS_WRAPPER_SELECTOR =
+      '[data-testid="common.components.progress-bar.progress-wrapper"]';
     const KEY_CELL_SELECTOR =
       '[data-testid="roadmap.timeline-table-kit.ui.list-item-content.summary.key"]';
 
     function findBars(root) {
-      const nodes = new Set();
-      const perSelector = {};
-      for (const sel of BAR_SELECTORS) {
-        const hits = root.querySelectorAll(sel);
-        perSelector[sel] = hits.length;
-        hits.forEach((n) => nodes.add(n));
+      // Strategy 1 — exact testid on the chart bar.
+      const direct = [...root.querySelectorAll(CHART_BAR_SELECTOR)];
+      if (direct.length > 0) {
+        if (isDebug()) debug('findBars → direct match:', direct.length);
+        return direct;
       }
-      if (isDebug()) debug('findBars per-selector counts:', perSelector, '→ total:', nodes.size);
-      return [...nodes];
+      // Strategy 2 — walk up from each progress-wrapper until we find an
+      // ancestor whose testid starts with "...chart-item-content.date-content",
+      // which is the chart bar container on this DOM variant.
+      const wrappers = root.querySelectorAll(PROGRESS_WRAPPER_SELECTOR);
+      const found = new Set();
+      for (const w of wrappers) {
+        let cursor = w.parentElement;
+        let steps = 0;
+        while (cursor && cursor !== document.body && steps < 12) {
+          const tid = cursor.getAttribute?.('data-testid') || '';
+          if (tid.startsWith('roadmap.timeline-table-kit.ui.chart-item-content')) {
+            found.add(cursor);
+            break;
+          }
+          cursor = cursor.parentElement;
+          steps += 1;
+        }
+      }
+      if (isDebug()) {
+        debug('findBars → direct:0, progress-wrappers:', wrappers.length, 'resolved-bars:', found.size);
+      }
+      return [...found];
     }
 
     // Diagnostic probe: when findBars returns empty, dump every data-testid value
@@ -378,6 +416,9 @@
       },
       async onMutation(root) {
         const bars = timelineDom.findBars(root);
+        // Always-on heartbeat (rate-limited) so we can tell from console whether
+        // the feature is finding bars, without having to enable debug mode.
+        heartbeat('epic-progress-bar bars found:', bars.length);
         if (bars.length === 0 && isDebug()) {
           timelineDom.probeCandidates(root);
           return;
@@ -494,7 +535,7 @@
     // Initial pass (in case the timeline is already rendered at document-idle).
     runActiveFeatures();
     log(
-      'loaded — version 0.1.6',
+      'loaded — version 0.1.7',
       isDebug()
         ? '(debug on)'
         : '(debug off — enable with: localStorage.setItem(\'momentum-light-debug\', \'1\'))',
