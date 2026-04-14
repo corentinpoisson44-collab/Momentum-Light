@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.3.8
+// @version      0.3.9
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), et indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -77,6 +77,22 @@
       if (t) clearTimeout(t);
       t = setTimeout(() => fn.apply(this, args), delay);
     };
+  }
+
+  // perfMark / perfStamp — tiny timing instrument used to trace the
+  // sprint-fill update pipeline in debug mode. `perfMark(reason)` starts
+  // a fresh clock; `perfStamp(reason)` logs ms elapsed since the last
+  // mark. No-op when debug mode is off.
+  let lastPerfMarkAt = null;
+  function perfMark(reason) {
+    lastPerfMarkAt = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    if (isDebug()) console.log(LOG_PREFIX, `[t=0] ${reason}`);
+  }
+  function perfStamp(reason) {
+    if (!isDebug()) return;
+    const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    const t = lastPerfMarkAt != null ? Math.round(now - lastPerfMarkAt) : '?';
+    console.log(LOG_PREFIX, `[t=${t}] ${reason}`);
   }
 
   // ---------------------------------------------------------------------------
@@ -533,6 +549,14 @@
       // Planning view: everything `get()` returns + `openSprints` (active
       // and future sprints on the board).
       getPlanningContext: getCached,
+      // Sync best-effort access to the open-sprint id set. Returns an
+      // empty set before the first resolution; used by the API
+      // interceptor to sanity-check candidate sprint ids extracted from
+      // GraphQL variables (no schema means we need a reality check).
+      getKnownOpenSprintIds() {
+        if (!cache || !cache.value) return new Set();
+        return new Set((cache.value.openSprints || []).map((s) => Number(s.id)));
+      },
     };
   })();
 
@@ -638,6 +662,7 @@
       pending = new Map();
       if (entries.length === 0) return;
 
+      perfStamp(`JQL batch start (${entries.length} sprints)`);
       let results;
       try {
         results = await runBatch(entries);
@@ -666,6 +691,7 @@
         }
         inflight.delete(key);
       }
+      perfStamp(`JQL batch done (${entries.length} sprints, ${cache.size} cache entries)`);
       // Let the feature pipeline re-run so stale-while-revalidate consumers
       // repaint with the freshly-landed numbers.
       if (onFreshListener) {
@@ -1654,6 +1680,7 @@
           sprintChipDom.probe(root);
           return;
         }
+        perfStamp(`sprint-fill: decorating ${chips.length} chips`);
         let ctx;
         try {
           ctx = await velocity.getPlanningContext();
@@ -1804,12 +1831,21 @@
     ];
 
     // GraphQL is multiplexed (queries + mutations over the same POST).
-    // We match on URL but require the body to contain a `mutation`
-    // operation to avoid invalidating on every read query.
+    // For non-persisted requests we match on URL but require the body
+    // to contain a `mutation` operation to avoid invalidating on every
+    // read query.
     const GRAPHQL_URL_PATTERNS = [
       /\/gateway\/api\/graphql\b/i,
       /\/graphql\b/i,
     ];
+
+    // Persisted-query mutations — Jira Cloud and Plans use these
+    // extensively (e.g. POST /gateway/api/graphql/pq/<hash>?operation=
+    // updateRoadmapItemMutation). The body is just { operationName,
+    // variables, extensions } — no literal `mutation` keyword, so
+    // isGraphqlMutationBody would miss them. Detect via the ?operation=
+    // query param whose value conventionally ends in "Mutation".
+    const GRAPHQL_PERSISTED_PATH = /\/graphql\/pq\//i;
 
     // Read-only endpoints that happen to use POST. Excluded to avoid
     // invalidating the cache when *we* search, or when Jira fetches lists.
@@ -1832,6 +1868,16 @@
       return /(^|["\\s{])mutation\s*[\s({]/i.test(text);
     }
 
+    function isGraphqlPersistedMutation(url) {
+      if (!GRAPHQL_PERSISTED_PATH.test(url)) return false;
+      // Persisted queries carry the operation name in the query string
+      // (or occasionally in the body — we stick with URL for the fast
+      // path since it doesn't require parsing).
+      const m = url.match(/[?&]operation=([^&]+)/);
+      if (!m) return false;
+      return /mutation/i.test(decodeURIComponent(m[1]));
+    }
+
     function extractSprintId(url) {
       const m = url.match(/\/sprint\/(\d+)(\/|\?|$)/i);
       return m ? Number(m[1]) : null;
@@ -1843,6 +1889,54 @@
       // in the URL (e.g. query params).
       const m = url.match(/\/issue\/([A-Z][A-Z0-9]+-\d+)(\b|\/|\?|$)/);
       return m ? m[1] : null;
+    }
+
+    // GraphQL mutations (Plans) carry their payload in a typed `variables`
+    // object whose shape depends on the operation. Rather than enumerate
+    // every mutation's schema (they change without notice), we walk the
+    // body heuristically:
+    //   - any string matching the issue-key regex is a candidate issue.
+    //   - any numeric value (or numeric-string) that coincides with a
+    //     known open-sprint id is a candidate target sprint.
+    // Cross-referencing against velocity.getKnownOpenSprintIds() keeps
+    // false positives near zero: a random number in the variables won't
+    // accidentally match a real sprint.
+    function extractGraphqlMove(body, openSprintIdSet) {
+      if (!body || typeof body !== 'string') return null;
+      if (!openSprintIdSet || openSprintIdSet.size === 0) return null;
+      let json;
+      try { json = JSON.parse(body); } catch { return null; }
+      const variables = json?.variables;
+      if (!variables || typeof variables !== 'object') return null;
+
+      const issueKeys = new Set();
+      const targetIds = new Set();
+      const walk = (node, depth) => {
+        if (depth > 6 || node == null) return;
+        if (typeof node === 'string') {
+          if (/^[A-Z][A-Z0-9]+-\d+$/.test(node)) issueKeys.add(node);
+          else if (/^\d+$/.test(node)) {
+            const n = Number(node);
+            if (openSprintIdSet.has(n)) targetIds.add(n);
+          }
+          return;
+        }
+        if (typeof node === 'number') {
+          if (openSprintIdSet.has(node)) targetIds.add(node);
+          return;
+        }
+        if (Array.isArray(node)) {
+          for (const item of node) walk(item, depth + 1);
+          return;
+        }
+        if (typeof node === 'object') {
+          for (const v of Object.values(node)) walk(v, depth + 1);
+        }
+      };
+      walk(variables, 0);
+
+      if (issueKeys.size !== 1 || targetIds.size === 0) return null;
+      return { issueKey: [...issueKeys][0], targetIds: [...targetIds] };
     }
 
     // Extract target sprint IDs from a mutation body. Jira's REST accepts
@@ -1915,6 +2009,10 @@
     function matchesInvalidationPath(url, body) {
       if (READONLY_EXCLUDES.some((re) => re.test(url))) return false;
       if (INVALIDATE_PATTERNS.some((re) => re.test(url))) return true;
+      // Plans / Advanced Roadmaps fires mutations through persisted GraphQL
+      // operations; detect those by the ?operation=*Mutation query param
+      // rather than by body content (the body is just a hash reference).
+      if (isGraphqlPersistedMutation(url)) return true;
       if (GRAPHQL_URL_PATTERNS.some((re) => re.test(url))) {
         return isGraphqlMutationBody(body);
       }
@@ -1922,46 +2020,73 @@
     }
 
     let onAfterInvalidate = null;
-    function onMutation(url, body) {
-      const sprintId = extractSprintId(url);
-      if (sprintId) {
-        sprintCapacity.invalidate(sprintId);
-        if (isDebug()) debug(`api-mutation → invalidated sprint ${sprintId} (${url})`);
-      } else {
-        sprintCapacity.invalidateAll();
-        if (isDebug()) debug(`api-mutation → invalidated all sprintCapacity (${url})`);
-      }
 
-      // Optimistic fast-path: if this is an issue-scoped mutation and we
-      // have the issue in our catalog, compute the delta locally so the
-      // chip repaints with the correct numbers *before* the confirming
-      // JQL returns. Worst case (catalog miss, body unparseable, wrong
-      // guess) we fall back to SWR + JQL timing — strictly not worse
-      // than before.
+    // Send-time: fires the moment we see the request leaving the browser,
+    // before the server has acknowledged anything. We apply an optimistic
+    // delta locally so the overlay updates in the same animation frame as
+    // Jira's own optimistic UI (the ticket card moving). We deliberately
+    // DO NOT invalidate/refetch here — a JQL that races the persist might
+    // return pre-mutation data and overwrite our optimistic value with
+    // stale numbers. Invalidation is deferred to response-time.
+    function onMutationSend(url, body) {
+      perfMark(`api-mutation send ${url.replace(/\?.*/, '')}`);
+      let applied = false;
       try {
-        const issueKey = extractIssueKey(url);
+        // REST path: issue key in URL, sprint ids in body.fields[<sprintFieldId>].
+        const issueKeyFromUrl = extractIssueKey(url);
         const sprintFieldId = sprintCapacity.getSprintFieldIdSync();
-        if (issueKey && sprintFieldId) {
+        if (issueKeyFromUrl && sprintFieldId) {
           const targetIds = extractTargetSprintIds(body, sprintFieldId);
           if (targetIds && targetIds.length > 0) {
-            const applied = sprintCapacity.applyOptimisticMove(issueKey, targetIds);
-            if (isDebug()) {
-              debug(
-                `optimistic ${applied ? 'applied' : 'skipped'} for ${issueKey} → [${targetIds.join(',')}]`,
-              );
-            }
+            applied = sprintCapacity.applyOptimisticMove(issueKeyFromUrl, targetIds);
+            perfStamp(
+              `optimistic(REST) ${applied ? 'applied' : 'skipped(catalog miss)'} ` +
+                `${issueKeyFromUrl} → [${targetIds.join(',')}]`,
+            );
+          }
+        }
+        // GraphQL path: issue key + sprint ids heuristically inside
+        // body.variables. Walk the tree looking for a single issue key +
+        // known sprint ids.
+        if (!applied) {
+          const openIds = velocity.getKnownOpenSprintIds();
+          const move = extractGraphqlMove(body, openIds);
+          if (move) {
+            applied = sprintCapacity.applyOptimisticMove(move.issueKey, move.targetIds);
+            perfStamp(
+              `optimistic(GraphQL) ${applied ? 'applied' : 'skipped(catalog miss)'} ` +
+                `${move.issueKey} → [${move.targetIds.join(',')}]`,
+            );
+          } else if (isDebug()) {
+            perfStamp('optimistic: no move extractable from body (REST+GraphQL both missed)');
           }
         }
       } catch (e) {
-        if (isDebug()) debug('optimistic path error:', e?.message || e);
+        if (isDebug()) debug('onMutationSend error:', e?.message || e);
       }
+      // If we applied, trigger a repaint now so the chip updates before
+      // the server even responds. If we didn't, no paint yet — the
+      // response-time path will invalidate and refresh.
+      if (applied && onAfterInvalidate) {
+        perfStamp('repaint scheduled (optimistic applied)');
+        onAfterInvalidate();
+      }
+    }
 
-      // Jira often updates the UI optimistically before the mutation
-      // request completes, so the MutationObserver may have already run
-      // a cycle against stale capacity data by the time we get here.
-      // Trigger an explicit re-run so the overlay catches up without
-      // waiting for the next DOM tick or TTL expiry.
-      if (onAfterInvalidate) onAfterInvalidate();
+    // Response-time: authoritative. Server has committed (2xx), so a JQL
+    // refresh now is guaranteed to see the post-mutation state. We mark
+    // cache entries stale (keeping their values for SWR) and schedule a
+    // re-run; the confirming JQL will overwrite any optimistic value that
+    // was wrong.
+    function onMutationConfirmed(url) {
+      perfStamp(`api-mutation confirmed ${url.replace(/\?.*/, '')}`);
+      const sprintId = extractSprintId(url);
+      if (sprintId) sprintCapacity.invalidate(sprintId);
+      else sprintCapacity.invalidateAll();
+      if (onAfterInvalidate) {
+        perfStamp('repaint scheduled (confirm-invalidate)');
+        onAfterInvalidate();
+      }
     }
 
     // In debug mode, dump every mutating same-origin request (matched or
@@ -2000,21 +2125,40 @@
         // ------ fetch patch
         const originalFetch = window.fetch.bind(window);
         window.fetch = async function momentumPatchedFetch(input, init) {
-          const res = await originalFetch(input, init);
+          // Peek request details BEFORE awaiting the server — so we can
+          // fire optimistic updates at send-time rather than waiting the
+          // full request round-trip before even starting to repaint.
+          let url = '';
+          let method = 'GET';
+          let body = null;
           try {
-            const url = typeof input === 'string' ? input : input?.url || '';
-            const method =
+            url = typeof input === 'string' ? input : input?.url || '';
+            method =
               (init && init.method) ||
               (typeof input !== 'string' && input?.method) ||
               'GET';
+            body =
+              (init && init.body) ||
+              (typeof input !== 'string' && input?.body) ||
+              null;
+            if (
+              url &&
+              MUTATING.has(method.toUpperCase()) &&
+              matchesInvalidationPath(url, body)
+            ) {
+              onMutationSend(url, body);
+            }
+          } catch (e) {
+            if (isDebug()) debug('fetch send-time error:', e?.message || e);
+          }
+
+          const res = await originalFetch(input, init);
+
+          try {
             if (url && isMutation(method, res.status)) {
-              const body =
-                (init && init.body) ||
-                (typeof input !== 'string' && input?.body) ||
-                null;
               const matched = matchesInvalidationPath(url, body);
               recordObservation(method, url, res.status, matched);
-              if (matched) onMutation(url, body);
+              if (matched) onMutationConfirmed(url);
             }
           } catch (e) {
             if (isDebug()) debug('api-mutation interceptor error (fetch):', e?.message || e);
@@ -2035,14 +2179,26 @@
         };
         XMLHttpRequest.prototype.send = function momentumXhrSend(body) {
           this.__momentumBody = body;
+          const method = this.__momentumMethod || 'GET';
+          const url = this.__momentumUrl || '';
+          // Send-time optimistic, before origSend kicks off the network.
+          try {
+            if (
+              url &&
+              MUTATING.has(method.toUpperCase()) &&
+              matchesInvalidationPath(url, body)
+            ) {
+              onMutationSend(url, body);
+            }
+          } catch (e) {
+            if (isDebug()) debug('xhr send-time error:', e?.message || e);
+          }
           this.addEventListener('load', () => {
             try {
-              const method = this.__momentumMethod || 'GET';
-              const url = this.__momentumUrl || '';
               if (url && isMutation(method, this.status)) {
                 const matched = matchesInvalidationPath(url, this.__momentumBody);
                 recordObservation(method, url, this.status, matched);
-                if (matched) onMutation(url, this.__momentumBody);
+                if (matched) onMutationConfirmed(url);
               }
             } catch (e) {
               if (isDebug()) debug('api-mutation interceptor error (xhr):', e?.message || e);
@@ -2095,7 +2251,7 @@
     // Initial pass (in case the timeline is already rendered at document-idle).
     runActiveFeatures();
     log(
-      'loaded — version 0.3.8',
+      'loaded — version 0.3.9',
       isDebug()
         ? '(debug on)'
         : '(debug off — enable with: localStorage.setItem(\'momentum-light-debug\', \'1\'))',
