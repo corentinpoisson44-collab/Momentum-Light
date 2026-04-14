@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.4.3
+// @version      0.4.4
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne, et menu « How-to » guidé qui surligne chaque feature au premier lancement.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -872,22 +872,12 @@
          preserves the strong state-color cue (green / amber / red). The
          numeric label lives in the tooltip, not inside the chip.
 
-         Alignment matters. The Jira timeline sprint chip is a flex row:
-           <button>
-             <div> body with rounded-left radius + sprint name </div>
-             <div> 7px SVG flag tip </div>
-           </button>
-         Our overlay sits at inset:0 by default, which fills the ENTIRE
-         button border-box including the 7px tip area — that's why the
-         colored wash used to bleed past the chip's visible right edge.
-         We anchor the overlay to the body's exact bounds: stop 7px short
-         of the button's right edge, and mirror the body's rounded-left-
-         only border-radius (var(--ds-radius-small) token from Atlaskit
-         — the same one the chip body uses inline) so the overlay's
-         corners line up with the chip's visible shape. */
+         The overlay DOM parent is the chip's body div (data-testid ends
+         with "marker.content"), not the button itself — see sprintChip
+         .ensureOverlay. That means inset:0 + border-radius:inherit from
+         the base OVERLAY_CLASS rule already line up with the chip's
+         visible rounded-left shape; no hardcoded inset or radius here. */
       .${OVERLAY_SPRINT_FILL_MOD} {
-        right: 7px;
-        border-radius: var(--ds-radius-small, 3px) 0 0 var(--ds-radius-small, 3px);
         background-color: transparent;
       }
       .${OVERLAY_SPRINT_FILL_MOD} .${OVERLAY_FILL_CLASS} {
@@ -1534,11 +1524,29 @@
       );
     }
 
+    // The sprint chip button is a flex row with three children:
+    //   1. (our overlay, once injected)
+    //   2. <div data-testid="…marker.content"> — the rounded-left body
+    //      that holds the sprint name and has the visible chip shape.
+    //   3. <div> — a 7px SVG flag tip on the right.
+    // Anchoring the overlay to the button's border-box makes it fill the
+    // full width including the tip area, so the wash bleeds past the
+    // chip's visible right edge (and misaligns on the left when the
+    // button itself has padding or transforms). Anchor to the body div
+    // instead — its bounds and border-radius ARE the chip's visible
+    // shape, so `inset: 0 + border-radius: inherit` lines up exactly.
+    const CHIP_BODY_SELECTOR = '[data-testid$="intervals.marker.content"]';
+
+    function overlayHost(chip) {
+      return chip.querySelector(CHIP_BODY_SELECTOR) || chip;
+    }
+
     function ensureOverlay(chip) {
-      let overlay = chip.querySelector(`:scope > .${OVERLAY_CLASS}`);
+      const host = overlayHost(chip);
+      let overlay = host.querySelector(`:scope > .${OVERLAY_CLASS}`);
       if (overlay) return overlay;
-      const computed = getComputedStyle(chip);
-      if (computed.position === 'static') chip.style.position = 'relative';
+      const computed = getComputedStyle(host);
+      if (computed.position === 'static') host.style.position = 'relative';
       overlay = document.createElement('div');
       overlay.className = `${OVERLAY_CLASS} ${OVERLAY_SPRINT_FILL_MOD}`;
       const fill = document.createElement('div');
@@ -1547,13 +1555,21 @@
       const label = document.createElement('div');
       label.className = OVERLAY_LABEL_CLASS;
       overlay.appendChild(label);
-      chip.insertBefore(overlay, chip.firstChild);
+      host.insertBefore(overlay, host.firstChild);
       return overlay;
     }
 
     function removeOverlay(chip) {
-      const overlay = chip.querySelector(`:scope > .${OVERLAY_CLASS}`);
+      const host = overlayHost(chip);
+      const overlay = host.querySelector(`:scope > .${OVERLAY_CLASS}`);
       if (overlay) overlay.remove();
+      // Belt-and-suspenders: earlier versions of this script attached the
+      // overlay directly to the button. Clean up any stale one so users
+      // upgrading in-place don't end up with two overlays stacked.
+      if (host !== chip) {
+        const stale = chip.querySelector(`:scope > .${OVERLAY_CLASS}`);
+        if (stale) stale.remove();
+      }
     }
 
     function extractSprintName(chip) {
