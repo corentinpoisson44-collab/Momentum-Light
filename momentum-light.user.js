@@ -2067,17 +2067,16 @@
       legend.innerHTML =
         `<span class="${CONFIDENCE_LEGEND_CLASS}__title">Confiance Epic :</span>` +
         `<span class="${CONFIDENCE_LEGEND_CLASS}__item">` +
-          `<span class="${CONFIDENCE_LEGEND_CLASS}__swatch" data-tier="low"></span>faible` +
+          `<span class="${CONFIDENCE_LEGEND_CLASS}__swatch" data-tier="low" data-discovery></span>Discovery` +
         `</span>` +
         `<span class="${CONFIDENCE_LEGEND_CLASS}__item">` +
-          `<span class="${CONFIDENCE_LEGEND_CLASS}__swatch" data-tier="medium"></span>moyenne` +
+          `<span class="${CONFIDENCE_LEGEND_CLASS}__swatch" data-tier="low"></span>Faible` +
         `</span>` +
         `<span class="${CONFIDENCE_LEGEND_CLASS}__item">` +
-          `<span class="${CONFIDENCE_LEGEND_CLASS}__swatch" data-tier="high"></span>haute` +
+          `<span class="${CONFIDENCE_LEGEND_CLASS}__swatch" data-tier="medium"></span>Moyenne` +
         `</span>` +
-        `<span class="${CONFIDENCE_LEGEND_CLASS}__separator">+ hachures si Open :</span>` +
         `<span class="${CONFIDENCE_LEGEND_CLASS}__item">` +
-          `<span class="${CONFIDENCE_LEGEND_CLASS}__swatch" data-tier="medium" data-discovery></span>Discovery` +
+          `<span class="${CONFIDENCE_LEGEND_CLASS}__swatch" data-tier="high"></span>Haute` +
         `</span>`;
       return legend;
     }
