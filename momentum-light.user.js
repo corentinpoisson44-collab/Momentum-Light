@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.1.8
+// @version      0.1.9
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — feature #1 : barre de progression sur les Epics, calculée sur SP done / SP total des tickets enfants.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -239,58 +239,81 @@
     // Holds { epicKey, overlay } so we can update without rebuilding.
     const decorated = new WeakMap();
 
-    // Primary target: the chart bar representing the Epic's timespan on the
-    // timeline. Adjust here if Atlassian ships a DOM change.
-    const CHART_BAR_SELECTOR =
-      '[data-testid="roadmap.timeline-table-kit.ui.chart-item-content.date-content.bar"]';
+    // Testid prefixes — Atlassian occasionally tweaks the leaf segment
+    // (e.g. `.date-content.bar` vs `.bar` vs `.content`), so we match by
+    // prefix rather than exact string to stay resilient across DOM revisions.
+    const CHART_CONTENT_TESTID_PREFIX = 'roadmap.timeline-table-kit.ui.chart-item-content';
+    const ROW_TESTID_PREFIX = 'roadmap.timeline-table-kit.ui.row';
     // Anchor used as a fallback — the native progress-wrapper is reliably rendered
-    // per Epic; from it we can walk up to find the chart bar even if its testid
-    // changes.
+    // per Epic in the list-side summary cell.
     const PROGRESS_WRAPPER_SELECTOR =
       '[data-testid="common.components.progress-bar.progress-wrapper"]';
     const KEY_CELL_SELECTOR =
       '[data-testid="roadmap.timeline-table-kit.ui.list-item-content.summary.key"]';
 
+    // From a list of candidate elements, return only those that do NOT contain
+    // another candidate — i.e. the deepest matches. This lets us target the
+    // actual visible bar and avoid decorating its wrapping containers.
+    function leavesOnly(candidates) {
+      return candidates.filter(
+        (el) => !candidates.some((other) => other !== el && el.contains(other)),
+      );
+    }
+
     function findBars(root) {
-      // Strategy 1 — exact testid on the chart bar.
-      const direct = [...root.querySelectorAll(CHART_BAR_SELECTOR)];
-      if (direct.length > 0) {
-        if (isDebug()) debug('findBars → direct match:', direct.length);
-        return direct;
+      // Strategy 1 — any testid starting with the chart-item-content prefix.
+      // Pick the deepest matches (leaves) so we decorate the bar itself and not
+      // its container.
+      const prefixHits = [...root.querySelectorAll('[data-testid]')].filter(
+        (el) => (el.getAttribute('data-testid') || '').startsWith(
+          CHART_CONTENT_TESTID_PREFIX,
+        ),
+      );
+      if (prefixHits.length > 0) {
+        const leaves = leavesOnly(prefixHits);
+        if (isDebug()) {
+          debug('findBars → prefix hits:', prefixHits.length, 'leaves:', leaves.length);
+        }
+        return leaves;
       }
-      // Strategy 2 — walk up from each progress-wrapper until we find an
-      // ancestor whose testid starts with "...chart-item-content.date-content",
-      // which is the chart bar container on this DOM variant.
+
+      // Strategy 2 — walk up from each progress-wrapper to the row container,
+      // then descend to pick any descendant whose testid references "chart".
+      // Progress-wrapper usually sits on the list side; the row is the shared
+      // ancestor that also owns the chart side.
       const wrappers = root.querySelectorAll(PROGRESS_WRAPPER_SELECTOR);
       const found = new Set();
       for (const w of wrappers) {
         let cursor = w.parentElement;
         let steps = 0;
-        while (cursor && cursor !== document.body && steps < 12) {
+        let row = null;
+        while (cursor && cursor !== document.body && steps < 20) {
           const tid = cursor.getAttribute?.('data-testid') || '';
-          if (tid.startsWith('roadmap.timeline-table-kit.ui.chart-item-content')) {
-            found.add(cursor);
+          if (tid.startsWith(ROW_TESTID_PREFIX)) {
+            row = cursor;
             break;
           }
           cursor = cursor.parentElement;
           steps += 1;
         }
+        if (!row) continue;
+        const chartHits = [...row.querySelectorAll('[data-testid]')].filter((el) => {
+          const tid = el.getAttribute('data-testid') || '';
+          return tid.startsWith(CHART_CONTENT_TESTID_PREFIX);
+        });
+        leavesOnly(chartHits).forEach((leaf) => found.add(leaf));
       }
       if (isDebug()) {
-        debug('findBars → direct:0, progress-wrappers:', wrappers.length, 'resolved-bars:', found.size);
+        debug('findBars → prefix:0, wrappers:', wrappers.length, 'row-scan resolved:', found.size);
       }
       return [...found];
     }
 
-    // Diagnostic probe — runs unconditionally when findBars returns empty (not
-    // gated on debug mode, so the user always gets actionable feedback).
-    // Three sections:
-    //   1. Top unique testids overall (signals what's rendered on the page).
-    //   2. All testids containing "chart" (the chart side we're targeting).
-    //   3. Ancestor chain of the first progress-wrapper (shows whether the
-    //      wrapper is on the list side or the chart side, and what testids
-    //      sit between it and the row).
-    // Rate-limited to once per 3 s to keep the console readable.
+    // Diagnostic probe — runs when findBars returns empty. Collects testid
+    // stats + the ancestor chain of a progress-wrapper, and stores them on
+    // `window.__MOMENTUM_PROBE__` so they survive console truncation (the user
+    // can inspect the live object or `JSON.stringify(window.__MOMENTUM_PROBE__)`
+    // any time without racing the rate limit). Rate-limited to once per 3 s.
     let lastProbeAt = 0;
     function probeCandidates(root) {
       const now = Date.now();
@@ -306,28 +329,50 @@
       const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1]);
 
       const top = sorted.slice(0, 20).map(([testid, count]) => ({ testid, count }));
-      warn(`probe — ${sorted.length} unique testids on page. Top 20:`);
-      warn(JSON.stringify(top, null, 2));
-
       const chartHits = sorted
         .filter(([id]) => id.toLowerCase().includes('chart'))
         .map(([testid, count]) => ({ testid, count }));
-      warn(`probe — chart-related testids (${chartHits.length}):`);
-      warn(JSON.stringify(chartHits, null, 2));
+      const rowHits = sorted
+        .filter(([id]) => id.toLowerCase().includes('row'))
+        .map(([testid, count]) => ({ testid, count }));
 
+      let wrapperChain = null;
       const firstPw = root.querySelector(PROGRESS_WRAPPER_SELECTOR);
       if (firstPw) {
-        const chain = [];
+        wrapperChain = [];
         let cursor = firstPw;
         let steps = 0;
         while (cursor && cursor !== document.body && steps < 15) {
           const tid = cursor.getAttribute?.('data-testid') || '';
           const tag = (cursor.tagName || '').toLowerCase();
-          chain.push(tid ? `${tag}[testid="${tid}"]` : `${tag}`);
+          wrapperChain.push(tid ? `${tag}[testid="${tid}"]` : tag);
           cursor = cursor.parentElement;
           steps += 1;
         }
-        warn('probe — ancestor chain of first progress-wrapper:\n' + chain.join('\n  ↑ '));
+      }
+
+      // Persist for post-hoc inspection. The user can run
+      //   copy(JSON.stringify(window.__MOMENTUM_PROBE__, null, 2))
+      // in DevTools to reliably extract the full probe without console truncation.
+      window.__MOMENTUM_PROBE__ = {
+        timestamp: new Date().toISOString(),
+        totalUniqueTestids: sorted.length,
+        top20: top,
+        chartHits,
+        rowHits,
+        firstProgressWrapperAncestorChain: wrapperChain,
+        allTestids: sorted.map(([testid, count]) => ({ testid, count })),
+      };
+
+      warn(
+        `probe — ${sorted.length} unique testids on page | chart:${chartHits.length} | row:${rowHits.length}`,
+      );
+      warn('probe — full dump at window.__MOMENTUM_PROBE__ — run `copy(JSON.stringify(window.__MOMENTUM_PROBE__, null, 2))`');
+      warn('probe — top 20:', top);
+      warn('probe — chart-related testids:', chartHits);
+      warn('probe — row-related testids:', rowHits);
+      if (wrapperChain) {
+        warn('probe — ancestor chain of first progress-wrapper:\n' + wrapperChain.join('\n  ↑ '));
       } else {
         warn('probe — no progress-wrapper found either');
       }
@@ -561,7 +606,7 @@
     // Initial pass (in case the timeline is already rendered at document-idle).
     runActiveFeatures();
     log(
-      'loaded — version 0.1.8',
+      'loaded — version 0.1.9',
       isDebug()
         ? '(debug on)'
         : '(debug off — enable with: localStorage.setItem(\'momentum-light-debug\', \'1\'))',
