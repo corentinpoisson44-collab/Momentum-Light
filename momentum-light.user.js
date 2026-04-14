@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.3.5
+// @version      0.3.6
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), et indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -21,7 +21,13 @@
   const LOG_PREFIX = '[Momentum-Light]';
   const ISSUE_KEY_REGEX = /\b([A-Z][A-Z0-9]+-\d+)\b/;
   const EPIC_CHILDREN_TTL_MS = 60_000;
+  // DOM-side: Jira re-renders the timeline in dozens of micro-mutations, so we
+  // wait a bit to coalesce them into a single feature pass.
   const MUTATION_DEBOUNCE_MS = 200;
+  // API-side: a ticket move fires at most a couple of requests (REST + GraphQL
+  // mirror). We just want to coalesce that burst, not wait for anything else,
+  // so this debounce is kept tight to minimise perceived update latency.
+  const API_MUTATION_DEBOUNCE_MS = 50;
   const OVERLAY_CLASS = 'momentum-progress';
   const OVERLAY_FILL_CLASS = 'momentum-progress__fill';
   const OVERLAY_LABEL_CLASS = 'momentum-progress__label';
@@ -1773,18 +1779,21 @@
   function bootstrap() {
     ensureStyles();
     tooltipInterceptor.install();
-    const onMutation = debounce(runActiveFeatures, MUTATION_DEBOUNCE_MS);
-    // After a sprint-membership mutation we invalidate sprintCapacity
-    // then schedule a re-run through the same debounced pipeline so two
-    // back-to-back mutations (e.g. rank + sprint field) coalesce into
-    // one refresh instead of triggering N parallel fetches.
-    apiMutationInterceptor.install(onMutation);
-    const observer = new MutationObserver(onMutation);
+    // Two debounces: the DOM one is conservative (coalesces Jira's re-render
+    // storm), the API one is tight — once the server has acknowledged a sprint
+    // mutation the user is waiting on the overlay, so we want the refresh to
+    // land as quickly as possible. Both share the same underlying runner, so
+    // overlapping triggers still coalesce via the feature pipeline's own
+    // inflight dedup.
+    const onMutationFromDom = debounce(runActiveFeatures, MUTATION_DEBOUNCE_MS);
+    const onMutationFromApi = debounce(runActiveFeatures, API_MUTATION_DEBOUNCE_MS);
+    apiMutationInterceptor.install(onMutationFromApi);
+    const observer = new MutationObserver(onMutationFromDom);
     observer.observe(document.body, { childList: true, subtree: true });
     // Initial pass (in case the timeline is already rendered at document-idle).
     runActiveFeatures();
     log(
-      'loaded — version 0.3.5',
+      'loaded — version 0.3.6',
       isDebug()
         ? '(debug on)'
         : '(debug off — enable with: localStorage.setItem(\'momentum-light-debug\', \'1\'))',
