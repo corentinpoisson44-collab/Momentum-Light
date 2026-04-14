@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.3.3
+// @version      0.3.4
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), et indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -438,10 +438,18 @@
           return kb - ka;
         };
         const recent = closed.sort(byCloseDesc).slice(0, SPRINT_WINDOW);
-        for (const s of recent) {
-          const done = await sprintCompletedSP(boardId, s.id, spFieldId);
-          perSprint.push({ id: s.id, name: s.name, velocity: done });
-        }
+        // Fetch all N sprint-reports in parallel. Jira comfortably handles
+        // a handful of concurrent requests against the same endpoint, and
+        // this cuts the velocity first-paint from ~N× round-trip to ~1×.
+        const velocities = await Promise.all(
+          recent.map((s) =>
+            sprintCompletedSP(boardId, s.id, spFieldId).catch((e) => {
+              warn(`velocity: sprint ${s.id} failed:`, e?.message || e);
+              return 0;
+            }),
+          ),
+        );
+        perSprint = recent.map((s, i) => ({ id: s.id, name: s.name, velocity: velocities[i] }));
         const total = perSprint.reduce((acc, s) => acc + s.velocity, 0);
         average = perSprint.length ? total / perSprint.length : 0;
       }
@@ -1591,6 +1599,7 @@
       return PATTERNS.some((re) => re.test(url));
     }
 
+    let onAfterInvalidate = null;
     function onMutation(url) {
       const sprintId = extractSprintId(url);
       if (sprintId) {
@@ -1600,13 +1609,20 @@
         sprintCapacity.invalidateAll();
         if (isDebug()) debug(`api-mutation → invalidated all sprintCapacity (${url})`);
       }
+      // Jira often updates the UI optimistically before the mutation
+      // request completes, so the MutationObserver may have already run
+      // a cycle against stale capacity data by the time we get here.
+      // Trigger an explicit re-run so the overlay catches up without
+      // waiting for the next DOM tick or TTL expiry.
+      if (onAfterInvalidate) onAfterInvalidate();
     }
 
     let installed = false;
     return {
-      install() {
+      install(afterInvalidateCb) {
         if (installed) return;
         installed = true;
+        onAfterInvalidate = afterInvalidateCb || null;
         const originalFetch = window.fetch.bind(window);
         window.fetch = async function momentumPatchedFetch(input, init) {
           const res = await originalFetch(input, init);
@@ -1653,14 +1669,18 @@
   function bootstrap() {
     ensureStyles();
     tooltipInterceptor.install();
-    apiMutationInterceptor.install();
     const onMutation = debounce(runActiveFeatures, MUTATION_DEBOUNCE_MS);
+    // After a sprint-membership mutation we invalidate sprintCapacity
+    // then schedule a re-run through the same debounced pipeline so two
+    // back-to-back mutations (e.g. rank + sprint field) coalesce into
+    // one refresh instead of triggering N parallel fetches.
+    apiMutationInterceptor.install(onMutation);
     const observer = new MutationObserver(onMutation);
     observer.observe(document.body, { childList: true, subtree: true });
     // Initial pass (in case the timeline is already rendered at document-idle).
     runActiveFeatures();
     log(
-      'loaded — version 0.3.3',
+      'loaded — version 0.3.4',
       isDebug()
         ? '(debug on)'
         : '(debug off — enable with: localStorage.setItem(\'momentum-light-debug\', \'1\'))',
