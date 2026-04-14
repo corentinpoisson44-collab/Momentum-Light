@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.3.6
+// @version      0.3.7
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), et indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -162,7 +162,48 @@
   })();
 
   // ---------------------------------------------------------------------------
-  // issueMeta — batched fetch of { isEpic, storyPoints } per issue key.
+  // sprintField — dynamic discovery of the Sprint custom field id (mirror of
+  // storyPointsField). Needed so we can bucket issues returned by a single
+  // "sprint in (a,b,c)" JQL into their respective sprints without issuing one
+  // /rest/agile/1.0/sprint/{id}/issue call per sprint.
+  // ---------------------------------------------------------------------------
+
+  const sprintField = (() => {
+    const CACHE_KEY = 'momentum-light::sprint-field-id';
+    let inflight = null;
+
+    return {
+      async resolve() {
+        const cached = sessionStorage.getItem(CACHE_KEY);
+        if (cached) return cached;
+        if (inflight) return inflight;
+
+        inflight = (async () => {
+          const fields = await jiraApi.listFields();
+          // The sprint field is an Atlassian-managed custom field whose
+          // schema.custom ends with ":gh-sprint". Match on that primarily,
+          // fall back to name === "sprint" for older instances.
+          const match =
+            fields.find((f) => String(f.schema?.custom || '').endsWith(':gh-sprint')) ||
+            fields.find((f) => (f.name || '').toLowerCase().trim() === 'sprint');
+          if (!match) {
+            throw new Error('Sprint custom field not found on this instance');
+          }
+          sessionStorage.setItem(CACHE_KEY, match.id);
+          log('Sprint field resolved:', match.id, `(${match.name})`);
+          return match.id;
+        })();
+
+        try {
+          return await inflight;
+        } finally {
+          inflight = null;
+        }
+      },
+    };
+  })();
+
+  // ---------------------------------------------------------------------------
   // Multiple concurrent requests within a 50 ms window are coalesced into a
   // single `key in (...)` JQL query so expanding an Epic with 20 children
   // costs one API round-trip instead of 20.
@@ -515,24 +556,128 @@
     // on mutation but may miss proprietary/graphql paths — the TTL is
     // the safety net that bounds staleness even in the miss case.
     const TTL_MS = 15_000;
-    const cache = new Map(); // sprintId -> { expiresAt, value }
-    const inflight = new Map(); // sprintId -> Promise
+    // Batching window: concurrent get() calls within this window coalesce
+    // into a single JQL round-trip. 20ms is enough to catch the burst of
+    // chip decorations fired by one runActiveFeatures pass, short enough
+    // that it doesn't contribute meaningfully to perceived latency.
+    const FLUSH_DELAY_MS = 20;
 
-    async function fetchOne(sprintId, state) {
-      const spFieldId = await storyPointsField.resolve();
-      const data = await jiraApi.request(
-        `/rest/agile/1.0/sprint/${sprintId}/issue?fields=${encodeURIComponent(spFieldId)},status&maxResults=500`,
+    const cache = new Map(); // `${id}:${state}` -> { expiresAt, value }
+    const inflight = new Map(); // `${id}:${state}` -> Promise<value>
+    const batchWaiters = new Map(); // `${id}:${state}` -> [{ resolve, reject }]
+    let pending = new Map(); // sprintId -> state (last state wins; states are stable per sprint)
+    let flushTimer = null;
+    let onFreshListener = null;
+
+    async function runBatch(entries) {
+      // entries: [[sprintId, state], ...]
+      const [spFieldId, sprintFieldId] = await Promise.all([
+        storyPointsField.resolve(),
+        sprintField.resolve(),
+      ]);
+      const ids = entries.map(([id]) => id);
+      const idSet = new Set(ids);
+      const jql = `sprint in (${ids.join(',')})`;
+      // maxResults=1000: covers the vast majority of plans (20 sprints ×
+      // ~50 issues). If a user has a giant plan we'll undercount the
+      // tail — acceptable; matches the previous /sprint/{id}/issue limit
+      // of 500 per sprint in practice.
+      const data = await jiraApi.searchIssues(
+        jql,
+        [spFieldId, 'status', sprintFieldId],
+        1000,
       );
-      let total = 0;
-      let remaining = 0;
+
+      const perSprint = new Map();
+      for (const [id] of entries) perSprint.set(id, { total: 0, remaining: 0 });
+
       for (const issue of data.issues || []) {
         const sp = Number(issue.fields?.[spFieldId]);
         if (!Number.isFinite(sp) || sp <= 0) continue;
-        total += sp;
-        if (issue.fields?.status?.statusCategory?.key !== 'done') remaining += sp;
+        const isDone = issue.fields?.status?.statusCategory?.key === 'done';
+        const sprintsRaw = issue.fields?.[sprintFieldId];
+        const sprintList = Array.isArray(sprintsRaw) ? sprintsRaw : [];
+        for (const s of sprintList) {
+          const sid = Number(s?.id);
+          if (!idSet.has(sid)) continue;
+          const bucket = perSprint.get(sid);
+          bucket.total += sp;
+          if (!isDone) bucket.remaining += sp;
+        }
       }
-      const load = state === 'active' ? remaining : total;
-      return { total, remaining, load, state };
+
+      const results = new Map();
+      for (const [id, state] of entries) {
+        const b = perSprint.get(id) || { total: 0, remaining: 0 };
+        const load = state === 'active' ? b.remaining : b.total;
+        results.set(`${id}:${state}`, { total: b.total, remaining: b.remaining, load, state });
+      }
+      return results;
+    }
+
+    async function flushBatch() {
+      flushTimer = null;
+      const entries = [...pending.entries()];
+      pending = new Map();
+      if (entries.length === 0) return;
+
+      let results;
+      try {
+        results = await runBatch(entries);
+      } catch (e) {
+        for (const [id, state] of entries) {
+          const key = `${id}:${state}`;
+          const w = batchWaiters.get(key);
+          if (w) {
+            w.forEach(({ reject }) => reject(e));
+            batchWaiters.delete(key);
+          }
+          inflight.delete(key);
+        }
+        return;
+      }
+
+      const now = Date.now();
+      for (const [id, state] of entries) {
+        const key = `${id}:${state}`;
+        const value = results.get(key);
+        if (value) cache.set(key, { expiresAt: now + TTL_MS, value });
+        const w = batchWaiters.get(key);
+        if (w) {
+          w.forEach(({ resolve }) => resolve(value));
+          batchWaiters.delete(key);
+        }
+        inflight.delete(key);
+      }
+      // Let the feature pipeline re-run so stale-while-revalidate consumers
+      // repaint with the freshly-landed numbers.
+      if (onFreshListener) {
+        try { onFreshListener(); } catch (e) { /* listener error shouldn't poison batch */ }
+      }
+    }
+
+    function enqueue(sprintId, state) {
+      pending.set(sprintId, state);
+      if (!flushTimer) flushTimer = setTimeout(flushBatch, FLUSH_DELAY_MS);
+    }
+
+    function awaitBatch(key) {
+      return new Promise((resolve, reject) => {
+        if (!batchWaiters.has(key)) batchWaiters.set(key, []);
+        batchWaiters.get(key).push({ resolve, reject });
+      });
+    }
+
+    function scheduleRefresh(sprintId, state) {
+      const key = `${sprintId}:${state}`;
+      if (inflight.has(key)) return inflight.get(key);
+      const p = awaitBatch(key);
+      // Swallow rejections on the inflight reference; callers that await
+      // will still observe them.
+      p.catch(() => {});
+      inflight.set(key, p);
+      enqueue(sprintId, state);
+      return p;
     }
 
     return {
@@ -541,28 +686,31 @@
         const now = Date.now();
         const hit = cache.get(key);
         if (hit && hit.expiresAt > now) return hit.value;
-        if (inflight.has(key)) return inflight.get(key);
-
-        const promise = (async () => {
-          try {
-            const value = await fetchOne(sprintId, state);
-            cache.set(key, { expiresAt: Date.now() + TTL_MS, value });
-            return value;
-          } finally {
-            inflight.delete(key);
-          }
-        })();
-        inflight.set(key, promise);
-        return promise;
+        // Stale-while-revalidate: return old value immediately so the chip
+        // stays painted (no flicker / no empty state), while a background
+        // batch refreshes the numbers. The onFresh listener triggers a
+        // re-run of runActiveFeatures once the batch lands.
+        if (hit) {
+          scheduleRefresh(sprintId, state);
+          return hit.value;
+        }
+        // Cold cache: must wait for the first batch to complete.
+        return scheduleRefresh(sprintId, state);
       },
       invalidate(sprintId) {
-        // Invalidate both state slots so a sprint transitioning from
-        // future → active (or any flip) picks up fresh data.
-        cache.delete(`${sprintId}:active`);
-        cache.delete(`${sprintId}:future`);
+        // Mark expired but keep the last known value for stale-while-
+        // revalidate — so the user sees the old numbers during the refetch
+        // instead of an empty overlay or pre-mutation stale data.
+        const a = cache.get(`${sprintId}:active`);
+        const f = cache.get(`${sprintId}:future`);
+        if (a) a.expiresAt = 0;
+        if (f) f.expiresAt = 0;
       },
       invalidateAll() {
-        cache.clear();
+        for (const entry of cache.values()) entry.expiresAt = 0;
+      },
+      onFresh(listener) {
+        onFreshListener = listener;
       },
     };
   })();
@@ -1788,12 +1936,16 @@
     const onMutationFromDom = debounce(runActiveFeatures, MUTATION_DEBOUNCE_MS);
     const onMutationFromApi = debounce(runActiveFeatures, API_MUTATION_DEBOUNCE_MS);
     apiMutationInterceptor.install(onMutationFromApi);
+    // When a background sprint-capacity refresh lands (stale-while-revalidate
+    // consumers got the stale value, the fresh one arrives async), trigger a
+    // re-paint so chips actually update on screen.
+    sprintCapacity.onFresh(onMutationFromApi);
     const observer = new MutationObserver(onMutationFromDom);
     observer.observe(document.body, { childList: true, subtree: true });
     // Initial pass (in case the timeline is already rendered at document-idle).
     runActiveFeatures();
     log(
-      'loaded — version 0.3.6',
+      'loaded — version 0.3.7',
       isDebug()
         ? '(debug on)'
         : '(debug off — enable with: localStorage.setItem(\'momentum-light-debug\', \'1\'))',
