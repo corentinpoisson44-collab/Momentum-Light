@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.1.10
+// @version      0.1.11
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — feature #1 : barre de progression sur les Epics, calculée sur SP done / SP total des tickets enfants.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -24,6 +24,7 @@
   const MUTATION_DEBOUNCE_MS = 200;
   const OVERLAY_CLASS = 'momentum-progress';
   const OVERLAY_FILL_CLASS = 'momentum-progress__fill';
+  const OVERLAY_LABEL_CLASS = 'momentum-progress__label';
 
   // Debug mode is opt-in per session. Enable from DevTools:
   //   localStorage.setItem('momentum-light-debug', '1')
@@ -210,9 +211,14 @@
         position: absolute;
         inset: 0;
         pointer-events: none;
-        /* No z-index / overflow: the overlay is inserted as the bar's FIRST
-           child so native widgets (edge link-dots, warning icons, link icons)
-           paint on top of us via natural DOM painting order. */
+        /* Pick up the bar's rounded corners so our fill matches the shape of
+           the host bar (prevents the sharp-corner artifact at the ends). */
+        border-radius: inherit;
+        /* Clip the fill to the rounded rectangle. Safe: the native widgets
+           that need to paint over our area (edge link-dots, icons, warnings)
+           are siblings of this overlay — they are not inside it and are not
+           affected by this overflow. */
+        overflow: hidden;
       }
       .${OVERLAY_FILL_CLASS} {
         height: 100%;
@@ -223,6 +229,24 @@
         background-color: rgba(0, 0, 0, 0.30);
         mix-blend-mode: multiply;
         transition: width 200ms ease-out;
+      }
+      .${OVERLAY_LABEL_CLASS} {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 0 8px;
+        color: #fff;
+        font-size: 11px;
+        font-weight: 600;
+        line-height: 1;
+        letter-spacing: 0.02em;
+        text-shadow: 0 1px 2px rgba(0, 0, 0, 0.55);
+        pointer-events: none;
+        overflow: hidden;
+        white-space: nowrap;
+        text-overflow: ellipsis;
       }
     `;
     document.head.appendChild(style);
@@ -249,6 +273,27 @@
     const KEY_CELL_SELECTOR =
       '[data-testid="roadmap.timeline-table-kit.ui.list-item-content.summary.key"]';
 
+    // Keywords in a testid that mark it as a widget nested inside the bar
+    // rather than the bar itself. We skip these to avoid decorating the
+    // corner link-creation dots, drag/resize handles, marker handles, etc.
+    // (they also share the chart-item-content prefix on this DOM variant).
+    const BAR_WIDGET_BLACKLIST = [
+      'link-dot',
+      'link-icon',
+      'dependency',
+      'handle',
+      'drag',
+      'resize',
+      'warning',
+      'lozenge',
+    ];
+
+    function isChartBarCandidate(el) {
+      const tid = (el.getAttribute('data-testid') || '').toLowerCase();
+      if (!tid.startsWith(CHART_CONTENT_TESTID_PREFIX)) return false;
+      return !BAR_WIDGET_BLACKLIST.some((kw) => tid.includes(kw));
+    }
+
     // From a list of candidate elements, return only those that do NOT contain
     // another candidate — i.e. the deepest matches. This lets us target the
     // actual visible bar and avoid decorating its wrapping containers.
@@ -259,14 +304,11 @@
     }
 
     function findBars(root) {
-      // Strategy 1 — any testid starting with the chart-item-content prefix.
-      // Pick the deepest matches (leaves) so we decorate the bar itself and not
-      // its container.
-      const prefixHits = [...root.querySelectorAll('[data-testid]')].filter(
-        (el) => (el.getAttribute('data-testid') || '').startsWith(
-          CHART_CONTENT_TESTID_PREFIX,
-        ),
-      );
+      // Strategy 1 — any testid starting with the chart-item-content prefix,
+      // minus known widget leaves (link-dots, drag handles, warning icons…).
+      // Then pick the deepest matches so we decorate the bar itself rather
+      // than its outer container.
+      const prefixHits = [...root.querySelectorAll('[data-testid]')].filter(isChartBarCandidate);
       if (prefixHits.length > 0) {
         const leaves = leavesOnly(prefixHits);
         if (isDebug()) {
@@ -295,10 +337,7 @@
           steps += 1;
         }
         if (!row) continue;
-        const chartHits = [...row.querySelectorAll('[data-testid]')].filter((el) => {
-          const tid = el.getAttribute('data-testid') || '';
-          return tid.startsWith(CHART_CONTENT_TESTID_PREFIX);
-        });
+        const chartHits = [...row.querySelectorAll('[data-testid]')].filter(isChartBarCandidate);
         leavesOnly(chartHits).forEach((leaf) => found.add(leaf));
       }
       if (isDebug()) {
@@ -414,6 +453,13 @@
       const fill = document.createElement('div');
       fill.className = OVERLAY_FILL_CLASS;
       overlay.appendChild(fill);
+      // In-bar label: "X / Y SP" rendered on top of the fill/bar for
+      // at-a-glance reading without hovering. The label sits in its own
+      // absolutely-positioned element so the mix-blend-mode on the fill does
+      // not affect the text color.
+      const label = document.createElement('div');
+      label.className = OVERLAY_LABEL_CLASS;
+      overlay.appendChild(label);
       // Insert as the FIRST child of the bar so the native widgets that JIRA
       // renders inside the bar (edge link-creation dots, link icons, warning
       // triangles) paint on top of our overlay via natural DOM order — no
@@ -438,7 +484,9 @@
 
       const overlay = ensureOverlay(bar);
       const fill = overlay.querySelector(`.${OVERLAY_FILL_CLASS}`);
+      const label = overlay.querySelector(`.${OVERLAY_LABEL_CLASS}`);
       if (fill) fill.style.width = pctStr;
+      if (label) label.textContent = `${done} / ${total} SP`;
 
       // Tooltip text — the interceptor (installed at bootstrap) will rewrite
       // JIRA's Atlaskit tooltip with this value when it appears on hover.
@@ -608,7 +656,7 @@
     // Initial pass (in case the timeline is already rendered at document-idle).
     runActiveFeatures();
     log(
-      'loaded — version 0.1.10',
+      'loaded — version 0.1.11',
       isDebug()
         ? '(debug on)'
         : '(debug off — enable with: localStorage.setItem(\'momentum-light-debug\', \'1\'))',
