@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.1.2
+// @version      0.1.3
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — feature #1 : barre de progression sur les Epics, calculée sur SP done / SP total des tickets enfants.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -178,30 +178,14 @@
   // styles — injected once
   // ---------------------------------------------------------------------------
 
+  // Styles kept as a placeholder for future features that inject their own DOM.
+  // The Epic Progress Bar feature overrides JIRA's own fill element directly, so
+  // no custom CSS is required for it.
   function ensureStyles() {
     if (document.getElementById('momentum-light-styles')) return;
     const style = document.createElement('style');
     style.id = 'momentum-light-styles';
-    style.textContent = `
-      .${OVERLAY_CLASS} {
-        position: absolute;
-        left: 0;
-        right: 0;
-        bottom: 0;
-        height: 25%;
-        min-height: 4px;
-        pointer-events: none;
-        border-radius: 0 0 3px 3px;
-        overflow: hidden;
-        z-index: 1;
-      }
-      .${OVERLAY_FILL_CLASS} {
-        height: 100%;
-        width: 0%;
-        background-color: rgba(0, 82, 204, 0.45);
-        transition: width 200ms ease-out;
-      }
-    `;
+    style.textContent = '';
     document.head.appendChild(style);
   }
 
@@ -214,24 +198,14 @@
     // Holds { epicKey, overlay } so we can update without rebuilding.
     const decorated = new WeakMap();
 
-    // JIRA obfuscates classes, so we probe multiple candidate selectors.
-    // These are the public-facing hooks observed on modern Cloud Plans/Timeline
-    // and project-board Timeline (software.c.projects/.../boards/.../timeline).
-    // Adjust here if Atlassian ships a DOM change.
+    // JIRA obfuscates classes, so we target the public data-testid hooks observed
+    // on real Timelines. Primary target: the progress-bar wrapper JIRA renders
+    // on each Epic's chart bar. Adjust here if Atlassian ships a DOM change.
     const BAR_SELECTORS = [
-      // Project-board Timeline (software-roadmap / software.c.projects)
-      '[data-testid*="software-roadmap" i][data-testid*="bar" i]',
-      '[data-testid*="roadmap.timeline" i][data-testid*="bar" i]',
-      // Plans / Advanced Roadmaps
-      '[data-testid*="plan-timeline" i][data-testid*="bar" i]',
-      '[data-testid*="timeline-bar" i]',
-      '[data-testid*="roadmap-bar" i]',
-      '[data-testid*="epic-bar" i]',
-      // Generic fallbacks
-      '[data-testid*="issue-bar" i]',
-      '[data-testid*="bar.ui" i]',
-      '[data-testid*="lozenge" i][role="button"]',
+      '[data-testid="common.components.progress-bar.progress-wrapper"]',
     ];
+    const KEY_CELL_SELECTOR =
+      '[data-testid="roadmap.timeline-table-kit.ui.list-item-content.summary.key"]';
 
     function findBars(root) {
       const nodes = new Set();
@@ -273,81 +247,83 @@
     }
 
     function extractIssueKey(bar) {
-      // Heuristic 1: data-* attribute on the bar or an ancestor
-      let cursor = bar;
-      while (cursor && cursor !== document.body) {
-        const dataKey =
-          cursor.getAttribute?.('data-issue-key') ||
-          cursor.getAttribute?.('data-rbd-draggable-id') ||
-          cursor.getAttribute?.('data-testid');
-        if (dataKey) {
-          const m = dataKey.match(ISSUE_KEY_REGEX);
+      // The progress-wrapper lives in the chart side of a row. The issue key lives
+      // in the list side, in a sibling cell. Walk up until we find an ancestor
+      // that also contains the key cell, then read the key from its text.
+      let cursor = bar.parentElement;
+      let steps = 0;
+      while (cursor && cursor !== document.body && steps < 20) {
+        const keyEl = cursor.querySelector(KEY_CELL_SELECTOR);
+        if (keyEl) {
+          const text = (keyEl.textContent || '').trim();
+          const m = text.match(ISSUE_KEY_REGEX);
           if (m) return m[1];
         }
         cursor = cursor.parentElement;
+        steps += 1;
       }
-      // Heuristic 2: anchor pointing to /browse/KEY
+      // Fallback: look for any /browse/KEY anchor inside the bar itself.
       const anchor = bar.querySelector?.('a[href*="/browse/"]');
       if (anchor) {
         const m = anchor.getAttribute('href').match(ISSUE_KEY_REGEX);
         if (m) return m[1];
       }
-      // Heuristic 3: visible text (fragile fallback)
-      const text = bar.textContent || '';
-      const m = text.match(ISSUE_KEY_REGEX);
-      if (m) return m[1];
       return null;
     }
 
-    function ensureOverlay(bar) {
-      let overlay = bar.querySelector(`:scope > .${OVERLAY_CLASS}`);
-      if (overlay) return overlay;
-      // Guarantee a positioning context without clobbering inline styles.
-      const computed = getComputedStyle(bar);
-      if (computed.position === 'static') {
-        bar.style.position = 'relative';
-      }
-      overlay = document.createElement('div');
-      overlay.className = OVERLAY_CLASS;
-      const fill = document.createElement('div');
-      fill.className = OVERLAY_FILL_CLASS;
-      overlay.appendChild(fill);
-      bar.appendChild(overlay);
-      return overlay;
-    }
+    // Memorise each wrapper's fill node so we can re-apply the width if React
+    // re-renders and resets it. Keyed on the wrapper element (WeakMap).
+    const fillObservers = new WeakMap();
 
-    function removeOverlay(bar) {
-      const overlay = bar.querySelector(`:scope > .${OVERLAY_CLASS}`);
-      if (overlay) overlay.remove();
-    }
-
-    function applyProgress(bar, { done, total }) {
-      if (!total || total <= 0) {
-        removeOverlay(bar);
-        return;
-      }
+    function applyProgress(bar, { done, total, epicKey }) {
+      if (!total || total <= 0) return;
       const pct = Math.max(0, Math.min(100, (done / total) * 100));
-      const overlay = ensureOverlay(bar);
-      const fill = overlay.querySelector(`.${OVERLAY_FILL_CLASS}`);
-      if (fill) fill.style.width = `${pct.toFixed(1)}%`;
-      overlay.title = `${done} / ${total} SP (${pct.toFixed(0)}%)`;
+      const pctStr = `${pct.toFixed(1)}%`;
+
+      // JIRA's progress-wrapper structure: <wrapper><fill style="width:X%"></wrapper>.
+      // We override the first child's width using !important so JIRA's inline
+      // style (set by React) loses the specificity fight.
+      const fill = bar.firstElementChild;
+      if (fill instanceof HTMLElement) {
+        fill.style.setProperty('width', pctStr, 'important');
+
+        // If we haven't already, watch this fill for React re-renders that would
+        // reset the width, and re-apply ours.
+        if (!fillObservers.has(bar)) {
+          const obs = new MutationObserver(() => {
+            const current = fill.style.width;
+            const desired = bar.dataset.momentumPct || '';
+            if (desired && current !== desired) {
+              fill.style.setProperty('width', desired, 'important');
+            }
+          });
+          obs.observe(fill, { attributes: true, attributeFilter: ['style'] });
+          fillObservers.set(bar, obs);
+        }
+      }
+      bar.dataset.momentumPct = pctStr;
+      bar.title = `${epicKey}: ${done} / ${total} SP (${pct.toFixed(0)}%)`;
     }
 
     async function decorateBar(bar) {
       const epicKey = extractIssueKey(bar);
-      if (!epicKey) return;
+      if (!epicKey) {
+        if (isDebug()) debug('no epic key resolved for a bar — skipping');
+        return;
+      }
 
       const previous = decorated.get(bar);
       if (previous && previous.epicKey === epicKey) {
         // Already decorated for this key; refresh value silently (cache hit is free).
         const { done, total } = await epicProgress.get(epicKey);
-        applyProgress(bar, { done, total });
+        applyProgress(bar, { done, total, epicKey });
         return;
       }
 
       decorated.set(bar, { epicKey });
       const { done, total } = await epicProgress.get(epicKey);
-      applyProgress(bar, { done, total });
+      if (isDebug()) debug(`${epicKey}: ${done}/${total} SP`);
+      applyProgress(bar, { done, total, epicKey });
     }
 
     return { findBars, decorateBar, probeCandidates };
@@ -406,7 +382,7 @@
     // Initial pass (in case the timeline is already rendered at document-idle).
     runActiveFeatures();
     log(
-      'loaded — version 0.1.2',
+      'loaded — version 0.1.3',
       isDebug()
         ? '(debug on)'
         : '(debug off — enable with: localStorage.setItem(\'momentum-light-debug\', \'1\'))',
