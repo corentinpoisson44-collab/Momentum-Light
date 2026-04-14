@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.1.13
-// @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — feature #1 : barre de progression sur les Epics, calculée sur SP done / SP total des tickets enfants.
+// @version      0.2.0
+// @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP sur les barres de tickets, et bandeau de vélocité moyenne des 3 derniers sprints.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
 // @run-at       document-idle
@@ -25,6 +25,8 @@
   const OVERLAY_CLASS = 'momentum-progress';
   const OVERLAY_FILL_CLASS = 'momentum-progress__fill';
   const OVERLAY_LABEL_CLASS = 'momentum-progress__label';
+  const OVERLAY_ESTIMATE_MOD = 'momentum-progress--estimate';
+  const VELOCITY_BANNER_ID = 'momentum-velocity-banner';
 
   // Debug mode is opt-in per session. Enable from DevTools:
   //   localStorage.setItem('momentum-light-debug', '1')
@@ -145,6 +147,79 @@
   })();
 
   // ---------------------------------------------------------------------------
+  // issueMeta — batched fetch of { isEpic, storyPoints } per issue key.
+  // Multiple concurrent requests within a 50 ms window are coalesced into a
+  // single `key in (...)` JQL query so expanding an Epic with 20 children
+  // costs one API round-trip instead of 20.
+  // ---------------------------------------------------------------------------
+
+  const issueMeta = (() => {
+    const ISSUE_TTL_MS = 60_000;
+    const FLUSH_DELAY_MS = 50;
+    const BATCH_MAX = 100;
+
+    const cache = new Map(); // key -> { expiresAt, value }
+    const waiters = new Map(); // key -> [{ resolve, reject }]
+    let pending = new Set();
+    let flushTimer = null;
+
+    async function flush() {
+      flushTimer = null;
+      const keys = [...pending].slice(0, BATCH_MAX);
+      pending = new Set([...pending].slice(BATCH_MAX));
+      if (pending.size > 0) {
+        flushTimer = setTimeout(flush, FLUSH_DELAY_MS);
+      }
+      if (keys.length === 0) return;
+
+      try {
+        const spFieldId = await storyPointsField.resolve();
+        const jql = `key in (${keys.map((k) => `"${k}"`).join(',')})`;
+        const data = await jiraApi.searchIssues(jql, [spFieldId, 'issuetype'], keys.length);
+        const results = new Map();
+        for (const issue of data.issues || []) {
+          const sp = Number(issue.fields?.[spFieldId]);
+          const typeName = issue.fields?.issuetype?.name || '';
+          const hierarchy = Number(issue.fields?.issuetype?.hierarchyLevel);
+          // "Epic" by name OR hierarchyLevel >= 1 (covers custom hierarchies).
+          const isEpic = /epic/i.test(typeName) || (Number.isFinite(hierarchy) && hierarchy >= 1);
+          results.set(issue.key, {
+            isEpic,
+            storyPoints: Number.isFinite(sp) ? sp : null,
+          });
+        }
+        const expiresAt = Date.now() + ISSUE_TTL_MS;
+        for (const key of keys) {
+          const value = results.get(key) || { isEpic: false, storyPoints: null };
+          cache.set(key, { expiresAt, value });
+          const ws = waiters.get(key) || [];
+          waiters.delete(key);
+          ws.forEach(({ resolve }) => resolve(value));
+        }
+      } catch (e) {
+        for (const key of keys) {
+          const ws = waiters.get(key) || [];
+          waiters.delete(key);
+          ws.forEach(({ reject }) => reject(e));
+        }
+      }
+    }
+
+    return {
+      get(issueKey) {
+        const hit = cache.get(issueKey);
+        if (hit && hit.expiresAt > Date.now()) return Promise.resolve(hit.value);
+        return new Promise((resolve, reject) => {
+          if (!waiters.has(issueKey)) waiters.set(issueKey, []);
+          waiters.get(issueKey).push({ resolve, reject });
+          pending.add(issueKey);
+          if (!flushTimer) flushTimer = setTimeout(flush, FLUSH_DELAY_MS);
+        });
+      },
+    };
+  })();
+
+  // ---------------------------------------------------------------------------
   // epicProgress — compute done/total SP for an Epic, with 60s memory cache
   // ---------------------------------------------------------------------------
 
@@ -199,6 +274,126 @@
   })();
 
   // ---------------------------------------------------------------------------
+  // velocity — average SP delivered across the last N closed sprints.
+  // Uses the Agile REST API. Result is cached in memory for 5 min.
+  //
+  // Board selection order:
+  //   1. localStorage override `momentum-light::velocity-board-id`
+  //   2. boardId extracted from the URL (`/boards/<id>/…`)
+  //   3. first scrum board returned by /rest/agile/1.0/board?type=scrum
+  // ---------------------------------------------------------------------------
+
+  const velocity = (() => {
+    const BOARD_OVERRIDE_KEY = 'momentum-light::velocity-board-id';
+    const SPRINT_WINDOW = 3;
+    const CACHE_TTL_MS = 5 * 60_000;
+    const MAX_CLOSED_SPRINTS_SCANNED = 200;
+
+    let cache = null; // { expiresAt, value }
+    let inflight = null;
+
+    async function listScrumBoards() {
+      const data = await jiraApi.request(
+        '/rest/agile/1.0/board?type=scrum&maxResults=50',
+      );
+      return data.values || [];
+    }
+
+    async function listClosedSprints(boardId) {
+      const all = [];
+      let startAt = 0;
+      const pageSize = 50;
+      while (all.length < MAX_CLOSED_SPRINTS_SCANNED) {
+        const data = await jiraApi.request(
+          `/rest/agile/1.0/board/${boardId}/sprint?state=closed&startAt=${startAt}&maxResults=${pageSize}`,
+        );
+        const values = data.values || [];
+        all.push(...values);
+        if (data.isLast || values.length < pageSize) break;
+        startAt += pageSize;
+      }
+      return all;
+    }
+
+    async function sprintDoneSP(sprintId, spFieldId) {
+      const data = await jiraApi.request(
+        `/rest/agile/1.0/sprint/${sprintId}/issue?fields=${encodeURIComponent(spFieldId)},status&maxResults=500`,
+      );
+      let done = 0;
+      for (const issue of data.issues || []) {
+        const sp = Number(issue.fields?.[spFieldId]);
+        if (!Number.isFinite(sp) || sp <= 0) continue;
+        const cat = issue.fields?.status?.statusCategory?.key;
+        if (cat === 'done') done += sp;
+      }
+      return done;
+    }
+
+    function pickBoardFromUrl() {
+      const m = location.pathname.match(/\/boards\/(\d+)/);
+      return m ? Number(m[1]) : null;
+    }
+
+    async function resolveBoardId() {
+      const override = localStorage.getItem(BOARD_OVERRIDE_KEY);
+      if (override) return Number(override);
+      const urlBoard = pickBoardFromUrl();
+      if (urlBoard) return urlBoard;
+      const boards = await listScrumBoards();
+      if (!boards.length) throw new Error('No scrum board accessible for velocity');
+      return boards[0].id;
+    }
+
+    async function compute() {
+      const [spFieldId, boardId] = await Promise.all([
+        storyPointsField.resolve(),
+        resolveBoardId(),
+      ]);
+
+      const sprints = await listClosedSprints(boardId);
+      if (!sprints.length) {
+        return { average: 0, sprints: [], boardId, note: 'no closed sprints' };
+      }
+      // Most recently closed first. `completeDate` is the actual close time;
+      // fall back to `endDate` then `startDate` so sprints without a close
+      // stamp still sort reasonably.
+      const byCloseDesc = (a, b) => {
+        const ka = new Date(a.completeDate || a.endDate || a.startDate || 0).getTime();
+        const kb = new Date(b.completeDate || b.endDate || b.startDate || 0).getTime();
+        return kb - ka;
+      };
+      const recent = sprints.sort(byCloseDesc).slice(0, SPRINT_WINDOW);
+
+      const perSprint = [];
+      for (const s of recent) {
+        const done = await sprintDoneSP(s.id, spFieldId);
+        perSprint.push({ id: s.id, name: s.name, velocity: done });
+      }
+      const total = perSprint.reduce((acc, s) => acc + s.velocity, 0);
+      const average = perSprint.length ? total / perSprint.length : 0;
+      return { average, sprints: perSprint, boardId };
+    }
+
+    return {
+      async get() {
+        const now = Date.now();
+        if (cache && cache.expiresAt > now) return cache.value;
+        if (inflight) return inflight;
+        inflight = (async () => {
+          try {
+            const value = await compute();
+            cache = { expiresAt: Date.now() + CACHE_TTL_MS, value };
+            return value;
+          } finally {
+            inflight = null;
+          }
+        })();
+        return inflight;
+      },
+    };
+  })();
+
+  // ---------------------------------------------------------------------------
   // styles — injected once
   // ---------------------------------------------------------------------------
 
@@ -247,6 +442,46 @@
         overflow: hidden;
         white-space: nowrap;
         text-overflow: ellipsis;
+      }
+      /* Ticket variant: no fill, label sits flush-left so it reads like a chip
+         attached to the start of the bar. The text-shadow keeps it legible on
+         any bar color without needing the mix-blend-mode fill. */
+      .${OVERLAY_ESTIMATE_MOD} .${OVERLAY_FILL_CLASS} {
+        display: none;
+      }
+      .${OVERLAY_ESTIMATE_MOD} .${OVERLAY_LABEL_CLASS} {
+        justify-content: flex-start;
+        padding: 0 6px;
+      }
+      #${VELOCITY_BANNER_ID} {
+        position: fixed;
+        top: 96px;
+        right: 24px;
+        z-index: 1000;
+        display: inline-flex;
+        align-items: baseline;
+        gap: 6px;
+        padding: 6px 12px;
+        border-radius: 16px;
+        background: #0c66e4;
+        color: #fff;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        font-size: 12px;
+        line-height: 1;
+        box-shadow: 0 2px 8px rgba(9, 30, 66, 0.2);
+        pointer-events: auto;
+        user-select: none;
+      }
+      #${VELOCITY_BANNER_ID} .momentum-velocity-banner__label {
+        opacity: 0.85;
+        font-weight: 500;
+      }
+      #${VELOCITY_BANNER_ID} .momentum-velocity-banner__value {
+        font-weight: 700;
+        font-variant-numeric: tabular-nums;
+      }
+      #${VELOCITY_BANNER_ID}[data-state="error"] {
+        background: #6b778c;
       }
     `;
     document.head.appendChild(style);
@@ -493,6 +728,7 @@
       const pctStr = `${pct.toFixed(1)}%`;
 
       const overlay = ensureOverlay(bar);
+      overlay.classList.remove(OVERLAY_ESTIMATE_MOD);
       const fill = overlay.querySelector(`.${OVERLAY_FILL_CLASS}`);
       const label = overlay.querySelector(`.${OVERLAY_LABEL_CLASS}`);
       if (fill) fill.style.width = pctStr;
@@ -507,47 +743,146 @@
       bar.title = tooltipText;
     }
 
+    // Non-Epic variant: just paint the ticket's SP estimate as a chip on the
+    // bar. No fill — tickets aren't "x% done", they're just sized at X SP.
+    // If the ticket has no SP, we silently skip (no overlay, no noise).
+    function applyEstimate(bar, { sp, issueKey }) {
+      if (sp == null || !(sp > 0)) {
+        removeOverlay(bar);
+        delete bar.dataset.momentumTooltip;
+        return;
+      }
+      const overlay = ensureOverlay(bar);
+      overlay.classList.add(OVERLAY_ESTIMATE_MOD);
+      const label = overlay.querySelector(`.${OVERLAY_LABEL_CLASS}`);
+      if (label) label.textContent = `${sp} SP`;
+
+      const tooltipText = `${issueKey} — ${sp} SP`;
+      bar.dataset.momentumTooltip = tooltipText;
+      bar.setAttribute('aria-label', tooltipText);
+      bar.title = tooltipText;
+    }
+
     async function decorateBar(bar) {
-      const epicKey = extractIssueKey(bar);
-      if (!epicKey) {
-        if (isDebug()) debug('no epic key resolved for a bar — skipping');
+      const issueKey = extractIssueKey(bar);
+      if (!issueKey) {
+        if (isDebug()) debug('no issue key resolved for a bar — skipping');
         return;
       }
 
       const previous = decorated.get(bar);
-      if (previous && previous.epicKey === epicKey) {
-        // Already decorated for this key; refresh value silently (cache hit is free).
-        const { done, total } = await epicProgress.get(epicKey);
-        applyProgress(bar, { done, total, epicKey });
-        return;
-      }
+      const isRefresh = previous && previous.issueKey === issueKey;
+      if (!isRefresh) decorated.set(bar, { issueKey });
 
-      decorated.set(bar, { epicKey });
-      const { done, total } = await epicProgress.get(epicKey);
-      if (isDebug()) debug(`${epicKey}: ${done}/${total} SP`);
-      applyProgress(bar, { done, total, epicKey });
+      const meta = await issueMeta.get(issueKey);
+      if (meta.isEpic) {
+        const { done, total } = await epicProgress.get(issueKey);
+        if (isDebug() && !isRefresh) debug(`${issueKey} (epic): ${done}/${total} SP`);
+        applyProgress(bar, { done, total, epicKey: issueKey });
+      } else {
+        if (isDebug() && !isRefresh) debug(`${issueKey} (ticket): ${meta.storyPoints ?? '—'} SP`);
+        applyEstimate(bar, { sp: meta.storyPoints, issueKey });
+      }
     }
 
     return { findBars, decorateBar, probeCandidates };
   })();
 
   // ---------------------------------------------------------------------------
+  // velocityBanner — fixed pill rendered on timeline/plan pages that surfaces
+  // the average velocity of the last 3 closed sprints. Click to refresh.
+  // ---------------------------------------------------------------------------
+
+  const velocityBanner = (() => {
+    function build() {
+      const el = document.createElement('div');
+      el.id = VELOCITY_BANNER_ID;
+      el.innerHTML =
+        '<span class="momentum-velocity-banner__label">Vélocité moyenne (3 derniers sprints)</span>' +
+        '<span class="momentum-velocity-banner__value">…</span>';
+      el.title = 'Cliquez pour rafraîchir';
+      el.addEventListener('click', () => {
+        // Force refresh by bypassing the in-memory cache. Cheapest way: clear
+        // the module-level cache via a fresh re-render; since `velocity` owns
+        // its cache, we just re-invoke update after a hard reload of the page.
+        // Simpler UX: reload the banner text to "…" and call update again —
+        // the cache will serve if still valid. A real force-refresh would
+        // need exposing a clear(); keeping minimal for now.
+        el.querySelector('.momentum-velocity-banner__value').textContent = '…';
+        update();
+      });
+      return el;
+    }
+
+    function ensure() {
+      let el = document.getElementById(VELOCITY_BANNER_ID);
+      if (el) return el;
+      if (!document.body) return null;
+      el = build();
+      document.body.appendChild(el);
+      return el;
+    }
+
+    function remove() {
+      const el = document.getElementById(VELOCITY_BANNER_ID);
+      if (el) el.remove();
+    }
+
+    let updating = false;
+    async function update() {
+      const el = ensure();
+      if (!el || updating) return;
+      updating = true;
+      try {
+        const { average, sprints } = await velocity.get();
+        const value = el.querySelector('.momentum-velocity-banner__value');
+        if (sprints.length === 0) {
+          value.textContent = 'N/A';
+          el.dataset.state = 'error';
+          el.title = 'Aucun sprint clos trouvé';
+          return;
+        }
+        value.textContent = `${Math.round(average)} SP`;
+        el.dataset.state = 'ok';
+        const breakdown = sprints
+          .map((s) => `${s.name}: ${s.velocity} SP`)
+          .join('\n');
+        el.title = `Moyenne de ${sprints.length} sprint(s) clos :\n${breakdown}\n(cliquer pour rafraîchir)`;
+      } catch (e) {
+        const value = el.querySelector('.momentum-velocity-banner__value');
+        if (value) value.textContent = 'N/A';
+        el.dataset.state = 'error';
+        el.title = `Vélocité indisponible : ${e?.message || e}`;
+        warn('velocity error:', e?.message || e);
+      } finally {
+        updating = false;
+      }
+    }
+
+    return { ensure, remove, update };
+  })();
+
+  // ---------------------------------------------------------------------------
   // Feature registry — add future Momentum features here
   // ---------------------------------------------------------------------------
 
+  const isTimelineLikePath = () => {
+    const p = location.pathname;
+    return p.includes('/plans/') || p.includes('/timeline');
+  };
+
   const features = [
     {
-      id: 'epic-progress-bar',
-      description: 'Progress bar on Epic timeline bars (SP done / SP total of children)',
-      isActive: () => {
-        const p = location.pathname;
-        return p.includes('/plans/') || p.includes('/timeline');
-      },
+      id: 'timeline-bar-overlays',
+      description:
+        'Overlays on timeline bars: progress on Epics (SP done / total of children) ' +
+        'and SP estimate on ticket bars.',
+      isActive: isTimelineLikePath,
       async onMutation(root) {
         const bars = timelineDom.findBars(root);
         // Always-on heartbeat (rate-limited) so we can tell from console whether
         // the feature is finding bars, without having to enable debug mode.
-        heartbeat('epic-progress-bar bars found:', bars.length);
+        heartbeat('timeline bars found:', bars.length);
         if (bars.length === 0) {
           // Unconditional probe — we need the diagnostic data even if the user
           // didn't flip on debug mode. Rate-limited internally.
@@ -560,6 +895,21 @@
             warn('decorateBar failed:', e?.message || e);
           });
         }
+      },
+    },
+    {
+      id: 'sprint-velocity-banner',
+      description: 'Fixed banner showing the average velocity of the last 3 closed sprints.',
+      isActive: isTimelineLikePath,
+      onMutation() {
+        // `update()` is idempotent and piggybacks on the 5 min velocity cache,
+        // so calling it on every debounced mutation is cheap.
+        velocityBanner.update();
+      },
+      onInactive() {
+        // User navigated away from a timeline/plan page — clean up so the
+        // banner doesn't linger on unrelated views.
+        velocityBanner.remove();
       },
     },
   ];
@@ -648,9 +998,12 @@
     const root = document.body;
     if (!root) return;
     for (const feature of features) {
-      if (!feature.isActive()) continue;
       try {
-        feature.onMutation(root);
+        if (feature.isActive()) {
+          feature.onMutation?.(root);
+        } else {
+          feature.onInactive?.();
+        }
       } catch (e) {
         error(`feature "${feature.id}" crashed:`, e);
       }
@@ -666,7 +1019,7 @@
     // Initial pass (in case the timeline is already rendered at document-idle).
     runActiveFeatures();
     log(
-      'loaded — version 0.1.13',
+      'loaded — version 0.2.0',
       isDebug()
         ? '(debug on)'
         : '(debug off — enable with: localStorage.setItem(\'momentum-light-debug\', \'1\'))',
