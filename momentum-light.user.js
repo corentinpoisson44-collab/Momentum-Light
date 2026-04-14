@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.5.4
+// @version      0.5.5
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne, et menu « How-to » guidé qui surligne chaque feature au premier lancement.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -344,6 +344,11 @@
       for (const issue of data.issues || []) {
         const typeName = issue.fields?.issuetype?.name || '';
         if (!COUNTABLE_TYPE.test(typeName)) continue;
+        // Exclude CANCELED tickets entirely — they land in the "done"
+        // status category in JIRA but do NOT represent delivered work, so
+        // counting them would inflate both progress and confidence.
+        const statusName = issue.fields?.status?.name || '';
+        if (/^cancel/i.test(statusName)) continue;
         childStats.totalChildren += 1;
         const sp = Number(issue.fields?.[spFieldId]);
         const cat = issue.fields?.status?.statusCategory?.key;
@@ -912,7 +917,7 @@
         display: none;
       }
       /* "Chiffrage incomplet" badge — small amber pill at the right edge
-         of the overlay ("⚠ N"). Uses an atlassian-style warning yellow so
+         of the overlay ("∅ N"). Uses an atlassian-style warning yellow so
          it reads as a distinct signal without competing with the main SP
          label. Anchored right/center via absolute positioning so the main
          label can still ellipsis-truncate without pushing the badge out.
@@ -1484,11 +1489,12 @@
     }
 
     // "Chiffrage incomplet" badge — a small amber pill pinned to the
-    // right edge of the overlay ("⚠ N") that signals how many child
-    // tickets still lack Story Points. Lives alongside the main label
-    // rather than inside it, so it stays legible even when the bar is
-    // narrow (the main label truncates with ellipsis; the badge keeps
-    // its own reserved space on the right).
+    // right edge of the overlay ("∅ N") that signals how many child
+    // tickets still lack Story Points. The empty-set glyph reads as
+    // "missing value" — more precise than a generic warning sign.
+    // Lives alongside the main label rather than inside it, so it stays
+    // legible even when the bar is narrow (the main label truncates
+    // with ellipsis; the badge keeps its own reserved space on the right).
     function ensureMissingBadge(overlay, unestimatedCount) {
       let badge = overlay.querySelector(`:scope > .${OVERLAY_MISSING_BADGE_CLASS}`);
       if (!unestimatedCount || unestimatedCount <= 0) {
@@ -1500,7 +1506,7 @@
         badge.className = OVERLAY_MISSING_BADGE_CLASS;
         overlay.appendChild(badge);
       }
-      badge.textContent = `⚠ ${unestimatedCount}`;
+      badge.textContent = `∅ ${unestimatedCount}`;
     }
 
     // Confidence tiers drive the opacity / hatch treatment applied to the
@@ -2067,14 +2073,14 @@
         body:
           'Chaque Epic de la Timeline affiche une barre de progression calculée ' +
           'sur Σ SP done / Σ SP total de ses tickets enfants (Stories, ' +
-          'Technical Stories et Bugs uniquement — les Tasks et Tests sont ' +
-          'ignorés). Un indice de confiance pondère done (×1.0), en cours ' +
-          '(×0.6) et todo (×0.15) puis divise par le nombre total de tickets ' +
-          'enfants comptés — les tickets sans chiffrage tirent le score vers ' +
-          'le bas. Une confiance faible est signalée par un hachuré diagonal ' +
-          'et une atténuation de la couleur de la barre (le label « X / Y SP » ' +
-          'reste lisible) ; un badge amber « ⚠ N » apparaît à droite quand ' +
-          'N tickets enfants sont encore sans chiffrage.',
+          'Technical Stories et Bugs uniquement — les Tasks, Tests et tickets ' +
+          'CANCELED sont ignorés). Un indice de confiance pondère done (×1.0), ' +
+          'en cours (×0.6) et todo (×0.15) puis divise par le nombre total de ' +
+          'tickets enfants comptés — les tickets sans chiffrage tirent le score ' +
+          'vers le bas. Une confiance faible est signalée par un hachuré ' +
+          'diagonal et une atténuation de la couleur de la barre (le label ' +
+          '« X / Y SP » reste lisible) ; un badge amber « ∅ N » apparaît à ' +
+          'droite quand N tickets enfants sont encore sans chiffrage.',
         findTarget: () =>
           document.querySelector(
             `.${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})`,
