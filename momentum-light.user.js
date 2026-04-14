@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.4.4
+// @version      0.5.8
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne, et menu « How-to » guidé qui surligne chaque feature au premier lancement.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -34,6 +34,7 @@
   const OVERLAY_ESTIMATE_MOD = 'momentum-progress--estimate';
   const OVERLAY_SPRINT_FILL_MOD = 'momentum-progress--sprint-fill';
   const VELOCITY_BANNER_ID = 'momentum-velocity-banner';
+  const CONFIDENCE_LEGEND_CLASS = 'momentum-confidence-legend';
   const HOWTO_BUTTON_ID = 'momentum-howto-button';
   const HOWTO_OVERLAY_ID = 'momentum-howto-overlay';
   const HOWTO_SEEN_KEY = 'momentum-light::howto-seen';
@@ -258,7 +259,11 @@
       try {
         const spFieldId = await storyPointsField.resolve();
         const jql = `key in (${keys.map((k) => `"${k}"`).join(',')})`;
-        const data = await jiraApi.searchIssues(jql, [spFieldId, 'issuetype'], keys.length);
+        const data = await jiraApi.searchIssues(
+          jql,
+          [spFieldId, 'issuetype', 'status'],
+          keys.length,
+        );
         const results = new Map();
         for (const issue of data.issues || []) {
           const sp = Number(issue.fields?.[spFieldId]);
@@ -266,14 +271,23 @@
           const hierarchy = Number(issue.fields?.issuetype?.hierarchyLevel);
           // "Epic" by name OR hierarchyLevel >= 1 (covers custom hierarchies).
           const isEpic = /epic/i.test(typeName) || (Number.isFinite(hierarchy) && hierarchy >= 1);
+          // statusCategory key ∈ {'new' (≈ Open/To Do/Discovery),
+          // 'indeterminate' (≈ In Progress), 'done'}. Used downstream to
+          // restrict the confidence hatch to Epics still in discovery.
+          const statusCategory = issue.fields?.status?.statusCategory?.key || null;
           results.set(issue.key, {
             isEpic,
             storyPoints: Number.isFinite(sp) ? sp : null,
+            statusCategory,
           });
         }
         const expiresAt = Date.now() + ISSUE_TTL_MS;
         for (const key of keys) {
-          const value = results.get(key) || { isEpic: false, storyPoints: null };
+          const value = results.get(key) || {
+            isEpic: false,
+            storyPoints: null,
+            statusCategory: null,
+          };
           cache.set(key, { expiresAt, value });
           const ws = waiters.get(key) || [];
           waiters.delete(key);
@@ -316,21 +330,67 @@
       // (Legacy "Epic Link" is still honored via `parent` for team-managed projects.)
       const data = await jiraApi.searchIssues(
         `parent = ${epicKey}`,
-        [spFieldId, 'status'],
+        [spFieldId, 'status', 'issuetype'],
         100,
       );
       let done = 0;
       let total = 0;
       let countedChildren = 0;
+      // childStats counts TICKETS (not SP) across all children, including
+      // those without SP — used by the confidence score to reflect both
+      // delivery progress and chiffrage completeness. A child with no SP
+      // contributes 0 to confidence regardless of its status.
+      const childStats = {
+        done: 0,
+        inProgress: 0,
+        todo: 0,
+        unestimated: 0,
+        totalChildren: 0,
+      };
+      // Type allow-list: epic progress & confidence reflect only the
+      // "real work" tickets — Stories, Technical Stories and Bugs. Tasks,
+      // Sub-tasks and Tests are treated as plumbing and excluded from both
+      // the SP progress bar and the confidence score. The regex covers
+      // French/English variants ("User Story", "Story technique", "Bug",
+      // etc.) while rejecting "Task", "Test", "Sub-task", "Epic".
+      const COUNTABLE_TYPE = /story|bug/i;
       for (const issue of data.issues || []) {
+        const typeName = issue.fields?.issuetype?.name || '';
+        if (!COUNTABLE_TYPE.test(typeName)) continue;
+        // Exclude CANCELED tickets entirely — they land in the "done"
+        // status category in JIRA but do NOT represent delivered work, so
+        // counting them would inflate both progress and confidence.
+        const statusName = issue.fields?.status?.name || '';
+        if (/^cancel/i.test(statusName)) continue;
+        childStats.totalChildren += 1;
         const sp = Number(issue.fields?.[spFieldId]);
-        if (!Number.isFinite(sp) || sp <= 0) continue;
+        const cat = issue.fields?.status?.statusCategory?.key;
+        const hasSp = Number.isFinite(sp) && sp > 0;
+        if (!hasSp) {
+          childStats.unestimated += 1;
+          continue;
+        }
         countedChildren += 1;
         total += sp;
-        const cat = issue.fields?.status?.statusCategory?.key;
-        if (cat === 'done') done += sp;
+        if (cat === 'done') {
+          done += sp;
+          childStats.done += 1;
+        } else if (cat === 'indeterminate') {
+          childStats.inProgress += 1;
+        } else {
+          childStats.todo += 1;
+        }
       }
-      return { done, total, countedChildren };
+      // Confidence = (done × 1.0 + inProgress × 0.6 + todo × 0.15) / total × 100
+      // Unestimated children count in the denominator but contribute 0 to
+      // the numerator — so incomplete chiffrage drags the score down.
+      const denom = childStats.totalChildren;
+      const confidence = denom > 0
+        ? ((childStats.done * 1.0
+            + childStats.inProgress * 0.6
+            + childStats.todo * 0.15) / denom) * 100
+        : 0;
+      return { done, total, countedChildren, childStats, confidence };
     }
 
     return {
@@ -857,6 +917,10 @@
         overflow: hidden;
         white-space: nowrap;
         text-overflow: ellipsis;
+        /* Keep the SP label above the confidence wash (::before) and the
+           hatch (::after) — the text must stay crisp and full-opacity
+           even when the rest of the bar is faded. */
+        z-index: 2;
       }
       /* Ticket variant: no fill, label keeps the default centered alignment
          inherited from .momentum-progress__label (flex center + padding).
@@ -864,6 +928,62 @@
          the mix-blend-mode fill. */
       .${OVERLAY_ESTIMATE_MOD} .${OVERLAY_FILL_CLASS} {
         display: none;
+      }
+      /* Confidence treatment on Epic bars — reflects the ETA confidence
+         score (done/inProgress/todo/unestimated weighted blend). Two
+         orthogonal signals stack, and they fire under different
+         conditions:
+           1. ::before wash — translucent white layer that lightens the
+              native bar color (more white = lower confidence). Applies
+              to EVERY Epic with low/medium confidence regardless of
+              status, so a low-confidence Epic in progress still reads
+              as "risky". Sits BELOW the SP label (label uses z-index:
+              2) so the text stays crisp and full-opacity even when the
+              bar is faded. We do NOT fade via CSS opacity on the host
+              element, because opacity cascades to descendants and
+              would wash out the label text too.
+           2. ::after hatch — diagonal stripes across the full overlay,
+              reinforcing the "uncertainty" read. Added ONLY on top of
+              the wash when the Epic is still in Discovery (status
+              category 'new' → we mark it via data-discovery). The
+              intent is to make not-yet-started low/medium-confidence
+              Epics visually pop as "scope work still needed", without
+              noising up in-flight bars where the uncertainty is
+              already being burned down. Low and medium share the
+              same hatch.
+
+         Both pseudo-elements are guarded against the ticket-estimate
+         and sprint-fill variants, which have their own visual language. */
+      .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="medium"]::before,
+      .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="low"]::before {
+        content: '';
+        position: absolute;
+        inset: 0;
+        pointer-events: none;
+        border-radius: inherit;
+        z-index: 0;
+      }
+      .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="medium"]::before {
+        background-color: rgba(255, 255, 255, 0.30);
+      }
+      .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="low"]::before {
+        background-color: rgba(255, 255, 255, 0.60);
+      }
+      .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="medium"][data-discovery]::after,
+      .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="low"][data-discovery]::after {
+        content: '';
+        position: absolute;
+        inset: 0;
+        pointer-events: none;
+        border-radius: inherit;
+        z-index: 1;
+        background-image: repeating-linear-gradient(
+          45deg,
+          transparent 0,
+          transparent 5px,
+          rgba(255, 255, 255, 0.22) 5px,
+          rgba(255, 255, 255, 0.22) 9px
+        );
       }
       /* Sprint-fill variant: a full-height translucent wash that covers the
          chip's body, so the fill level reads at a glance across the whole
@@ -931,6 +1051,8 @@
         z-index: 100;
         display: flex;
         justify-content: flex-end;
+        align-items: center;
+        gap: 8px;
         box-sizing: border-box;
         width: 100%;
         margin: 0;
@@ -978,6 +1100,86 @@
       #${VELOCITY_BANNER_ID}[data-state="error"] .momentum-velocity-banner__chip {
         background: #F4F5F7;
         color: #6B778C;
+      }
+
+      /* Confidence legend — compact reference chip that lives inside the
+         sticky velocity banner. Shows the three confidence tiers with
+         swatches whose visual treatment mirrors the actual Epic bars
+         (low wash + hatch / medium wash + hatch / plain), plus the
+         "(Open)" qualifier to remind readers that the hatch only lights
+         up during the Discovery phase. Non-interactive — purely a
+         reference, so no hover affordance. */
+      .${CONFIDENCE_LEGEND_CLASS} {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 10px;
+        border-radius: 14px;
+        background: #F4F5F7;
+        color: #42526E;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        font-size: 11px;
+        line-height: 1.3;
+        user-select: none;
+        white-space: nowrap;
+        pointer-events: auto;
+        box-shadow: 0 1px 2px rgba(9, 30, 66, 0.12);
+      }
+      .${CONFIDENCE_LEGEND_CLASS}__title {
+        font-weight: 600;
+        color: #172B4D;
+      }
+      .${CONFIDENCE_LEGEND_CLASS}__item {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+      }
+      /* Swatch dimensions are generous enough to render the same 5px/9px
+         diagonal hatch used on timeline Epic bars — this is the whole
+         point: the legend shows the *exact* treatment viewers will see
+         on the chart, not a stylized approximation. Base color, wash
+         opacities (0.60 / 0.30) and hatch parameters (5px transparent,
+         4px rgba(255,255,255,0.22)) mirror the Epic bar CSS above. */
+      .${CONFIDENCE_LEGEND_CLASS}__swatch {
+        position: relative;
+        display: inline-block;
+        width: 40px;
+        height: 12px;
+        border-radius: 2px;
+        /* Base color mirrors a typical JIRA epic bar (Atlaskit purple). */
+        background-color: #6554C0;
+        overflow: hidden;
+      }
+      .${CONFIDENCE_LEGEND_CLASS}__swatch[data-tier="medium"]::before,
+      .${CONFIDENCE_LEGEND_CLASS}__swatch[data-tier="low"]::before {
+        content: '';
+        position: absolute;
+        inset: 0;
+      }
+      .${CONFIDENCE_LEGEND_CLASS}__swatch[data-tier="medium"]::before {
+        background-color: rgba(255, 255, 255, 0.30);
+      }
+      .${CONFIDENCE_LEGEND_CLASS}__swatch[data-tier="low"]::before {
+        background-color: rgba(255, 255, 255, 0.60);
+      }
+      /* Hatch overlay — only on swatches explicitly flagged as Discovery,
+         mirroring the [data-discovery] gate on timeline Epic bars. */
+      .${CONFIDENCE_LEGEND_CLASS}__swatch[data-tier="medium"][data-discovery]::after,
+      .${CONFIDENCE_LEGEND_CLASS}__swatch[data-tier="low"][data-discovery]::after {
+        content: '';
+        position: absolute;
+        inset: 0;
+        background-image: repeating-linear-gradient(
+          45deg,
+          transparent 0,
+          transparent 5px,
+          rgba(255, 255, 255, 0.22) 5px,
+          rgba(255, 255, 255, 0.22) 9px
+        );
+      }
+      .${CONFIDENCE_LEGEND_CLASS}__separator {
+        color: #6B778C;
+        font-weight: 500;
       }
 
       /* ---------------------------------------------------------------------
@@ -1360,28 +1562,117 @@
     function removeOverlay(bar) {
       const overlay = bar.querySelector(`:scope > .${OVERLAY_CLASS}`);
       if (overlay) overlay.remove();
+      // Always clear any confidence fade we may have set previously — the
+      // bar might be about to be recycled by JIRA for a different issue.
+      resetBarConfidence(bar);
     }
 
-    function applyProgress(bar, { done, total, epicKey }) {
-      if (!total || total <= 0) {
+    // Confidence tiers drive the opacity / hatch treatment applied to the
+    // epic bar: low-confidence epics read as "uncertain" at a glance via
+    // diagonal stripes + a faded host bar, without requiring a tooltip hover.
+    function confidenceTier(confidence) {
+      if (!(confidence >= 0)) return 'high'; // treat NaN/undefined as neutral
+      if (confidence < 40) return 'low';
+      if (confidence < 70) return 'medium';
+      return 'high';
+    }
+
+    // Confidence fade is now driven purely by the CSS ::before wash on the
+    // overlay, gated by [data-confidence] — no JS-side opacity writes on
+    // the bar or its parent. The wash paints a translucent white layer
+    // below the SP label so the colored bar fades while the label stays
+    // crisp (opacity on an ancestor would cascade to the label text).
+    //
+    // This tracker lets us clean up opacity values written by older
+    // versions (v0.5.2 on `bar`, v0.5.3 on `bar.parentElement`) in case
+    // they survived a page-reload during a script upgrade.
+    const OUR_BAR_OPACITIES = new Set(['0.4', '0.75']);
+
+    function applyBarConfidence(bar /* , tier */) {
+      // No-op on the host DOM — the wash handles it. Only strip legacy
+      // opacities we may have written in earlier versions.
+      resetBarConfidence(bar);
+    }
+
+    function resetBarConfidence(bar) {
+      const parent = bar.parentElement;
+      if (parent && OUR_BAR_OPACITIES.has(parent.style.opacity)) {
+        parent.style.opacity = '';
+      }
+      if (OUR_BAR_OPACITIES.has(bar.style.opacity)) bar.style.opacity = '';
+    }
+
+    function applyProgress(
+      bar,
+      { done, total, epicKey, childStats, confidence, statusCategory },
+    ) {
+      const stats = childStats || { done: 0, inProgress: 0, todo: 0, unestimated: 0, totalChildren: 0 };
+      // No children at all → nothing to visualize. Matches legacy behavior.
+      if (stats.totalChildren === 0 && (!total || total <= 0)) {
         removeOverlay(bar);
         delete bar.dataset.momentumTooltip;
         return;
       }
-      const pct = Math.max(0, Math.min(100, (done / total) * 100));
+      const pct = total > 0 ? Math.max(0, Math.min(100, (done / total) * 100)) : 0;
       const pctStr = `${pct.toFixed(1)}%`;
+      const conf = Number.isFinite(confidence) ? confidence : 0;
+      const tier = confidenceTier(conf);
+      // Two independent signals drive the Epic bar appearance:
+      //   • wash (opacity) — applies to EVERY low/medium-confidence Epic
+      //     regardless of status, so a risky Epic already in progress
+      //     still reads as faded.
+      //   • hatch (diagonal stripes) — added on top of the wash only
+      //     when the Epic is still in Discovery (statusCategory 'new').
+      //     This makes not-yet-started Epics pop as "scope work
+      //     pending", without cluttering bars for work in flight.
+      // High-confidence Epics get neither treatment.
+      const showWash = tier !== 'high';
+      const isDiscovery = statusCategory === 'new';
+      const showHatch = showWash && isDiscovery;
 
       const overlay = ensureOverlay(bar);
       overlay.classList.remove(OVERLAY_ESTIMATE_MOD);
+      if (showWash) {
+        overlay.dataset.confidence = tier;
+      } else {
+        delete overlay.dataset.confidence;
+      }
+      if (showHatch) {
+        overlay.dataset.discovery = '';
+      } else {
+        delete overlay.dataset.discovery;
+      }
+      applyBarConfidence(bar, tier);
       const fill = overlay.querySelector(`.${OVERLAY_FILL_CLASS}`);
       const label = overlay.querySelector(`.${OVERLAY_LABEL_CLASS}`);
       if (fill) fill.style.width = pctStr;
-      if (label) label.textContent = `${done} / ${total} SP`;
+      // Inline "chiffrage incomplet" suffix — "X / Y SP (∅ N)" where N is
+      // the count of child tickets without Story Points. The empty-set
+      // glyph reads as "missing value" and sits inside the main label so
+      // it fades alongside the rest of the text on narrow bars instead of
+      // competing for its own reserved space.
+      const missingSuffix = stats.unestimated > 0 ? ` (∅ ${stats.unestimated})` : '';
+      if (label) label.textContent = `${done} / ${total} SP${missingSuffix}`;
 
       // Tooltip text — the interceptor (installed at bootstrap) will rewrite
       // JIRA's Atlaskit tooltip with this value when it appears on hover.
       // aria-label and title are set as accessibility/fallback hints.
-      const tooltipText = `${epicKey} — ${done} / ${total} SP (${pct.toFixed(0)}%)`;
+      // "Discovery" annotation reflects the Epic's status (Open), not the
+      // hatch — a high-confidence Open Epic is still in Discovery even
+      // though the hatch is suppressed.
+      const tierLabel = isDiscovery ? `${tier} · Discovery` : tier;
+      const confidenceLine = `Confiance : ${conf.toFixed(0)}% (${tierLabel})`;
+      const breakdownParts = [];
+      if (stats.done) breakdownParts.push(`${stats.done} done`);
+      if (stats.inProgress) breakdownParts.push(`${stats.inProgress} en cours`);
+      if (stats.todo) breakdownParts.push(`${stats.todo} todo`);
+      if (stats.unestimated) breakdownParts.push(`${stats.unestimated} sans SP`);
+      const breakdown = breakdownParts.length
+        ? ` — ${breakdownParts.join(', ')}`
+        : '';
+      const tooltipText =
+        `${epicKey} — ${done} / ${total} SP (${pct.toFixed(0)}%)\n` +
+        `${confidenceLine}${breakdown}`;
       bar.dataset.momentumTooltip = tooltipText;
       bar.setAttribute('aria-label', tooltipText);
       bar.title = tooltipText;
@@ -1398,6 +1689,12 @@
       }
       const overlay = ensureOverlay(bar);
       overlay.classList.add(OVERLAY_ESTIMATE_MOD);
+      // Ticket variant never carries a confidence tier — strip any stale
+      // attribute and bar opacity left over if this bar was previously
+      // decorated as an epic.
+      delete overlay.dataset.confidence;
+      delete overlay.dataset.discovery;
+      resetBarConfidence(bar);
       const label = overlay.querySelector(`.${OVERLAY_LABEL_CLASS}`);
       if (label) label.textContent = `${sp} SP`;
 
@@ -1420,9 +1717,22 @@
 
       const meta = await issueMeta.get(issueKey);
       if (meta.isEpic) {
-        const { done, total } = await epicProgress.get(issueKey);
-        if (isDebug() && !isRefresh) debug(`${issueKey} (epic): ${done}/${total} SP`);
-        applyProgress(bar, { done, total, epicKey: issueKey });
+        const { done, total, childStats, confidence } = await epicProgress.get(issueKey);
+        if (isDebug() && !isRefresh) {
+          debug(
+            `${issueKey} (epic): ${done}/${total} SP, confidence=${Math.round(confidence)}%, ` +
+            `unestimated=${childStats?.unestimated ?? 0}/${childStats?.totalChildren ?? 0}, ` +
+            `statusCategory=${meta.statusCategory ?? '—'}`,
+          );
+        }
+        applyProgress(bar, {
+          done,
+          total,
+          epicKey: issueKey,
+          childStats,
+          confidence,
+          statusCategory: meta.statusCategory,
+        });
       } else {
         if (isDebug() && !isRefresh) debug(`${issueKey} (ticket): ${meta.storyPoints ?? '—'} SP`);
         applyEstimate(bar, { sp: meta.storyPoints, issueKey });
@@ -1740,10 +2050,43 @@
       return { el: document.body, mode: 'fixed' };
     }
 
+    function buildLegend() {
+      // Reference-only chip — mirrors the three confidence tier visuals
+      // (wash + hatch for low/medium, plain for high) so readers can
+      // decode an Epic bar at a glance. The "(Open)" qualifier calls
+      // out that the hatch only appears while the Epic is in discovery.
+      const legend = document.createElement('span');
+      legend.className = CONFIDENCE_LEGEND_CLASS;
+      legend.title =
+        'Opacité selon l\'indice de confiance (tous les Epics) :\n' +
+        '  • faible  (< 40 %)\n' +
+        '  • moyenne (40-70 %)\n' +
+        '  • haute   (≥ 70 %)\n' +
+        '\n' +
+        'Hachurage en supplément sur les Epics en statut Open (Discovery).';
+      legend.innerHTML =
+        `<span class="${CONFIDENCE_LEGEND_CLASS}__title">Confiance Epic :</span>` +
+        `<span class="${CONFIDENCE_LEGEND_CLASS}__item">` +
+          `<span class="${CONFIDENCE_LEGEND_CLASS}__swatch" data-tier="low"></span>faible` +
+        `</span>` +
+        `<span class="${CONFIDENCE_LEGEND_CLASS}__item">` +
+          `<span class="${CONFIDENCE_LEGEND_CLASS}__swatch" data-tier="medium"></span>moyenne` +
+        `</span>` +
+        `<span class="${CONFIDENCE_LEGEND_CLASS}__item">` +
+          `<span class="${CONFIDENCE_LEGEND_CLASS}__swatch" data-tier="high"></span>haute` +
+        `</span>` +
+        `<span class="${CONFIDENCE_LEGEND_CLASS}__separator">+ hachures si Open :</span>` +
+        `<span class="${CONFIDENCE_LEGEND_CLASS}__item">` +
+          `<span class="${CONFIDENCE_LEGEND_CLASS}__swatch" data-tier="medium" data-discovery></span>Discovery` +
+        `</span>`;
+      return legend;
+    }
+
     function build(mode) {
       const wrapper = document.createElement('div');
       wrapper.id = VELOCITY_BANNER_ID;
       wrapper.dataset.anchor = mode;
+      wrapper.appendChild(buildLegend());
       const chip = document.createElement('span');
       chip.className = 'momentum-velocity-banner__chip';
       chip.title = 'Cliquez pour rafraîchir';
@@ -1857,8 +2200,17 @@
         title: '1. Epic Progress Bar',
         body:
           'Chaque Epic de la Timeline affiche une barre de progression calculée ' +
-          'sur Σ SP done / Σ SP total de ses tickets enfants. Les chiffres sont ' +
-          'mis en cache pendant 60 s pour rester réactifs.',
+          'sur Σ SP done / Σ SP total de ses tickets enfants (Stories, ' +
+          'Technical Stories et Bugs uniquement — les Tasks, Tests et tickets ' +
+          'CANCELED sont ignorés). Un indice de confiance pondère done (×1.0), ' +
+          'en cours (×0.6) et todo (×0.15) puis divise par le nombre total de ' +
+          'tickets enfants comptés — les tickets sans chiffrage tirent le score ' +
+          'vers le bas. L\'opacité de la barre est atténuée sur tous les Epics ' +
+          'à confiance faible ou moyenne (le label « X / Y SP » reste lisible) ; ' +
+          'un hachuré diagonal s\'ajoute par-dessus uniquement sur les Epics ' +
+          'encore en statut « Open » (Discovery) pour les faire ressortir. ' +
+          'Un suffixe « (∅ N) » apparaît dans le label quand N tickets enfants ' +
+          'sont encore sans chiffrage.',
         findTarget: () =>
           document.querySelector(
             `.${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})`,
