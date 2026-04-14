@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.2.2
-// @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, et chip de vélocité moyenne des 5 derniers sprints ancrée au-dessus de la grille timeline.
+// @version      0.2.3
+// @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, et chip de vélocité moyenne des 5 derniers sprints, ancrée en sticky au sommet de la zone principale du plan.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
 // @run-at       document-idle
@@ -450,18 +450,33 @@
       .${OVERLAY_ESTIMATE_MOD} .${OVERLAY_FILL_CLASS} {
         display: none;
       }
-      /* Block-level wrapper so the banner always takes its own line above the
-         timeline grid, regardless of whether the parent is flex-row or
-         flex-column. The "contain: layout style" rule isolates us from any
-         inherited flex/grid constraints that would otherwise squeeze the chip. */
+      /* Full-width sticky banner anchored at the top of the plan's main
+         content area. "pointer-events: none" on the wrapper lets clicks
+         reach the underlying UI through the transparent margin; the chip
+         itself opts back in. The high z-index beats the timeline grid's
+         own stacking context so it is never hidden behind rows or the
+         date-header bar. */
       #${VELOCITY_BANNER_ID} {
-        display: block;
+        position: sticky;
+        top: 0;
+        z-index: 100;
+        display: flex;
+        justify-content: flex-end;
         box-sizing: border-box;
+        width: 100%;
         margin: 0;
         padding: 8px 16px;
         background: transparent;
-        flex-shrink: 0;
-        contain: layout style;
+        pointer-events: none;
+      }
+      /* Fallback mode: if we couldn't find a main-content anchor, we fall
+         back to fixed-positioned chip in the viewport top-right. */
+      #${VELOCITY_BANNER_ID}[data-anchor="fixed"] {
+        position: fixed;
+        top: 88px;
+        right: 16px;
+        width: auto;
+        padding: 0;
       }
       #${VELOCITY_BANNER_ID} .momentum-velocity-banner__chip {
         display: inline-flex;
@@ -477,6 +492,8 @@
         cursor: pointer;
         user-select: none;
         white-space: nowrap;
+        pointer-events: auto;
+        box-shadow: 0 1px 2px rgba(9, 30, 66, 0.12);
       }
       #${VELOCITY_BANNER_ID} .momentum-velocity-banner__chip:hover {
         background: #C1C7D0;
@@ -799,42 +816,38 @@
   })();
 
   // ---------------------------------------------------------------------------
-  // velocityBanner — block wrapper rendered directly above the timeline grid
-  // that shows the average velocity of the last N closed sprints. Click the
-  // chip to refresh (bypasses the in-memory velocity cache).
+  // velocityBanner — sticky chip rendered at the top of the plan's main
+  // content region, showing the average velocity of the last N closed
+  // sprints. Click the chip to refresh.
   //
-  // Anchor strategy: insert ourselves as the previous sibling of the
-  // outermost `roadmap.timeline-table-kit.*` wrapper. Any other anchor we
-  // tried (ending-in-`.toolbar`, header testids, …) risked landing inside
-  // an Atlaskit button/tooltip and getting re-rendered as a popup — see
-  // v0.2.2 fix. The timeline-root sibling is the only stable, unambiguous
-  // slot in the plan view.
+  // Anchor strategy:
+  //   1. Primary: `[role="main"]` (or `<main>`). We prepend the wrapper
+  //      so the chip sticks to the top of the plan's main region. The
+  //      wrapper is `position: sticky` with `z-index: 100` so it stays
+  //      visible above the timeline grid during scroll.
+  //   2. Fallback: if no main-region anchor is found, we attach the
+  //      wrapper to `document.body` with `position: fixed` (top-right).
+  //      Better a slightly floating chip than no chip at all.
   //
-  // If the timeline root isn't there yet (page still loading), we noop —
-  // the next mutation tick will retry.
+  // The wrapper is `pointer-events: none` over its transparent margins so
+  // it never steals clicks from the UI underneath — only the visible chip
+  // is clickable.
   // ---------------------------------------------------------------------------
 
   const velocityBanner = (() => {
-    function findTimelineRoot() {
-      // Climb from any timeline-table-kit descendant up to the outermost
-      // ancestor that still belongs to that widget.
-      const probe = document.querySelector('[data-testid^="roadmap.timeline-table-kit."]');
-      if (!probe) return null;
-      let cursor = probe;
-      let candidate = probe;
-      let steps = 0;
-      while (cursor && cursor !== document.body && steps < 30) {
-        const tid = cursor.getAttribute?.('data-testid') || '';
-        if (tid.startsWith('roadmap.timeline-table-kit.')) candidate = cursor;
-        cursor = cursor.parentElement;
-        steps += 1;
-      }
-      return candidate;
+    function findAnchor() {
+      // Prefer a semantic main region — that's the plan's content area.
+      const main =
+        document.querySelector('[role="main"]') ||
+        document.querySelector('main');
+      if (main) return { el: main, mode: 'sticky' };
+      return { el: document.body, mode: 'fixed' };
     }
 
-    function build() {
+    function build(mode) {
       const wrapper = document.createElement('div');
       wrapper.id = VELOCITY_BANNER_ID;
+      wrapper.dataset.anchor = mode;
       const chip = document.createElement('span');
       chip.className = 'momentum-velocity-banner__chip';
       chip.title = 'Cliquez pour rafraîchir';
@@ -851,20 +864,25 @@
     }
 
     function ensure() {
-      const root = findTimelineRoot();
-      if (!root || !root.parentElement) return null;
+      const anchor = findAnchor();
+      if (!anchor) return null;
 
       const existing = document.getElementById(VELOCITY_BANNER_ID);
-      // Happy path: still in the DOM AND still directly before the current
-      // timeline root. Otherwise, re-anchor from scratch (covers React
-      // re-renders that move the root around).
-      if (existing && existing.isConnected && existing.nextElementSibling === root) {
-        return existing;
-      }
+      // Happy path: still connected AND attached to the expected anchor.
+      const stillValid =
+        existing &&
+        existing.isConnected &&
+        ((anchor.mode === 'sticky' && existing.parentElement === anchor.el) ||
+          (anchor.mode === 'fixed' && existing.parentElement === document.body));
+      if (stillValid) return existing;
       if (existing) existing.remove();
 
-      const el = build();
-      root.parentElement.insertBefore(el, root);
+      const el = build(anchor.mode);
+      if (anchor.mode === 'sticky') {
+        anchor.el.insertBefore(el, anchor.el.firstChild);
+      } else {
+        document.body.appendChild(el);
+      }
       return el;
     }
 
@@ -1068,7 +1086,7 @@
     // Initial pass (in case the timeline is already rendered at document-idle).
     runActiveFeatures();
     log(
-      'loaded — version 0.2.2',
+      'loaded — version 0.2.3',
       isDebug()
         ? '(debug on)'
         : '(debug off — enable with: localStorage.setItem(\'momentum-light-debug\', \'1\'))',
