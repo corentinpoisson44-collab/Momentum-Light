@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.3.4
+// @version      0.3.5
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), et indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -503,7 +503,12 @@
   // ---------------------------------------------------------------------------
 
   const sprintCapacity = (() => {
-    const TTL_MS = 60_000;
+    // Short TTL: the sprint-fill overlay is primarily read while the user
+    // is actively moving tickets between sprints, so fresh data matters
+    // more than request economy. The interceptor invalidates explicitly
+    // on mutation but may miss proprietary/graphql paths — the TTL is
+    // the safety net that bounds staleness even in the miss case.
+    const TTL_MS = 15_000;
     const cache = new Map(); // sprintId -> { expiresAt, value }
     const inflight = new Map(); // sprintId -> Promise
 
@@ -1560,43 +1565,81 @@
   })();
 
   // ---------------------------------------------------------------------------
-  // apiMutationInterceptor — monkey-patch window.fetch so we can invalidate
-  // sprintCapacity the moment Jira commits a ticket-sprint change. Without
-  // this, moving an issue between sprints would leave the sprint-fill
-  // indicator stale until the 60 s TTL expires.
+  // apiMutationInterceptor — monkey-patch window.fetch AND XMLHttpRequest so
+  // we can invalidate sprintCapacity the moment Jira commits a ticket-sprint
+  // change. Plans / Advanced Roadmaps persists scope changes through a
+  // patchwork of endpoints (classic REST, proprietary /rest/jpo, gateway
+  // routes, GraphQL) so the match list is intentionally broad.
   //
-  // We match a small set of Jira REST paths that mutate sprint membership
-  // (issue edit, direct sprint-move, backlog move, plans commit) and only
-  // act on successful (2xx) mutating methods (POST/PUT/PATCH/DELETE).
-  // Misses are cheap; false positives at worst trigger a single refetch.
+  // Strategy: any non-GET request to an Atlassian backend path that returns
+  // 2xx triggers invalidation unless it is on a read-only allowlist
+  // (search/jql, graphql queries that are safe to ignore). False positives
+  // are harmless — worst case we refetch sprint capacity once, which is
+  // cheap and rate-limited by the inflight-dedup.
   // ---------------------------------------------------------------------------
 
   const apiMutationInterceptor = (() => {
     const MUTATING = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
-    const PATTERNS = [
-      // Issue edit — carries the sprint custom field in most cases.
-      /\/rest\/api\/\d+\/issue\/[^/?#]+(\/|\?|$)/i,
-      // Direct sprint membership change (add an issue to a sprint).
-      /\/rest\/agile\/[^/]+\/sprint\/\d+\/issue(\?|$)/i,
-      // Back-to-backlog.
-      /\/rest\/agile\/[^/]+\/backlog\/issue(\?|$)/i,
-      // Plans mutations: scope changes, commits, etc.
-      /\/rest\/plans\//i,
-      // Greenhopper scope + sprint mutations.
-      /\/rest\/greenhopper\/1\.0\/(sprint|xboard)\//i,
+
+    // Paths whose mutating method is definitely a sprint-membership
+    // change. Broad enough to cover Plans, Agile API, Greenhopper, and
+    // proprietary /rest/jpo routes.
+    const INVALIDATE_PATTERNS = [
+      /\/rest\/api\/\d+\/issue\b/i,              // REST v3 issue edits
+      /\/rest\/agile\/[^/]+\/(sprint|backlog|board|issue)\b/i, // Agile API
+      /\/rest\/greenhopper\/1\.0\//i,            // Greenhopper scope/sprint
+      /\/rest\/plans\//i,                        // Advanced Roadmaps REST
+      /\/rest\/jpo\//i,                          // Legacy Portfolio/Plans API
+      /\/gateway\/api\/.*\/(issues?|sprints?|plans?)\b/i, // Gateway routes
     ];
 
-    // Extract a specific sprintId from URL when possible so we can do a
-    // targeted invalidation; falls back to a broad cache clear.
+    // GraphQL is multiplexed (queries + mutations over the same POST).
+    // We match on URL but require the body to contain a `mutation`
+    // operation to avoid invalidating on every read query.
+    const GRAPHQL_URL_PATTERNS = [
+      /\/gateway\/api\/graphql\b/i,
+      /\/graphql\b/i,
+    ];
+
+    // Read-only endpoints that happen to use POST. Excluded to avoid
+    // invalidating the cache when *we* search, or when Jira fetches lists.
+    const READONLY_EXCLUDES = [
+      /\/rest\/api\/\d+\/search(\b|\/jql)/i,     // POST /search/jql (our calls too)
+      /\/rest\/agile\/[^/]+\/board\b.*\/sprint\?/i, // sprint listing (GET-like)
+    ];
+
+    function isGraphqlMutationBody(body) {
+      if (!body) return false;
+      let text = body;
+      if (typeof text !== 'string') {
+        // Could be FormData/URLSearchParams/Blob; we don't peek those,
+        // treat as "possibly mutation" to stay safe.
+        return true;
+      }
+      // Look for a top-level `mutation` operation. Regex is forgiving to
+      // whitespace/named operations: `mutation Foo(...)` and bare
+      // `mutation { ... }` both match.
+      return /(^|["\\s{])mutation\s*[\s({]/i.test(text);
+    }
+
     function extractSprintId(url) {
-      const m = url.match(/\/sprint\/(\d+)\//i);
+      const m = url.match(/\/sprint\/(\d+)(\/|\?|$)/i);
       return m ? Number(m[1]) : null;
     }
 
-    function shouldInvalidate(url, method, status) {
+    function isMutation(method, status) {
       if (!MUTATING.has(method.toUpperCase())) return false;
       if (status < 200 || status >= 300) return false;
-      return PATTERNS.some((re) => re.test(url));
+      return true;
+    }
+
+    function matchesInvalidationPath(url, body) {
+      if (READONLY_EXCLUDES.some((re) => re.test(url))) return false;
+      if (INVALIDATE_PATTERNS.some((re) => re.test(url))) return true;
+      if (GRAPHQL_URL_PATTERNS.some((re) => re.test(url))) {
+        return isGraphqlMutationBody(body);
+      }
+      return false;
     }
 
     let onAfterInvalidate = null;
@@ -1617,30 +1660,91 @@
       if (onAfterInvalidate) onAfterInvalidate();
     }
 
+    // In debug mode, dump every mutating same-origin request (matched or
+    // not) so we can tune INVALIDATE_PATTERNS when Jira introduces new
+    // routes. Cross-origin calls (Sentry, Segment, ad trackers) are
+    // filtered out — they can't affect Jira's own sprint state. The log
+    // is exposed at window.__MOMENTUM_API_LOG__ for offline inspection.
+    const apiLog = [];
+    function isSameOriginJiraPath(url) {
+      try {
+        const u = new URL(url, location.origin);
+        return u.origin === location.origin;
+      } catch {
+        // Relative URLs without an origin are same-origin by definition.
+        return url.startsWith('/');
+      }
+    }
+    function recordObservation(method, url, status, matched) {
+      if (!isDebug()) return;
+      if (!isSameOriginJiraPath(url)) return;
+      apiLog.push({ ts: Date.now(), method, url, status, matched });
+      if (apiLog.length > 100) apiLog.shift();
+      window.__MOMENTUM_API_LOG__ = apiLog;
+      if (!matched) {
+        debug(`api-mutation observed (not acted on): ${method} ${url} → ${status}`);
+      }
+    }
+
     let installed = false;
     return {
       install(afterInvalidateCb) {
         if (installed) return;
         installed = true;
         onAfterInvalidate = afterInvalidateCb || null;
+
+        // ------ fetch patch
         const originalFetch = window.fetch.bind(window);
         window.fetch = async function momentumPatchedFetch(input, init) {
           const res = await originalFetch(input, init);
-          // Best-effort URL/method extraction; never let interceptor
-          // errors bubble into Jira's own request pipeline.
           try {
             const url = typeof input === 'string' ? input : input?.url || '';
             const method =
               (init && init.method) ||
               (typeof input !== 'string' && input?.method) ||
               'GET';
-            if (url && shouldInvalidate(url, method, res.status)) {
-              onMutation(url);
+            if (url && isMutation(method, res.status)) {
+              const body =
+                (init && init.body) ||
+                (typeof input !== 'string' && input?.body) ||
+                null;
+              const matched = matchesInvalidationPath(url, body);
+              recordObservation(method, url, res.status, matched);
+              if (matched) onMutation(url);
             }
           } catch (e) {
-            if (isDebug()) debug('api-mutation interceptor error:', e?.message || e);
+            if (isDebug()) debug('api-mutation interceptor error (fetch):', e?.message || e);
           }
           return res;
+        };
+
+        // ------ XHR patch
+        // Some Jira flows (legacy admin widgets, older Plans gestures)
+        // still fire via XMLHttpRequest. Hooking `open` captures the URL
+        // + method; `load` reads the final status.
+        const origOpen = XMLHttpRequest.prototype.open;
+        const origSend = XMLHttpRequest.prototype.send;
+        XMLHttpRequest.prototype.open = function momentumXhrOpen(method, url) {
+          this.__momentumMethod = method;
+          this.__momentumUrl = url;
+          return origOpen.apply(this, arguments);
+        };
+        XMLHttpRequest.prototype.send = function momentumXhrSend(body) {
+          this.__momentumBody = body;
+          this.addEventListener('load', () => {
+            try {
+              const method = this.__momentumMethod || 'GET';
+              const url = this.__momentumUrl || '';
+              if (url && isMutation(method, this.status)) {
+                const matched = matchesInvalidationPath(url, this.__momentumBody);
+                recordObservation(method, url, this.status, matched);
+                if (matched) onMutation(url);
+              }
+            } catch (e) {
+              if (isDebug()) debug('api-mutation interceptor error (xhr):', e?.message || e);
+            }
+          });
+          return origSend.apply(this, arguments);
         };
       },
     };
@@ -1680,7 +1784,7 @@
     // Initial pass (in case the timeline is already rendered at document-idle).
     runActiveFeatures();
     log(
-      'loaded — version 0.3.4',
+      'loaded — version 0.3.5',
       isDebug()
         ? '(debug on)'
         : '(debug off — enable with: localStorage.setItem(\'momentum-light-debug\', \'1\'))',
