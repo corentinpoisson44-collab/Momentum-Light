@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.2.3
-// @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, et chip de vélocité moyenne des 5 derniers sprints, ancrée en sticky au sommet de la zone principale du plan.
+// @version      0.2.4
+// @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, et chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog).
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
 // @run-at       document-idle
@@ -275,7 +275,18 @@
 
   // ---------------------------------------------------------------------------
   // velocity — average SP delivered across the last N closed sprints.
-  // Uses the Agile REST API. Result is cached in memory for 5 min.
+  //
+  // Sprint SP completion is read from the Greenhopper Sprint Report
+  // (`/rest/greenhopper/1.0/rapid/charts/sprintreport`) — the same source
+  // Jira's Backlog "Sprint commitment" widget uses. This matters: listing
+  // a sprint's issues via the Agile API and summing current `done` SP
+  // over-counts, because an issue that lived in this sprint and was later
+  // moved and completed in a subsequent sprint still reads as `done` today.
+  // The Sprint Report only counts issues that were actually completed
+  // within the sprint, matching Jira's official velocity figure.
+  //
+  // Falls back to the Agile-API count if the Greenhopper endpoint is
+  // unreachable (very rare on Cloud, but worth guarding).
   //
   // Board selection order:
   //   1. localStorage override `momentum-light::velocity-board-id`
@@ -315,7 +326,23 @@
       return all;
     }
 
-    async function sprintDoneSP(sprintId, spFieldId) {
+    // Authoritative per-sprint velocity via the Sprint Report endpoint.
+    // Returns the SP sum of issues that were completed WITHIN the sprint
+    // window — ignores issues that were moved out and completed elsewhere.
+    async function sprintCompletedSPViaReport(boardId, sprintId) {
+      const data = await jiraApi.request(
+        `/rest/greenhopper/1.0/rapid/charts/sprintreport?rapidViewId=${boardId}&sprintId=${sprintId}`,
+      );
+      const raw = data?.contents?.completedIssuesEstimateSum?.value;
+      // `value` can be number, numeric string, or null when tracking is off.
+      const n = typeof raw === 'number' ? raw : Number(raw);
+      return Number.isFinite(n) ? n : 0;
+    }
+
+    // Fallback: sum current-`done` SP among issues listed against the sprint.
+    // Known to over-count when issues are moved between sprints, but kept
+    // as a safety net for instances where the Greenhopper endpoint is off.
+    async function sprintCompletedSPViaAgile(sprintId, spFieldId) {
       const data = await jiraApi.request(
         `/rest/agile/1.0/sprint/${sprintId}/issue?fields=${encodeURIComponent(spFieldId)},status&maxResults=500`,
       );
@@ -327,6 +354,18 @@
         if (cat === 'done') done += sp;
       }
       return done;
+    }
+
+    async function sprintCompletedSP(boardId, sprintId, spFieldId) {
+      try {
+        return await sprintCompletedSPViaReport(boardId, sprintId);
+      } catch (e) {
+        warn(
+          `sprint-report unavailable for sprint ${sprintId}, falling back to agile API:`,
+          e?.message || e,
+        );
+        return sprintCompletedSPViaAgile(sprintId, spFieldId);
+      }
     }
 
     function pickBoardFromUrl() {
@@ -366,7 +405,7 @@
 
       const perSprint = [];
       for (const s of recent) {
-        const done = await sprintDoneSP(s.id, spFieldId);
+        const done = await sprintCompletedSP(boardId, s.id, spFieldId);
         perSprint.push({ id: s.id, name: s.name, velocity: done });
       }
       const total = perSprint.reduce((acc, s) => acc + s.velocity, 0);
@@ -1086,7 +1125,7 @@
     // Initial pass (in case the timeline is already rendered at document-idle).
     runActiveFeatures();
     log(
-      'loaded — version 0.2.3',
+      'loaded — version 0.2.4',
       isDebug()
         ? '(debug on)'
         : '(debug off — enable with: localStorage.setItem(\'momentum-light-debug\', \'1\'))',
