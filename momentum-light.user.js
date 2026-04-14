@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.5.7
+// @version      0.5.8
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne, et menu « How-to » guidé qui surligne chaque feature au premier lancement.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -931,17 +931,26 @@
       }
       /* Confidence treatment on Epic bars — reflects the ETA confidence
          score (done/inProgress/todo/unestimated weighted blend). Two
-         orthogonal signals stack:
+         orthogonal signals stack, and they fire under different
+         conditions:
            1. ::before wash — translucent white layer that lightens the
-              native bar color (more white = lower confidence). Sits
-              BELOW the SP label (label uses z-index: 2) so the text
-              stays crisp and full-opacity even when the bar is faded.
-              We do NOT fade via CSS opacity on the host element, because
-              opacity cascades to descendants and would wash out the label
-              text too.
+              native bar color (more white = lower confidence). Applies
+              to EVERY Epic with low/medium confidence regardless of
+              status, so a low-confidence Epic in progress still reads
+              as "risky". Sits BELOW the SP label (label uses z-index:
+              2) so the text stays crisp and full-opacity even when the
+              bar is faded. We do NOT fade via CSS opacity on the host
+              element, because opacity cascades to descendants and
+              would wash out the label text too.
            2. ::after hatch — diagonal stripes across the full overlay,
-              reinforcing the "uncertainty" read. Low and medium share
-              the same hatch.
+              reinforcing the "uncertainty" read. Added ONLY on top of
+              the wash when the Epic is still in Discovery (status
+              category 'new' → we mark it via data-discovery). The
+              intent is to make not-yet-started low/medium-confidence
+              Epics visually pop as "scope work still needed", without
+              noising up in-flight bars where the uncertainty is
+              already being burned down. Low and medium share the
+              same hatch.
 
          Both pseudo-elements are guarded against the ticket-estimate
          and sprint-fill variants, which have their own visual language. */
@@ -960,8 +969,8 @@
       .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="low"]::before {
         background-color: rgba(255, 255, 255, 0.60);
       }
-      .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="medium"]::after,
-      .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="low"]::after {
+      .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="medium"][data-discovery]::after,
+      .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="low"][data-discovery]::after {
         content: '';
         position: absolute;
         inset: 0;
@@ -1153,8 +1162,10 @@
       .${CONFIDENCE_LEGEND_CLASS}__swatch[data-tier="low"]::before {
         background-color: rgba(255, 255, 255, 0.60);
       }
-      .${CONFIDENCE_LEGEND_CLASS}__swatch[data-tier="medium"]::after,
-      .${CONFIDENCE_LEGEND_CLASS}__swatch[data-tier="low"]::after {
+      /* Hatch overlay — only on swatches explicitly flagged as Discovery,
+         mirroring the [data-discovery] gate on timeline Epic bars. */
+      .${CONFIDENCE_LEGEND_CLASS}__swatch[data-tier="medium"][data-discovery]::after,
+      .${CONFIDENCE_LEGEND_CLASS}__swatch[data-tier="low"][data-discovery]::after {
         content: '';
         position: absolute;
         inset: 0;
@@ -1165,6 +1176,10 @@
           rgba(255, 255, 255, 0.22) 5px,
           rgba(255, 255, 255, 0.22) 9px
         );
+      }
+      .${CONFIDENCE_LEGEND_CLASS}__separator {
+        color: #6B778C;
+        font-weight: 500;
       }
 
       /* ---------------------------------------------------------------------
@@ -1602,23 +1617,32 @@
       const pctStr = `${pct.toFixed(1)}%`;
       const conf = Number.isFinite(confidence) ? confidence : 0;
       const tier = confidenceTier(conf);
-      // Confidence hatch is reserved for Epics still in discovery
-      // (statusCategory 'new' — i.e. Open, To Do, Backlog, Discovery…).
-      // Once an Epic moves to In Progress or Done, its low confidence
-      // stops being actionable information — the team is already
-      // executing, so hatching it only adds visual noise. The tooltip
-      // still reports the raw confidence for reference.
-      const showHatch = statusCategory === 'new' && tier !== 'high';
+      // Two independent signals drive the Epic bar appearance:
+      //   • wash (opacity) — applies to EVERY low/medium-confidence Epic
+      //     regardless of status, so a risky Epic already in progress
+      //     still reads as faded.
+      //   • hatch (diagonal stripes) — added on top of the wash only
+      //     when the Epic is still in Discovery (statusCategory 'new').
+      //     This makes not-yet-started Epics pop as "scope work
+      //     pending", without cluttering bars for work in flight.
+      // High-confidence Epics get neither treatment.
+      const showWash = tier !== 'high';
+      const isDiscovery = statusCategory === 'new';
+      const showHatch = showWash && isDiscovery;
 
       const overlay = ensureOverlay(bar);
       overlay.classList.remove(OVERLAY_ESTIMATE_MOD);
-      if (showHatch) {
+      if (showWash) {
         overlay.dataset.confidence = tier;
-        applyBarConfidence(bar, tier);
       } else {
         delete overlay.dataset.confidence;
-        resetBarConfidence(bar);
       }
+      if (showHatch) {
+        overlay.dataset.discovery = '';
+      } else {
+        delete overlay.dataset.discovery;
+      }
+      applyBarConfidence(bar, tier);
       const fill = overlay.querySelector(`.${OVERLAY_FILL_CLASS}`);
       const label = overlay.querySelector(`.${OVERLAY_LABEL_CLASS}`);
       if (fill) fill.style.width = pctStr;
@@ -1633,7 +1657,10 @@
       // Tooltip text — the interceptor (installed at bootstrap) will rewrite
       // JIRA's Atlaskit tooltip with this value when it appears on hover.
       // aria-label and title are set as accessibility/fallback hints.
-      const tierLabel = showHatch ? `${tier} · Discovery` : tier;
+      // "Discovery" annotation reflects the Epic's status (Open), not the
+      // hatch — a high-confidence Open Epic is still in Discovery even
+      // though the hatch is suppressed.
+      const tierLabel = isDiscovery ? `${tier} · Discovery` : tier;
       const confidenceLine = `Confiance : ${conf.toFixed(0)}% (${tierLabel})`;
       const breakdownParts = [];
       if (stats.done) breakdownParts.push(`${stats.done} done`);
@@ -1666,6 +1693,7 @@
       // attribute and bar opacity left over if this bar was previously
       // decorated as an epic.
       delete overlay.dataset.confidence;
+      delete overlay.dataset.discovery;
       resetBarConfidence(bar);
       const label = overlay.querySelector(`.${OVERLAY_LABEL_CLASS}`);
       if (label) label.textContent = `${sp} SP`;
@@ -2030,16 +2058,14 @@
       const legend = document.createElement('span');
       legend.className = CONFIDENCE_LEGEND_CLASS;
       legend.title =
-        'Hachurage des Epics en statut Open\n' +
-        '\n' +
-        'Opacité selon l\'indice de confiance :\n' +
+        'Opacité selon l\'indice de confiance (tous les Epics) :\n' +
         '  • faible  (< 40 %)\n' +
         '  • moyenne (40-70 %)\n' +
         '  • haute   (≥ 70 %)\n' +
         '\n' +
-        'Les Epics en cours / terminés ne sont jamais hachurés.';
+        'Hachurage en supplément sur les Epics en statut Open (Discovery).';
       legend.innerHTML =
-        `<span class="${CONFIDENCE_LEGEND_CLASS}__title">Confiance Epic (Open) :</span>` +
+        `<span class="${CONFIDENCE_LEGEND_CLASS}__title">Confiance Epic :</span>` +
         `<span class="${CONFIDENCE_LEGEND_CLASS}__item">` +
           `<span class="${CONFIDENCE_LEGEND_CLASS}__swatch" data-tier="low"></span>faible` +
         `</span>` +
@@ -2048,6 +2074,10 @@
         `</span>` +
         `<span class="${CONFIDENCE_LEGEND_CLASS}__item">` +
           `<span class="${CONFIDENCE_LEGEND_CLASS}__swatch" data-tier="high"></span>haute` +
+        `</span>` +
+        `<span class="${CONFIDENCE_LEGEND_CLASS}__separator">+ hachures si Open :</span>` +
+        `<span class="${CONFIDENCE_LEGEND_CLASS}__item">` +
+          `<span class="${CONFIDENCE_LEGEND_CLASS}__swatch" data-tier="medium" data-discovery></span>Discovery` +
         `</span>`;
       return legend;
     }
@@ -2175,12 +2205,12 @@
           'CANCELED sont ignorés). Un indice de confiance pondère done (×1.0), ' +
           'en cours (×0.6) et todo (×0.15) puis divise par le nombre total de ' +
           'tickets enfants comptés — les tickets sans chiffrage tirent le score ' +
-          'vers le bas. Une confiance faible est signalée par un hachuré ' +
-          'diagonal et une atténuation de la couleur de la barre (le label ' +
-          '« X / Y SP » reste lisible), uniquement sur les Epics encore en ' +
-          'statut « Open » (Discovery) — les Epics en cours ou terminés restent ' +
-          'unis. Un suffixe « (∅ N) » apparaît dans le label quand N tickets ' +
-          'enfants sont encore sans chiffrage.',
+          'vers le bas. L\'opacité de la barre est atténuée sur tous les Epics ' +
+          'à confiance faible ou moyenne (le label « X / Y SP » reste lisible) ; ' +
+          'un hachuré diagonal s\'ajoute par-dessus uniquement sur les Epics ' +
+          'encore en statut « Open » (Discovery) pour les faire ressortir. ' +
+          'Un suffixe « (∅ N) » apparaît dans le label quand N tickets enfants ' +
+          'sont encore sans chiffrage.',
         findTarget: () =>
           document.querySelector(
             `.${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})`,
