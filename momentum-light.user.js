@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.1.5
+// @version      0.1.6
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — feature #1 : barre de progression sur les Epics, calculée sur SP done / SP total des tickets enfants.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -185,14 +185,31 @@
   // styles — injected once
   // ---------------------------------------------------------------------------
 
-  // Styles kept as a placeholder for future features that inject their own DOM.
-  // The Epic Progress Bar feature overrides JIRA's own fill element directly, so
-  // no custom CSS is required for it.
   function ensureStyles() {
     if (document.getElementById('momentum-light-styles')) return;
     const style = document.createElement('style');
     style.id = 'momentum-light-styles';
-    style.textContent = '';
+    style.textContent = `
+      .${OVERLAY_CLASS} {
+        position: absolute;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        height: 28%;
+        min-height: 4px;
+        pointer-events: none;
+        overflow: hidden;
+        border-radius: 0 0 3px 3px;
+        background-color: rgba(9, 30, 66, 0.08);
+        z-index: 1;
+      }
+      .${OVERLAY_FILL_CLASS} {
+        height: 100%;
+        width: 0%;
+        background-color: rgba(9, 30, 66, 0.55);
+        transition: width 200ms ease-out;
+      }
+    `;
     document.head.appendChild(style);
   }
 
@@ -206,10 +223,11 @@
     const decorated = new WeakMap();
 
     // JIRA obfuscates classes, so we target the public data-testid hooks observed
-    // on real Timelines. Primary target: the progress-bar wrapper JIRA renders
-    // on each Epic's chart bar. Adjust here if Atlassian ships a DOM change.
+    // on real Timelines. Primary target: the chart bar representing the Epic's
+    // timespan on the timeline. We inject our own progress overlay inside it.
+    // Adjust here if Atlassian ships a DOM change.
     const BAR_SELECTORS = [
-      '[data-testid="common.components.progress-bar.progress-wrapper"]',
+      '[data-testid="roadmap.timeline-table-kit.ui.chart-item-content.date-content.bar"]',
     ];
     const KEY_CELL_SELECTOR =
       '[data-testid="roadmap.timeline-table-kit.ui.list-item-content.summary.key"]';
@@ -278,43 +296,44 @@
       return null;
     }
 
-    // Memorise each wrapper's fill node so we can re-apply the width if React
-    // re-renders and resets it. Keyed on the wrapper element (WeakMap).
-    const fillObservers = new WeakMap();
+    function ensureOverlay(bar) {
+      let overlay = bar.querySelector(`:scope > .${OVERLAY_CLASS}`);
+      if (overlay) return overlay;
+      // Guarantee a positioning context without clobbering inline styles.
+      const computed = getComputedStyle(bar);
+      if (computed.position === 'static') {
+        bar.style.position = 'relative';
+      }
+      overlay = document.createElement('div');
+      overlay.className = OVERLAY_CLASS;
+      const fill = document.createElement('div');
+      fill.className = OVERLAY_FILL_CLASS;
+      overlay.appendChild(fill);
+      bar.appendChild(overlay);
+      return overlay;
+    }
+
+    function removeOverlay(bar) {
+      const overlay = bar.querySelector(`:scope > .${OVERLAY_CLASS}`);
+      if (overlay) overlay.remove();
+    }
 
     function applyProgress(bar, { done, total, epicKey }) {
-      if (!total || total <= 0) return;
+      if (!total || total <= 0) {
+        removeOverlay(bar);
+        delete bar.dataset.momentumTooltip;
+        return;
+      }
       const pct = Math.max(0, Math.min(100, (done / total) * 100));
       const pctStr = `${pct.toFixed(1)}%`;
 
-      // JIRA's progress-wrapper structure: <wrapper><fill style="width:X%"></wrapper>.
-      // We override the first child's width using !important so JIRA's inline
-      // style (set by React) loses the specificity fight.
-      const fill = bar.firstElementChild;
-      if (fill instanceof HTMLElement) {
-        fill.style.setProperty('width', pctStr, 'important');
+      const overlay = ensureOverlay(bar);
+      const fill = overlay.querySelector(`.${OVERLAY_FILL_CLASS}`);
+      if (fill) fill.style.width = pctStr;
 
-        // If we haven't already, watch this fill for React re-renders that would
-        // reset the width, and re-apply ours.
-        if (!fillObservers.has(bar)) {
-          const obs = new MutationObserver(() => {
-            const current = fill.style.width;
-            const desired = bar.dataset.momentumPct || '';
-            if (desired && current !== desired) {
-              fill.style.setProperty('width', desired, 'important');
-            }
-          });
-          obs.observe(fill, { attributes: true, attributeFilter: ['style'] });
-          fillObservers.set(bar, obs);
-        }
-      }
-      bar.dataset.momentumPct = pctStr;
-
-      // Tooltip text. We stash it on the wrapper so the global tooltip
-      // interceptor (installed at bootstrap) can swap JIRA's default tooltip
-      // ("X tickets done / Y total") with our SP-based one when the user hovers.
-      // We also set aria-label for accessibility + as a best-effort hint to
-      // Atlaskit's Tooltip component in case it reads from ARIA.
+      // Tooltip text — the interceptor (installed at bootstrap) will rewrite
+      // JIRA's Atlaskit tooltip with this value when it appears on hover.
+      // aria-label and title are set as accessibility/fallback hints.
       const tooltipText = `${epicKey} — ${done} / ${total} SP (${pct.toFixed(0)}%)`;
       bar.dataset.momentumTooltip = tooltipText;
       bar.setAttribute('aria-label', tooltipText);
@@ -475,7 +494,7 @@
     // Initial pass (in case the timeline is already rendered at document-idle).
     runActiveFeatures();
     log(
-      'loaded — version 0.1.5',
+      'loaded — version 0.1.6',
       isDebug()
         ? '(debug on)'
         : '(debug off — enable with: localStorage.setItem(\'momentum-light-debug\', \'1\'))',
