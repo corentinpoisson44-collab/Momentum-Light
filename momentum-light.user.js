@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.3.7
+// @version      0.3.8
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), et indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -569,6 +569,14 @@
     let flushTimer = null;
     let onFreshListener = null;
 
+    // Issue catalog — populated as a side-effect of runBatch. For every
+    // issue that appears in a batch response we remember its SP, the set
+    // of sprint IDs it belonged to, and its done-ness. This is what makes
+    // optimistic updates possible: when Jira fires a sprint-change
+    // mutation we look up the issue's prior state here, compute the delta
+    // locally, and repaint instantly — no round-trip wait.
+    const issueCatalog = new Map(); // issueKey -> { sp, sprintIds: Set<number>, isDone }
+
     async function runBatch(entries) {
       // entries: [[sprintId, state], ...]
       const [spFieldId, sprintFieldId] = await Promise.all([
@@ -597,12 +605,21 @@
         const isDone = issue.fields?.status?.statusCategory?.key === 'done';
         const sprintsRaw = issue.fields?.[sprintFieldId];
         const sprintList = Array.isArray(sprintsRaw) ? sprintsRaw : [];
+        const issueSprintIds = new Set();
         for (const s of sprintList) {
           const sid = Number(s?.id);
+          if (!Number.isFinite(sid) || sid <= 0) continue;
+          issueSprintIds.add(sid);
           if (!idSet.has(sid)) continue;
           const bucket = perSprint.get(sid);
           bucket.total += sp;
           if (!isDone) bucket.remaining += sp;
+        }
+        // Catalog the issue (for optimistic updates on sprint moves).
+        // Keep a record even if no requested sprint matched — the issue
+        // might still be moved INTO one of our tracked sprints later.
+        if (issue.key) {
+          issueCatalog.set(issue.key, { sp, sprintIds: issueSprintIds, isDone });
         }
       }
 
@@ -680,6 +697,17 @@
       return p;
     }
 
+    function adjustCachedBucket(sprintId, deltaSp, isDone) {
+      for (const state of ['active', 'future']) {
+        const hit = cache.get(`${sprintId}:${state}`);
+        if (!hit) continue;
+        const v = hit.value;
+        v.total = Math.max(0, v.total + deltaSp);
+        if (!isDone) v.remaining = Math.max(0, v.remaining + deltaSp);
+        v.load = state === 'active' ? v.remaining : v.total;
+      }
+    }
+
     return {
       async get(sprintId, state) {
         const key = `${sprintId}:${state}`;
@@ -711,6 +739,34 @@
       },
       onFresh(listener) {
         onFreshListener = listener;
+      },
+      // Optimistic update: called from the API interceptor the moment a
+      // ticket-sprint change is detected. We mutate the cached load/total
+      // in place so the next SWR read (triggered synchronously via the
+      // onFresh listener) paints the correct numbers without waiting for
+      // the JQL refresh to land. The real batch still fires in the
+      // background and will overwrite with authoritative values.
+      //
+      // Returns true if the delta was applied, false if we didn't know
+      // about the issue (catalog miss → fall back to JQL-refresh timing).
+      applyOptimisticMove(issueKey, targetSprintIds) {
+        const meta = issueCatalog.get(issueKey);
+        if (!meta) return false;
+        const prevIds = meta.sprintIds;
+        const newIds = new Set(targetSprintIds.filter((n) => Number.isFinite(n) && n > 0));
+        const removed = [...prevIds].filter((id) => !newIds.has(id));
+        const added = [...newIds].filter((id) => !prevIds.has(id));
+        if (removed.length === 0 && added.length === 0) return false;
+        for (const id of removed) adjustCachedBucket(id, -meta.sp, meta.isDone);
+        for (const id of added) adjustCachedBucket(id, +meta.sp, meta.isDone);
+        // Mirror the move in the catalog so repeated moves compose correctly.
+        meta.sprintIds = newIds;
+        return true;
+      },
+      getSprintFieldIdSync() {
+        // Synchronous read of the resolved sprint field id (if any).
+        // Used by the interceptor to parse mutation bodies without awaiting.
+        return sessionStorage.getItem('momentum-light::sprint-field-id');
       },
     };
   })();
@@ -1781,6 +1837,75 @@
       return m ? Number(m[1]) : null;
     }
 
+    function extractIssueKey(url) {
+      // Matches /rest/api/3/issue/ABC-123 (and variants). Anchored on
+      // `/issue/` so we don't accidentally grab keys appearing elsewhere
+      // in the URL (e.g. query params).
+      const m = url.match(/\/issue\/([A-Z][A-Z0-9]+-\d+)(\b|\/|\?|$)/);
+      return m ? m[1] : null;
+    }
+
+    // Extract target sprint IDs from a mutation body. Jira's REST accepts
+    // the sprint change in several shapes depending on the client:
+    //   { fields: { customfield_XXXX: [id, ...] } }          (bulk set)
+    //   { fields: { customfield_XXXX: id } }                 (single)
+    //   { update: { customfield_XXXX: [{ set: [ids] }] } }   (operation-style)
+    //   { update: { customfield_XXXX: [{ add: id }] } }      (incremental)
+    // We handle the common set-style shapes; incremental add is treated as
+    // "at least one new sprint" (the optimistic delta will still be right
+    // if that's the actual move Jira is persisting).
+    function extractTargetSprintIds(body, sprintFieldId) {
+      if (!body || !sprintFieldId) return null;
+      let text = body;
+      if (typeof text !== 'string') {
+        // ArrayBuffer / Blob / FormData — we'd need async reads to peek.
+        // Skip optimistic path; SWR + JQL still kicks in as a fallback.
+        return null;
+      }
+      let json;
+      try { json = JSON.parse(text); } catch { return null; }
+      if (!json || typeof json !== 'object') return null;
+
+      const ids = new Set();
+      const normalize = (v) => {
+        if (v == null) return null;
+        const n = typeof v === 'object' ? Number(v.id) : Number(v);
+        return Number.isFinite(n) && n > 0 ? n : null;
+      };
+
+      const fieldsVal = json.fields?.[sprintFieldId];
+      if (fieldsVal !== undefined) {
+        const arr = Array.isArray(fieldsVal) ? fieldsVal : [fieldsVal];
+        for (const v of arr) {
+          const n = normalize(v);
+          if (n) ids.add(n);
+        }
+      }
+      const updateOps = json.update?.[sprintFieldId];
+      if (Array.isArray(updateOps)) {
+        for (const op of updateOps) {
+          if (op.set !== undefined) {
+            // `set` replaces everything — reset accumulator to match.
+            ids.clear();
+            const setArr = Array.isArray(op.set) ? op.set : [op.set];
+            for (const v of setArr) {
+              const n = normalize(v);
+              if (n) ids.add(n);
+            }
+          } else if (op.add !== undefined) {
+            const n = normalize(op.add);
+            if (n) ids.add(n);
+          }
+          // `remove` left alone: caller's prev-sprints minus removed
+          // would give us the target, but we don't know prev-sprints
+          // outside the catalog lookup (which is done by applyOptimisticMove
+          // itself). Skip — SWR still catches up.
+        }
+      }
+      if (ids.size === 0) return null;
+      return [...ids];
+    }
+
     function isMutation(method, status) {
       if (!MUTATING.has(method.toUpperCase())) return false;
       if (status < 200 || status >= 300) return false;
@@ -1797,7 +1922,7 @@
     }
 
     let onAfterInvalidate = null;
-    function onMutation(url) {
+    function onMutation(url, body) {
       const sprintId = extractSprintId(url);
       if (sprintId) {
         sprintCapacity.invalidate(sprintId);
@@ -1806,6 +1931,31 @@
         sprintCapacity.invalidateAll();
         if (isDebug()) debug(`api-mutation → invalidated all sprintCapacity (${url})`);
       }
+
+      // Optimistic fast-path: if this is an issue-scoped mutation and we
+      // have the issue in our catalog, compute the delta locally so the
+      // chip repaints with the correct numbers *before* the confirming
+      // JQL returns. Worst case (catalog miss, body unparseable, wrong
+      // guess) we fall back to SWR + JQL timing — strictly not worse
+      // than before.
+      try {
+        const issueKey = extractIssueKey(url);
+        const sprintFieldId = sprintCapacity.getSprintFieldIdSync();
+        if (issueKey && sprintFieldId) {
+          const targetIds = extractTargetSprintIds(body, sprintFieldId);
+          if (targetIds && targetIds.length > 0) {
+            const applied = sprintCapacity.applyOptimisticMove(issueKey, targetIds);
+            if (isDebug()) {
+              debug(
+                `optimistic ${applied ? 'applied' : 'skipped'} for ${issueKey} → [${targetIds.join(',')}]`,
+              );
+            }
+          }
+        }
+      } catch (e) {
+        if (isDebug()) debug('optimistic path error:', e?.message || e);
+      }
+
       // Jira often updates the UI optimistically before the mutation
       // request completes, so the MutationObserver may have already run
       // a cycle against stale capacity data by the time we get here.
@@ -1864,7 +2014,7 @@
                 null;
               const matched = matchesInvalidationPath(url, body);
               recordObservation(method, url, res.status, matched);
-              if (matched) onMutation(url);
+              if (matched) onMutation(url, body);
             }
           } catch (e) {
             if (isDebug()) debug('api-mutation interceptor error (fetch):', e?.message || e);
@@ -1892,7 +2042,7 @@
               if (url && isMutation(method, this.status)) {
                 const matched = matchesInvalidationPath(url, this.__momentumBody);
                 recordObservation(method, url, this.status, matched);
-                if (matched) onMutation(url);
+                if (matched) onMutation(url, this.__momentumBody);
               }
             } catch (e) {
               if (isDebug()) debug('api-mutation interceptor error (xhr):', e?.message || e);
@@ -1945,7 +2095,7 @@
     // Initial pass (in case the timeline is already rendered at document-idle).
     runActiveFeatures();
     log(
-      'loaded — version 0.3.7',
+      'loaded — version 0.3.8',
       isDebug()
         ? '(debug on)'
         : '(debug off — enable with: localStorage.setItem(\'momentum-light-debug\', \'1\'))',
