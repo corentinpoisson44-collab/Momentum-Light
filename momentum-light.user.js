@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.1.4
+// @version      0.1.5
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — feature #1 : barre de progression sur les Epics, calculée sur SP done / SP total des tickets enfants.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -309,7 +309,16 @@
         }
       }
       bar.dataset.momentumPct = pctStr;
-      bar.title = `${epicKey}: ${done} / ${total} SP (${pct.toFixed(0)}%)`;
+
+      // Tooltip text. We stash it on the wrapper so the global tooltip
+      // interceptor (installed at bootstrap) can swap JIRA's default tooltip
+      // ("X tickets done / Y total") with our SP-based one when the user hovers.
+      // We also set aria-label for accessibility + as a best-effort hint to
+      // Atlaskit's Tooltip component in case it reads from ARIA.
+      const tooltipText = `${epicKey} — ${done} / ${total} SP (${pct.toFixed(0)}%)`;
+      bar.dataset.momentumTooltip = tooltipText;
+      bar.setAttribute('aria-label', tooltipText);
+      bar.title = tooltipText;
     }
 
     async function decorateBar(bar) {
@@ -365,6 +374,82 @@
   ];
 
   // ---------------------------------------------------------------------------
+  // tooltipInterceptor — rewrite JIRA's tooltip when it appears for one of our
+  // decorated wrappers. JIRA uses Atlaskit's React tooltip whose content is a
+  // React prop (not a DOM attribute), so we can't set it with title/aria-label.
+  // Strategy: MutationObserver on document.body, and whenever a [role="tooltip"]
+  // node is added, figure out which element it belongs to. If the trigger has
+  // a data-momentum-tooltip attribute, replace the tooltip's textContent with
+  // that value and keep it replaced if React re-renders the tooltip body.
+  // ---------------------------------------------------------------------------
+
+  const tooltipInterceptor = (() => {
+    let installed = false;
+
+    function findTrigger(tooltip) {
+      // Strategy 1: aria-describedby wiring (Atlaskit's default pattern).
+      if (tooltip.id) {
+        try {
+          const t = document.querySelector(
+            `[aria-describedby~="${CSS.escape(tooltip.id)}"]`,
+          );
+          if (t) return t;
+        } catch (_) { /* CSS.escape missing on very old browsers */ }
+      }
+      // Strategy 2: currently-hovered ancestor chain.
+      const hovered = document.querySelectorAll(':hover');
+      for (const el of hovered) {
+        if (el instanceof HTMLElement && el.dataset && el.dataset.momentumTooltip) {
+          return el;
+        }
+      }
+      return null;
+    }
+
+    function lockTooltipText(tooltip, newText) {
+      if (tooltip.dataset.momentumLocked === '1') return;
+      tooltip.dataset.momentumLocked = '1';
+      const apply = () => {
+        if (tooltip.textContent !== newText) {
+          tooltip.textContent = newText;
+        }
+      };
+      apply();
+      // React may re-render the tooltip's inner body; keep our text locked
+      // until the tooltip is detached.
+      const inner = new MutationObserver(apply);
+      inner.observe(tooltip, { childList: true, subtree: true, characterData: true });
+    }
+
+    function onAddedNode(node) {
+      if (!(node instanceof HTMLElement)) return;
+      const tooltips = node.matches?.('[role="tooltip"]')
+        ? [node]
+        : [...(node.querySelectorAll?.('[role="tooltip"]') || [])];
+      for (const tip of tooltips) {
+        const trigger = findTrigger(tip);
+        if (!trigger) continue;
+        const text = trigger.dataset?.momentumTooltip;
+        if (!text) continue;
+        lockTooltipText(tip, text);
+      }
+    }
+
+    return {
+      install() {
+        if (installed) return;
+        installed = true;
+        const obs = new MutationObserver((mutations) => {
+          for (const m of mutations) {
+            for (const n of m.addedNodes) onAddedNode(n);
+          }
+        });
+        obs.observe(document.body, { childList: true, subtree: true });
+      },
+    };
+  })();
+
+  // ---------------------------------------------------------------------------
   // Bootstrap
   // ---------------------------------------------------------------------------
 
@@ -383,13 +468,14 @@
 
   function bootstrap() {
     ensureStyles();
+    tooltipInterceptor.install();
     const onMutation = debounce(runActiveFeatures, MUTATION_DEBOUNCE_MS);
     const observer = new MutationObserver(onMutation);
     observer.observe(document.body, { childList: true, subtree: true });
     // Initial pass (in case the timeline is already rendered at document-idle).
     runActiveFeatures();
     log(
-      'loaded — version 0.1.4',
+      'loaded — version 0.1.5',
       isDebug()
         ? '(debug on)'
         : '(debug off — enable with: localStorage.setItem(\'momentum-light-debug\', \'1\'))',
