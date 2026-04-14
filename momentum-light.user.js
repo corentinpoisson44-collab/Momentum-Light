@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.5.1
+// @version      0.5.2
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne, et menu « How-to » guidé qui surligne chaque feature au premier lancement.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -907,26 +907,22 @@
         display: none;
       }
       /* Confidence treatment on Epic bars — reflects the ETA confidence
-         score (done/inProgress/todo/unestimated weighted blend). The
-         diagonal hatch pattern is painted via a ::after pseudo-element
-         stretched across the entire overlay so the "uncertainty" signal
-         covers both the filled and unfilled portions of the bar.
+         score (done/inProgress/todo/unestimated weighted blend). Two
+         orthogonal signals stack:
+           1. Diagonal hatch pattern, painted via a ::after pseudo-element
+              stretched across the entire overlay (filled + unfilled
+              portions). Low and medium share the same hatch.
+           2. Opacity applied to the host bar via inline style (see
+              applyProgress). Opacity on the BAR (not just our overlay)
+              fades the native JIRA-rendered color too — otherwise the
+              "uncertainty" cue would only affect our subtle multiply
+              fill and read as no visible change.
 
-         Low and medium share the SAME hatch pattern — the differentiator
-         between the two tiers is opacity: low epics fade further so they
-         read as distinctly less "solid" than medium ones. High-confidence
-         epics receive no treatment and display the full mix-blend-mode
-         fill at 100% opacity.
-
-         Guarded against the ticket-estimate and sprint-fill variants,
-         which already have their own visual language and should not
-         pick up the hatch pattern. */
-      .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="medium"] .${OVERLAY_FILL_CLASS} {
-        opacity: 0.7;
-      }
-      .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="low"] .${OVERLAY_FILL_CLASS} {
-        opacity: 0.3;
-      }
+         The ::after rule is guarded against the ticket-estimate and
+         sprint-fill variants, which already have their own visual
+         language and should not pick up the hatch pattern. The bar-
+         opacity treatment is lifecycle-managed by applyProgress /
+         applyEstimate / removeOverlay. */
       .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="medium"]::after,
       .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="low"]::after {
         content: '';
@@ -938,8 +934,8 @@
           45deg,
           transparent 0,
           transparent 5px,
-          rgba(255, 255, 255, 0.16) 5px,
-          rgba(255, 255, 255, 0.16) 9px
+          rgba(255, 255, 255, 0.22) 5px,
+          rgba(255, 255, 255, 0.22) 9px
         );
       }
       /* Sprint-fill variant: a full-height translucent wash that covers the
@@ -1437,16 +1433,37 @@
     function removeOverlay(bar) {
       const overlay = bar.querySelector(`:scope > .${OVERLAY_CLASS}`);
       if (overlay) overlay.remove();
+      // Always clear any confidence fade we may have set previously — the
+      // bar might be about to be recycled by JIRA for a different issue.
+      resetBarConfidence(bar);
     }
 
     // Confidence tiers drive the opacity / hatch treatment applied to the
     // epic bar: low-confidence epics read as "uncertain" at a glance via
-    // diagonal stripes + faded fill, without requiring a tooltip hover.
+    // diagonal stripes + a faded host bar, without requiring a tooltip hover.
     function confidenceTier(confidence) {
       if (!(confidence >= 0)) return 'high'; // treat NaN/undefined as neutral
       if (confidence < 40) return 'low';
       if (confidence < 70) return 'medium';
       return 'high';
+    }
+
+    // Opacity is applied directly to the JIRA-rendered bar element so the
+    // whole visible bar fades — native background color included. Setting
+    // it only on our overlay would have no visible effect, since the
+    // overlay is transparent apart from the subtle multiply fill.
+    function applyBarConfidence(bar, tier) {
+      if (tier === 'low') bar.style.opacity = '0.4';
+      else if (tier === 'medium') bar.style.opacity = '0.75';
+      else bar.style.opacity = '';
+    }
+
+    function resetBarConfidence(bar) {
+      // Only clear if we set it — avoid clobbering any inline opacity JIRA
+      // may have applied for its own reasons.
+      if (bar.style.opacity === '0.4' || bar.style.opacity === '0.75') {
+        bar.style.opacity = '';
+      }
     }
 
     function applyProgress(bar, { done, total, epicKey, childStats, confidence }) {
@@ -1465,6 +1482,7 @@
       const overlay = ensureOverlay(bar);
       overlay.classList.remove(OVERLAY_ESTIMATE_MOD);
       overlay.dataset.confidence = tier;
+      applyBarConfidence(bar, tier);
       const fill = overlay.querySelector(`.${OVERLAY_FILL_CLASS}`);
       const label = overlay.querySelector(`.${OVERLAY_LABEL_CLASS}`);
       if (fill) fill.style.width = pctStr;
@@ -1507,6 +1525,11 @@
       }
       const overlay = ensureOverlay(bar);
       overlay.classList.add(OVERLAY_ESTIMATE_MOD);
+      // Ticket variant never carries a confidence tier — strip any stale
+      // attribute + bar opacity left over if this bar was previously
+      // decorated as an epic.
+      delete overlay.dataset.confidence;
+      resetBarConfidence(bar);
       const label = overlay.querySelector(`.${OVERLAY_LABEL_CLASS}`);
       if (label) label.textContent = `${sp} SP`;
 
