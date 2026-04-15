@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.7.7
+// @version      0.7.8
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne, macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, menu « How-to » guidé qui surligne chaque feature au premier lancement, et surcharge du menu Export → Image (.png) qui capture la Timeline au format natif (via html2canvas) avec tous les overlays Momentum-Light visibles dessus.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -3009,92 +3009,99 @@
     }
 
     // ------------------------------------------------------------------
-    // Discovery hatching — post-processing fix for html2canvas
+    // Discovery hatching — inject temporary canvases so html2canvas
+    // can capture them natively
     //
     // Low/medium-confidence Epic bars still in Discovery are marked with
     // diagonal white stripes via `::after { background-image:
-    // repeating-linear-gradient(45deg, ...) }`. html2canvas 1.4.1 doesn't
-    // render that pattern on pseudo-elements reliably — the stripes drop
-    // out of the PNG even though the translucent wash on `::before` is
-    // captured correctly.
+    // repeating-linear-gradient(45deg, ...) }`. html2canvas 1.4.1 drops
+    // that gradient on pseudo-elements — the stripes are missing from
+    // the PNG even though the `::before` wash makes it through.
     //
-    // Fix: draw each diagonal stripe directly onto the returned canvas,
-    // one by one, clipped to the bar's rounded rect. We use the simple
-    // stroke-per-line approach rather than a CanvasPattern tile because
-    // the tile approach requires a delicate seamless-tiling dance that's
-    // easy to get wrong, whereas `moveTo/lineTo` strokes always render.
+    // Earlier attempts tried to paint the hatch onto the returned canvas
+    // by mapping each overlay's viewport rect through the capture root's
+    // rect + scale, but that proved fragile (the hatching landed at the
+    // wrong Y across the whole export). Instead we:
+    //   1. Append a real `<canvas>` child to every eligible overlay,
+    //      sized to the overlay via inset:0, filled with the hatch
+    //      pattern at the current DPR.
+    //   2. Suppress the CSS `::after` hatch globally via a throwaway
+    //      <style> tag so the live view doesn't double up.
+    //   3. Run html2canvas — it captures the <canvas> children natively,
+    //      no coordinate math required, because the browser's own
+    //      layout engine has already placed them exactly where the
+    //      `::after` would have been.
+    //   4. Remove the injected canvases and the <style> in `finally`.
     //
-    // We enumerate the live DOM (what the user sees right now) and match
-    // each eligible overlay to a rect on the canvas via the capture
-    // root's bounding rect + the html2canvas scale factor.
+    // The browser sees the same visual both before and during the export
+    // (swapping one hatch for a pixel-equivalent one), so there's no
+    // flicker beyond maybe a single frame at cleanup.
     // ------------------------------------------------------------------
-    function paintDiscoveryHatching(canvas, root) {
-      const rootRect = root.getBoundingClientRect();
-      if (rootRect.width <= 0 || rootRect.height <= 0) return;
-      const scale = canvas.width / rootRect.width;
-      const ctx = canvas.getContext('2d');
 
+    // Draw the 45° hatch into a canvas sized `w × h` at the given DPR.
+    // Matches the CSS `repeating-linear-gradient(45deg, transparent 0
+    // 5px, rgba(255,255,255,0.22) 5px 9px)`: stripes perpendicular to a
+    // 45° axis with a 9px period and 4px opaque band per period.
+    function drawHatchInto(ctx, w, h, dpr) {
+      ctx.save();
+      ctx.scale(dpr, dpr);
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.22)';
+      ctx.lineWidth = 4;
+      ctx.lineCap = 'square';
+      ctx.beginPath();
+      const period = 9 * Math.SQRT2;
+      // Stripes go top-left → bottom-right. Starting x ranges from -h
+      // (so a stripe starting above-left of the rect reaches the top
+      // edge) through w (so the last stripe starts past the right
+      // edge). Each stripe is `h` long so it always crosses the rect.
+      for (let ax = -h; ax < w + period; ax += period) {
+        ctx.moveTo(ax, 0);
+        ctx.lineTo(ax + h, h);
+      }
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    function injectDiscoveryHatchCanvases() {
       const overlays = document.querySelectorAll(
         `.${OVERLAY_CLASS}[data-discovery][data-confidence="low"],`
         + `.${OVERLAY_CLASS}[data-discovery][data-confidence="medium"]`,
       );
-      log(`paintDiscoveryHatching: ${overlays.length} candidate overlay(s)`);
-
-      // Matches the CSS `repeating-linear-gradient(45deg, transparent 0 5px,
-      // rgba(255,255,255,0.22) 5px 9px)` — a 9px period along the gradient
-      // axis becomes 9*√2 ≈ 12.73px horizontal stride for a 45° stripe set.
-      const period = Math.max(6, 9 * Math.SQRT2) * scale;
-      const lineWidth = Math.max(2, 4 * scale);
-
-      let painted = 0;
+      const injections = [];
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
       for (const overlay of overlays) {
         if (!(overlay instanceof HTMLElement)) continue;
-        // Variants that don't receive the hatch in CSS — mirror that here.
         if (overlay.classList.contains(OVERLAY_ESTIMATE_MOD)) continue;
         if (overlay.classList.contains(OVERLAY_SPRINT_FILL_MOD)) continue;
+        const w = overlay.offsetWidth;
+        const h = overlay.offsetHeight;
+        if (!w || !h) continue;
 
-        const rect = overlay.getBoundingClientRect();
-        if (rect.width <= 0 || rect.height <= 0) continue;
-        const x = (rect.left - rootRect.left) * scale;
-        const y = (rect.top - rootRect.top) * scale;
-        const w = rect.width * scale;
-        const h = rect.height * scale;
-        // Skip overlays fully outside the captured region.
-        if (x + w <= 0 || y + h <= 0 || x >= canvas.width || y >= canvas.height) {
-          continue;
-        }
-
-        const brPx = parseFloat(getComputedStyle(overlay).borderRadius) || 0;
-        const r = Math.min(brPx * scale, w / 2, h / 2);
-
-        ctx.save();
-        // Clip to the overlay's rounded rect so stripes stop at the bar edge.
-        ctx.beginPath();
-        ctx.moveTo(x + r, y);
-        ctx.arcTo(x + w, y, x + w, y + h, r);
-        ctx.arcTo(x + w, y + h, x, y + h, r);
-        ctx.arcTo(x, y + h, x, y, r);
-        ctx.arcTo(x, y, x + w, y, r);
-        ctx.closePath();
-        ctx.clip();
-
-        // 45° stripes (top-left → bottom-right in DOM coordinates). For each
-        // stripe, start on the top edge (or above-left of the rect) and draw
-        // down-right by `h` pixels — that's long enough to exit the rect no
-        // matter where in x it starts.
-        ctx.strokeStyle = 'rgba(255, 255, 255, 0.22)';
-        ctx.lineWidth = lineWidth;
-        ctx.lineCap = 'square';
-        ctx.beginPath();
-        for (let ax = x - h; ax < x + w + period; ax += period) {
-          ctx.moveTo(ax, y);
-          ctx.lineTo(ax + h, y + h);
-        }
-        ctx.stroke();
-        ctx.restore();
-        painted += 1;
+        const c = document.createElement('canvas');
+        c.width = Math.ceil(w * dpr);
+        c.height = Math.ceil(h * dpr);
+        c.style.cssText =
+          'position:absolute;inset:0;width:100%;height:100%;'
+          + 'pointer-events:none;border-radius:inherit;z-index:1;';
+        c.setAttribute('data-momentum-export-hatch', '');
+        drawHatchInto(c.getContext('2d'), w, h, dpr);
+        overlay.appendChild(c);
+        injections.push(c);
       }
-      log(`paintDiscoveryHatching: painted ${painted} overlay(s)`);
+      log(`exportPng: injected ${injections.length} hatch canvas(es)`);
+      return injections;
+    }
+
+    // Globally hide the CSS `::after` hatch while our injected canvases
+    // are in play, so the live screen doesn't render two layers stacked
+    // (which would read as darker stripes). Returns the <style> node so
+    // the caller can remove it when export is done.
+    function suppressCssHatch() {
+      const style = document.createElement('style');
+      style.id = 'momentum-export-hatch-suppressor';
+      style.textContent = `.${OVERLAY_CLASS}::after { display: none !important; }`;
+      document.head.appendChild(style);
+      return style;
     }
 
     // ------------------------------------------------------------------
@@ -3139,12 +3146,22 @@
         // hover states, menu close animations, etc.) before we snapshot.
         await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
 
-        toast.update('Momentum-Light — rendu de la Timeline…');
-        log('exportPng: capturing', root);
-        const canvas = await window.html2canvas(root, html2canvasOpts());
-        // html2canvas drops the `repeating-linear-gradient` hatch on the
-        // Discovery Epic bars — paint it back on before we download.
-        paintDiscoveryHatching(canvas, root);
+        // Swap the CSS `::after` hatch for live <canvas> children so
+        // html2canvas can capture the stripes (it can't render
+        // `repeating-linear-gradient` on pseudo-elements reliably).
+        // Both operations are guarded by `finally` so the DOM is left
+        // clean even if the capture throws.
+        const suppressor = suppressCssHatch();
+        const injections = injectDiscoveryHatchCanvases();
+        let canvas;
+        try {
+          toast.update('Momentum-Light — rendu de la Timeline…');
+          log('exportPng: capturing', root);
+          canvas = await window.html2canvas(root, html2canvasOpts());
+        } finally {
+          for (const c of injections) c.remove();
+          suppressor.remove();
+        }
 
         const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
         downloadCanvas(canvas, `momentum-timeline-${stamp}.png`);
@@ -3824,7 +3841,7 @@
     // Initial pass (in case the timeline is already rendered at document-idle).
     runActiveFeatures();
     log(
-      'loaded — version 0.7.7',
+      'loaded — version 0.7.8',
       isDebug()
         ? '(debug on)'
         : '(debug off — enable with: localStorage.setItem(\'momentum-light-debug\', \'1\'))',
