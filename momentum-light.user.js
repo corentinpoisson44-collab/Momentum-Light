@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.7.2
+// @version      0.7.3
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne, macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, menu « How-to » guidé qui surligne chaque feature au premier lancement, et surcharge du menu Export → Image (.png) qui capture la Timeline au format natif (via html2canvas) avec tous les overlays Momentum-Light visibles dessus.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -2764,24 +2764,31 @@
   // Implementation:
   //   1. Menu MutationObserver spots the Export popover when it opens and
   //      adds "Image enrichie Momentum (.png)" right after the native item.
-  //   2. On click we locate the outermost Advanced Roadmaps container
-  //      (`data-testid` starting with `roadmap.timeline-table-kit`, falling
-  //      back to `[role="main"]`) and hand it to html2canvas, which is
-  //      bundled via the userscript `@require` directive so Atlassian's
-  //      aggressive CSP never has to allow a runtime CDN fetch.
-  //   3. Plans virtualise the list — only visible rows exist in the DOM at
-  //      any time. We therefore scroll the inner viewport in non-overlapping
-  //      steps, capture each slice, then stitch them vertically with the
-  //      sticky header cropped off every slice past the first so it doesn't
-  //      repeat. Each slice waits ~450ms so the virtualisation library and
-  //      our own overlay decorator (200ms debounce) have time to render.
+  //   2. On click we locate the capture root. Priority order:
+  //        a. `#sr-timeline` — Plans / Advanced Roadmaps renders the whole
+  //           plan into this container at its intrinsic height, so
+  //           html2canvas gets every Epic and ticket in a single pass.
+  //        b. outermost `[data-testid^="roadmap.timeline-table-kit"]`.
+  //        c. `[role="main"]` as a last resort.
+  //      We hand the chosen root to html2canvas, which is bundled via the
+  //      userscript `@require` directive so Atlassian's aggressive CSP
+  //      never has to allow a runtime CDN fetch.
+  //   3. Fallback for virtualised roots: if the root has a descendant that
+  //      scrolls vertically (non-#sr-timeline case), we scroll it in
+  //      non-overlapping steps, capture each slice, then stitch them
+  //      vertically with the sticky header cropped off every slice past
+  //      the first so it doesn't repeat. Each slice waits ~450ms so the
+  //      virtualisation library and our own overlay decorator (200ms
+  //      debounce) have time to render. When the root is `#sr-timeline`
+  //      (preferred path) a single capture is enough.
   //   4. We stamp a discreet Momentum-Light footer into the bottom-right
   //      corner so the PNG reads as a branded export.
   //   5. The resulting canvas is downloaded as `momentum-timeline-<iso>.png`.
   //
-  // UX: a floating toast reports progress ("capture 2/5…", "assemblage…",
-  // "export prêt ✓") so the user can follow along — the stitching pass on
-  // a 50-Epic plan can take 5-10 seconds end to end.
+  // UX: a floating toast reports progress ("rendu de la Timeline…", or
+  // "capture X/Y…" + "assemblage…" on the stitched path, followed by
+  // "export prêt ✓") so the user can follow along — wide plans can take
+  // a few seconds.
   // ---------------------------------------------------------------------------
 
   const exportPng = (() => {
@@ -2899,7 +2906,15 @@
     // ------------------------------------------------------------------
 
     function findCaptureRoot() {
-      // Strategy 1 — outermost `[data-testid^="roadmap.timeline-table-kit"]`.
+      // Strategy 1 — the `#sr-timeline` element. Plans / Advanced Roadmaps
+      // renders the whole plan into this container at its intrinsic height,
+      // so html2canvas gets every Epic / ticket in a single pass — no
+      // virtualisation scroll-and-stitch required. If it's present, always
+      // prefer it over the Atlaskit testid wrappers (which can expose only
+      // the currently-visible rows).
+      const sr = document.getElementById('sr-timeline');
+      if (sr instanceof HTMLElement) return sr;
+      // Strategy 2 — outermost `[data-testid^="roadmap.timeline-table-kit"]`.
       // That prefix is stable on Plans / Advanced Roadmaps and wraps the
       // entire timeline table (list side + chart side + header rows).
       const kitHits = [...document.querySelectorAll('[data-testid]')].filter((el) => {
@@ -2916,7 +2931,7 @@
         }
         if (best) return best;
       }
-      // Strategy 2 — Jira main region (works for the native Timeline view
+      // Strategy 3 — Jira main region (works for the native Timeline view
       // inside boards & project roadmaps, not just Plans).
       const main = document.querySelector('[role="main"]') || document.querySelector('main');
       if (main) return main;
@@ -3905,7 +3920,7 @@
     // Initial pass (in case the timeline is already rendered at document-idle).
     runActiveFeatures();
     log(
-      'loaded — version 0.7.2',
+      'loaded — version 0.7.3',
       isDebug()
         ? '(debug on)'
         : '(debug off — enable with: localStorage.setItem(\'momentum-light-debug\', \'1\'))',
