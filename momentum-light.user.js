@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.5.8
-// @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne, et menu « How-to » guidé qui surligne chaque feature au premier lancement.
+// @version      0.6.1
+// @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne, macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, et menu « How-to » guidé qui surligne chaque feature au premier lancement.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
 // @run-at       document-idle
@@ -38,6 +38,33 @@
   const HOWTO_BUTTON_ID = 'momentum-howto-button';
   const HOWTO_OVERLAY_ID = 'momentum-howto-overlay';
   const HOWTO_SEEN_KEY = 'momentum-light::howto-seen';
+  const OVERLAY_TSHIRT_CLASS = 'momentum-progress__tshirt';
+
+  // ---------------------------------------------------------------------------
+  // Macro-estimation (T-Shirt sizing) — each Epic-level size bucket is mapped
+  // to a Story Point budget. The scale follows a Fibonacci-ish curve to
+  // reflect the growing uncertainty of larger scopes. Tweak the numbers
+  // below to recalibrate for your team (XS ≈ a few days of work, XL ≈ about
+  // a quarter). The KEYS are what JIRA stores in the custom field, so leave
+  // them unchanged unless you also remap your JIRA field options.
+  //
+  // `TSHIRT_FIELD_NAME` must match the exact display name of the JIRA
+  // custom field that holds the size (case-insensitive). If the field is
+  // absent, every T-Shirt feature silently no-ops.
+  // ---------------------------------------------------------------------------
+  const TSHIRT_SIZE_SP = {
+    XS: 3,
+    S: 8,
+    M: 20,
+    L: 40,
+    XL: 80,
+  };
+  const TSHIRT_FIELD_NAME = 'T-Shirt Sizing';
+  // Sizing-drift tolerance window — ratio of (real child SP) / (macro size SP).
+  // Below UNDER → Epic was optimistically under-sized; above OVER → dépassement.
+  // The drift state is shown in the tooltip only (kept subtle on the badge).
+  const TSHIRT_DRIFT_UNDER = 0.7;
+  const TSHIRT_DRIFT_OVER = 1.3;
 
   // Debug mode is opt-in per session. Enable from DevTools:
   //   localStorage.setItem('momentum-light-debug', '1')
@@ -232,6 +259,71 @@
   })();
 
   // ---------------------------------------------------------------------------
+  // tshirtSizeField — dynamic discovery of the T-Shirt Sizing custom field id
+  // (configurable via TSHIRT_FIELD_NAME). Shape mirrors storyPointsField, but
+  // resolves to `null` (instead of throwing) when the field isn't present —
+  // macro-estimation is optional, everything else must keep working even on
+  // instances that don't configure it. The miss is cached with a sentinel
+  // so we don't re-scan /rest/api/3/field on every Epic decoration.
+  // ---------------------------------------------------------------------------
+
+  const tshirtSizeField = (() => {
+    const CACHE_KEY = 'momentum-light::tshirt-field-id';
+    const MISS_SENTINEL = '__absent__';
+    let inflight = null;
+
+    return {
+      async resolve() {
+        const cached = sessionStorage.getItem(CACHE_KEY);
+        if (cached === MISS_SENTINEL) return null;
+        if (cached) return cached;
+        if (inflight) return inflight;
+
+        inflight = (async () => {
+          const fields = await jiraApi.listFields();
+          const wanted = TSHIRT_FIELD_NAME.toLowerCase().trim();
+          const match = fields.find(
+            (f) => (f.name || '').toLowerCase().trim() === wanted,
+          );
+          if (!match) {
+            sessionStorage.setItem(CACHE_KEY, MISS_SENTINEL);
+            warn(
+              `T-Shirt Sizing field "${TSHIRT_FIELD_NAME}" not found — ` +
+              'macro-estimation features will be disabled.',
+            );
+            return null;
+          }
+          sessionStorage.setItem(CACHE_KEY, match.id);
+          log('T-Shirt Sizing field resolved:', match.id, `(${match.name})`);
+          return match.id;
+        })();
+
+        try {
+          return await inflight;
+        } finally {
+          inflight = null;
+        }
+      },
+    };
+  })();
+
+  // Normalize a raw JIRA custom-field value into a canonical T-Shirt size key
+  // (one of XS|S|M|L|XL), or null if absent / unknown. JIRA "single-select"
+  // fields return `{ value: 'M', id: '10042', … }` objects; text fields
+  // return a plain string. Anything that doesn't map to a known bucket
+  // (e.g. 'XXL' when the team only defined XS-XL) is treated as absent so
+  // the downstream code can't assign an SP budget it doesn't know about.
+  function normalizeTshirtSize(raw) {
+    if (raw == null) return null;
+    const value = typeof raw === 'string' ? raw : raw.value;
+    if (!value) return null;
+    const upper = String(value).toUpperCase().trim();
+    return Object.prototype.hasOwnProperty.call(TSHIRT_SIZE_SP, upper)
+      ? upper
+      : null;
+  }
+
+  // ---------------------------------------------------------------------------
   // Multiple concurrent requests within a 50 ms window are coalesced into a
   // single `key in (...)` JQL query so expanding an Epic with 20 children
   // costs one API round-trip instead of 20.
@@ -257,13 +349,16 @@
       if (keys.length === 0) return;
 
       try {
-        const spFieldId = await storyPointsField.resolve();
+        // Resolve the T-Shirt field in parallel with Story Points; a miss
+        // returns null and is absorbed below (macro-estimation optional).
+        const [spFieldId, tshirtFieldId] = await Promise.all([
+          storyPointsField.resolve(),
+          tshirtSizeField.resolve().catch(() => null),
+        ]);
         const jql = `key in (${keys.map((k) => `"${k}"`).join(',')})`;
-        const data = await jiraApi.searchIssues(
-          jql,
-          [spFieldId, 'issuetype', 'status'],
-          keys.length,
-        );
+        const fieldList = [spFieldId, 'issuetype', 'status'];
+        if (tshirtFieldId) fieldList.push(tshirtFieldId);
+        const data = await jiraApi.searchIssues(jql, fieldList, keys.length);
         const results = new Map();
         for (const issue of data.issues || []) {
           const sp = Number(issue.fields?.[spFieldId]);
@@ -275,10 +370,14 @@
           // 'indeterminate' (≈ In Progress), 'done'}. Used downstream to
           // restrict the confidence hatch to Epics still in discovery.
           const statusCategory = issue.fields?.status?.statusCategory?.key || null;
+          const tshirtSize = tshirtFieldId
+            ? normalizeTshirtSize(issue.fields?.[tshirtFieldId])
+            : null;
           results.set(issue.key, {
             isEpic,
             storyPoints: Number.isFinite(sp) ? sp : null,
             statusCategory,
+            tshirtSize,
           });
         }
         const expiresAt = Date.now() + ISSUE_TTL_MS;
@@ -287,6 +386,7 @@
             isEpic: false,
             storyPoints: null,
             statusCategory: null,
+            tshirtSize: null,
           };
           cache.set(key, { expiresAt, value });
           const ws = waiters.get(key) || [];
@@ -627,6 +727,14 @@
       getKnownOpenSprintIds() {
         if (!cache || !cache.value) return new Set();
         return new Set((cache.value.openSprints || []).map((s) => Number(s.id)));
+      },
+      // Synchronous snapshot of the last resolved planning context, or
+      // null if velocity hasn't been computed yet. Consumers that can
+      // tolerate "no data yet" (e.g. the Epic tooltip projecting a sprint
+      // end) can read this without awaiting anything — a fresh value
+      // will reach them on the next debounced mutation pass anyway.
+      getCachedSnapshot() {
+        return cache && cache.value ? cache.value : null;
       },
     };
   })();
@@ -985,6 +1093,43 @@
           rgba(255, 255, 255, 0.22) 9px
         );
       }
+      /* T-Shirt size badge — intentionally discreet. A low-contrast pill on
+         the LEFT edge of the Epic bar shows the macro-estimate bucket
+         (XS|S|M|L|XL). No per-size palette and no drift ring: the
+         timeline already carries a lot of color (native Atlaskit hues,
+         confidence wash, sprint-fill states), so the badge reads as a
+         neutral annotation that you notice only when you look for it.
+         The drift state still surfaces in the hover tooltip for Epics
+         whose real chiffrage disagrees with the macro-estimate. */
+      .${OVERLAY_TSHIRT_CLASS} {
+        position: absolute;
+        top: 50%;
+        left: 6px;
+        transform: translateY(-50%);
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 20px;
+        height: 14px;
+        padding: 0 5px;
+        border-radius: 7px;
+        background: rgba(9, 30, 66, 0.35);
+        color: rgba(255, 255, 255, 0.92);
+        font-size: 9px;
+        font-weight: 600;
+        line-height: 1;
+        letter-spacing: 0.04em;
+        z-index: 3;
+        box-sizing: border-box;
+        pointer-events: none;
+        white-space: nowrap;
+      }
+      /* Shift the centered SP label a touch to the right when a badge is
+         present so the two don't visually collide on narrow bars. */
+      .${OVERLAY_CLASS}[data-epic-size] .${OVERLAY_LABEL_CLASS} {
+        padding-left: 32px;
+      }
+
       /* Sprint-fill variant: a full-height translucent wash that covers the
          chip's body, so the fill level reads at a glance across the whole
          button while the chip's own text ("FHSBFF Sprint 53…") stays fully
@@ -1604,11 +1749,13 @@
 
     function applyProgress(
       bar,
-      { done, total, epicKey, childStats, confidence, statusCategory },
+      { done, total, epicKey, childStats, confidence, statusCategory, tshirtSize },
     ) {
       const stats = childStats || { done: 0, inProgress: 0, todo: 0, unestimated: 0, totalChildren: 0 };
-      // No children at all → nothing to visualize. Matches legacy behavior.
-      if (stats.totalChildren === 0 && (!total || total <= 0)) {
+      // No children at all AND no macro-estimate either → nothing to visualize.
+      // An Epic with a T-Shirt size but zero chiffred children still gets
+      // painted: the badge IS the signal in that case.
+      if (stats.totalChildren === 0 && (!total || total <= 0) && !tshirtSize) {
         removeOverlay(bar);
         delete bar.dataset.momentumTooltip;
         return;
@@ -1646,6 +1793,43 @@
       const fill = overlay.querySelector(`.${OVERLAY_FILL_CLASS}`);
       const label = overlay.querySelector(`.${OVERLAY_LABEL_CLASS}`);
       if (fill) fill.style.width = pctStr;
+
+      // --- Macro-estimation (T-Shirt size) ------------------------------
+      // The macro budget (in SP) comes from the TSHIRT_SIZE_SP table at
+      // the top of this file — edit those numbers to recalibrate for your
+      // team. When the Epic already has real child SP, compute a
+      // sizing-drift indicator: the ratio (actualSP / macroSP) tells us
+      // whether the macro-estimate holds.
+      const macroSP = tshirtSize ? TSHIRT_SIZE_SP[tshirtSize] : null;
+      let drift = null;
+      if (macroSP != null && total > 0) {
+        const ratio = total / macroSP;
+        if (ratio < TSHIRT_DRIFT_UNDER) drift = 'under';
+        else if (ratio > TSHIRT_DRIFT_OVER) drift = 'over';
+        else drift = 'on-target';
+      }
+      if (tshirtSize) {
+        overlay.dataset.epicSize = tshirtSize;
+      } else {
+        delete overlay.dataset.epicSize;
+      }
+      if (drift) {
+        overlay.dataset.sizingDrift = drift;
+      } else {
+        delete overlay.dataset.sizingDrift;
+      }
+      let badge = overlay.querySelector(`.${OVERLAY_TSHIRT_CLASS}`);
+      if (tshirtSize) {
+        if (!badge) {
+          badge = document.createElement('span');
+          badge.className = OVERLAY_TSHIRT_CLASS;
+          overlay.appendChild(badge);
+        }
+        badge.textContent = tshirtSize;
+      } else if (badge) {
+        badge.remove();
+      }
+
       // Inline "chiffrage incomplet" suffix — "X / Y SP (∅ N)" where N is
       // the count of child tickets without Story Points. The empty-set
       // glyph reads as "missing value" and sits inside the main label so
@@ -1653,6 +1837,32 @@
       // competing for its own reserved space.
       const missingSuffix = stats.unestimated > 0 ? ` (∅ ${stats.unestimated})` : '';
       if (label) label.textContent = `${done} / ${total} SP${missingSuffix}`;
+
+      // --- Sprint-end projection ----------------------------------------
+      // Best-effort synchronous read of the cached velocity snapshot.
+      // When it isn't ready yet we just omit the projection line — the
+      // next mutation cycle will fill it in once velocity.get() resolves.
+      let projectionLine = null;
+      if (macroSP != null) {
+        const vctx = velocity.getCachedSnapshot();
+        if (vctx && vctx.average > 0 && vctx.openSprints?.length) {
+          const remaining = Math.max(0, macroSP - done);
+          const sprintsAhead = remaining === 0
+            ? 0
+            : Math.max(1, Math.ceil(remaining / vctx.average));
+          if (sprintsAhead === 0) {
+            projectionLine = 'Projection : budget macro déjà couvert par le chiffrage réel';
+          } else {
+            const idx = Math.min(sprintsAhead - 1, vctx.openSprints.length - 1);
+            const target = vctx.openSprints[idx];
+            const overflow = sprintsAhead > vctx.openSprints.length;
+            const plural = sprintsAhead > 1 ? 's' : '';
+            projectionLine = overflow
+              ? `Fin estimée : au-delà du dernier sprint planifié (${sprintsAhead} sprint${plural} à ${Math.round(vctx.average)} SP)`
+              : `Fin estimée : ${target.name} (dans ${sprintsAhead} sprint${plural} à ${Math.round(vctx.average)} SP)`;
+          }
+        }
+      }
 
       // Tooltip text — the interceptor (installed at bootstrap) will rewrite
       // JIRA's Atlaskit tooltip with this value when it appears on hover.
@@ -1670,9 +1880,19 @@
       const breakdown = breakdownParts.length
         ? ` — ${breakdownParts.join(', ')}`
         : '';
-      const tooltipText =
-        `${epicKey} — ${done} / ${total} SP (${pct.toFixed(0)}%)\n` +
-        `${confidenceLine}${breakdown}`;
+      let tshirtLine = null;
+      if (macroSP != null) {
+        let driftTag = '';
+        if (drift === 'under') driftTag = ' · sous-cadrage ⚠️';
+        else if (drift === 'over') driftTag = ' · dépassement 🔴';
+        tshirtLine = `Macro-estimé ${tshirtSize} (~${macroSP} SP)${driftTag}`;
+      }
+      const tooltipText = [
+        `${epicKey} — ${done} / ${total} SP (${pct.toFixed(0)}%)`,
+        tshirtLine,
+        projectionLine,
+        `${confidenceLine}${breakdown}`,
+      ].filter(Boolean).join('\n');
       bar.dataset.momentumTooltip = tooltipText;
       bar.setAttribute('aria-label', tooltipText);
       bar.title = tooltipText;
@@ -1732,6 +1952,7 @@
           childStats,
           confidence,
           statusCategory: meta.statusCategory,
+          tshirtSize: meta.tshirtSize,
         });
       } else {
         if (isDebug() && !isRefresh) debug(`${issueKey} (ticket): ${meta.storyPoints ?? '—'} SP`);
