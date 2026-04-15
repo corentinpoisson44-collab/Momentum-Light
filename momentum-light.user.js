@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.7.5
+// @version      0.7.6
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne, macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, menu « How-to » guidé qui surligne chaque feature au premier lancement, et surcharge du menu Export → Image (.png) qui capture la Timeline au format natif (via html2canvas) avec tous les overlays Momentum-Light visibles dessus.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -3009,6 +3009,85 @@
     }
 
     // ------------------------------------------------------------------
+    // Discovery hatching — post-processing fix for html2canvas
+    //
+    // Low/medium-confidence Epic bars still in Discovery are marked with
+    // diagonal white stripes via `::after { background-image:
+    // repeating-linear-gradient(45deg, ...) }`. html2canvas 1.4.1 doesn't
+    // render that pattern on pseudo-elements reliably — the stripes drop
+    // out of the PNG even though the translucent wash on `::before` is
+    // captured correctly. We paint the hatch directly onto the returned
+    // canvas using a tiled CanvasPattern, which is bulletproof.
+    //
+    // We enumerate the live DOM (what the user sees right now) and match
+    // each eligible overlay to a rect on the canvas via the capture
+    // root's bounding rect + the html2canvas scale factor.
+    // ------------------------------------------------------------------
+    function paintDiscoveryHatching(canvas, root) {
+      const rootRect = root.getBoundingClientRect();
+      if (rootRect.width <= 0 || rootRect.height <= 0) return;
+      const scale = canvas.width / rootRect.width;
+      const ctx = canvas.getContext('2d');
+
+      // Build a tileable diagonal-hatch pattern at the capture's DPR.
+      // The tile is a square with one stripe running corner-to-corner
+      // plus two half-stubs at the opposite corners so repeats chain
+      // seamlessly along both axes.
+      const tileSize = Math.max(4, Math.round(9 * Math.SQRT2 * scale));
+      const tile = document.createElement('canvas');
+      tile.width = tile.height = tileSize;
+      const tctx = tile.getContext('2d');
+      tctx.strokeStyle = 'rgba(255, 255, 255, 0.22)';
+      tctx.lineWidth = Math.max(1, Math.round(4 * scale));
+      tctx.lineCap = 'square';
+      tctx.beginPath();
+      tctx.moveTo(-1, 1); tctx.lineTo(1, -1);
+      tctx.moveTo(0, tileSize); tctx.lineTo(tileSize, 0);
+      tctx.moveTo(tileSize - 1, tileSize + 1); tctx.lineTo(tileSize + 1, tileSize - 1);
+      tctx.stroke();
+      const pattern = ctx.createPattern(tile, 'repeat');
+      if (!pattern) return;
+
+      const overlays = document.querySelectorAll(
+        `.${OVERLAY_CLASS}[data-discovery][data-confidence="low"],`
+        + `.${OVERLAY_CLASS}[data-discovery][data-confidence="medium"]`,
+      );
+      for (const overlay of overlays) {
+        if (!(overlay instanceof HTMLElement)) continue;
+        // Variants that don't receive the hatch in CSS — mirror that here.
+        if (overlay.classList.contains(OVERLAY_ESTIMATE_MOD)) continue;
+        if (overlay.classList.contains(OVERLAY_SPRINT_FILL_MOD)) continue;
+
+        const rect = overlay.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) continue;
+        const x = (rect.left - rootRect.left) * scale;
+        const y = (rect.top - rootRect.top) * scale;
+        const w = rect.width * scale;
+        const h = rect.height * scale;
+        // Skip overlays that fall fully outside the captured region.
+        if (x + w <= 0 || y + h <= 0 || x >= canvas.width || y >= canvas.height) {
+          continue;
+        }
+
+        const brPx = parseFloat(getComputedStyle(overlay).borderRadius) || 0;
+        const r = Math.min(brPx * scale, w / 2, h / 2);
+
+        ctx.save();
+        ctx.beginPath();
+        ctx.moveTo(x + r, y);
+        ctx.arcTo(x + w, y, x + w, y + h, r);
+        ctx.arcTo(x + w, y + h, x, y + h, r);
+        ctx.arcTo(x, y + h, x, y, r);
+        ctx.arcTo(x, y, x + w, y, r);
+        ctx.closePath();
+        ctx.clip();
+        ctx.fillStyle = pattern;
+        ctx.fillRect(x, y, w, h);
+        ctx.restore();
+      }
+    }
+
+    // ------------------------------------------------------------------
     // Capture — single-shot, viewport-only
     //
     // We deliberately capture only what's currently on screen. Plans
@@ -3053,6 +3132,9 @@
         toast.update('Momentum-Light — rendu de la Timeline…');
         log('exportPng: capturing', root);
         const canvas = await window.html2canvas(root, html2canvasOpts());
+        // html2canvas drops the `repeating-linear-gradient` hatch on the
+        // Discovery Epic bars — paint it back on before we download.
+        paintDiscoveryHatching(canvas, root);
 
         const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
         downloadCanvas(canvas, `momentum-timeline-${stamp}.png`);
@@ -3732,7 +3814,7 @@
     // Initial pass (in case the timeline is already rendered at document-idle).
     runActiveFeatures();
     log(
-      'loaded — version 0.7.5',
+      'loaded — version 0.7.6',
       isDebug()
         ? '(debug on)'
         : '(debug off — enable with: localStorage.setItem(\'momentum-light-debug\', \'1\'))',
