@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.6.0
-// @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne, macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge sur la barre, projection de fin de sprint, indicateur de sur/sous-cadrage et backlog macro-estimé dans la bannière, et menu « How-to » guidé qui surligne chaque feature au premier lancement.
+// @version      0.6.1
+// @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne, macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, et menu « How-to » guidé qui surligne chaque feature au premier lancement.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
 // @run-at       document-idle
@@ -62,12 +62,9 @@
   const TSHIRT_FIELD_NAME = 'T-Shirt Sizing';
   // Sizing-drift tolerance window — ratio of (real child SP) / (macro size SP).
   // Below UNDER → Epic was optimistically under-sized; above OVER → dépassement.
+  // The drift state is shown in the tooltip only (kept subtle on the badge).
   const TSHIRT_DRIFT_UNDER = 0.7;
   const TSHIRT_DRIFT_OVER = 1.3;
-  // How long a macro-estimate entry lingers in the "visible backlog" ledger
-  // after its Epic bar was last decorated. Keeps the velocity banner total
-  // steady across scroll/mutations without accumulating ghost entries.
-  const TSHIRT_ENTRY_TTL_MS = 120_000;
 
   // Debug mode is opt-in per session. Enable from DevTools:
   //   localStorage.setItem('momentum-light-debug', '1')
@@ -743,40 +740,6 @@
   })();
 
   // ---------------------------------------------------------------------------
-  // tshirtBacklog — in-memory ledger of the currently-visible Epics that
-  // carry a T-Shirt size. Populated by applyProgress on every decoration
-  // pass; read by velocityBanner to display a rolling "macro-estimated
-  // backlog" total. Entries age out after TSHIRT_ENTRY_TTL_MS so Epics
-  // that scroll out of the visible timeline don't pollute the sum forever.
-  // ---------------------------------------------------------------------------
-  const tshirtBacklog = (() => {
-    const entries = new Map(); // epicKey -> { expiresAt, size, sizeSP, doneSP, realSP, drift, statusCategory }
-
-    function prune() {
-      const now = Date.now();
-      for (const [key, e] of entries) {
-        if (e.expiresAt < now) entries.delete(key);
-      }
-    }
-
-    return {
-      set(epicKey, data) {
-        entries.set(epicKey, {
-          ...data,
-          expiresAt: Date.now() + TSHIRT_ENTRY_TTL_MS,
-        });
-      },
-      clear(epicKey) {
-        entries.delete(epicKey);
-      },
-      snapshot() {
-        prune();
-        return [...entries.values()];
-      },
-    };
-  })();
-
-  // ---------------------------------------------------------------------------
   // sprintCapacity — per-sprint planned SP load, for the timeline Sprints
   // row overlays. Same TTL + inflight-dedup pattern as `epicProgress`.
   //
@@ -1130,11 +1093,14 @@
           rgba(255, 255, 255, 0.22) 9px
         );
       }
-      /* T-Shirt size badge — small pill on the LEFT edge of the Epic bar
-         that shows the macro-estimate bucket (XS|S|M|L|XL). Sits above the
-         confidence wash (z-index:3) so it stays crisp even when the bar
-         is faded for low-confidence Epics. Colors run on a green→red
-         gradient to match the implicit risk curve of larger sizes. */
+      /* T-Shirt size badge — intentionally discreet. A low-contrast pill on
+         the LEFT edge of the Epic bar shows the macro-estimate bucket
+         (XS|S|M|L|XL). No per-size palette and no drift ring: the
+         timeline already carries a lot of color (native Atlaskit hues,
+         confidence wash, sprint-fill states), so the badge reads as a
+         neutral annotation that you notice only when you look for it.
+         The drift state still surfaces in the hover tooltip for Epics
+         whose real chiffrage disagrees with the macro-estimate. */
       .${OVERLAY_TSHIRT_CLASS} {
         position: absolute;
         top: 50%;
@@ -1143,43 +1109,25 @@
         display: inline-flex;
         align-items: center;
         justify-content: center;
-        min-width: 22px;
-        height: 16px;
+        min-width: 20px;
+        height: 14px;
         padding: 0 5px;
-        border-radius: 8px;
-        background: rgba(9, 30, 66, 0.55);
-        color: #fff;
-        font-size: 10px;
-        font-weight: 700;
+        border-radius: 7px;
+        background: rgba(9, 30, 66, 0.35);
+        color: rgba(255, 255, 255, 0.92);
+        font-size: 9px;
+        font-weight: 600;
         line-height: 1;
-        letter-spacing: 0.05em;
+        letter-spacing: 0.04em;
         z-index: 3;
         box-sizing: border-box;
-        border: 1px solid rgba(255, 255, 255, 0.35);
         pointer-events: none;
         white-space: nowrap;
-      }
-      /* Per-size palette — XS (safe, green) → XL (risky, red). */
-      .${OVERLAY_CLASS}[data-epic-size="XS"] .${OVERLAY_TSHIRT_CLASS} { background: #1B9467; }
-      .${OVERLAY_CLASS}[data-epic-size="S"]  .${OVERLAY_TSHIRT_CLASS} { background: #36B37E; }
-      .${OVERLAY_CLASS}[data-epic-size="M"]  .${OVERLAY_TSHIRT_CLASS} { background: #FFAB00; color: #172B4D; border-color: rgba(9, 30, 66, 0.25); }
-      .${OVERLAY_CLASS}[data-epic-size="L"]  .${OVERLAY_TSHIRT_CLASS} { background: #FF7452; }
-      .${OVERLAY_CLASS}[data-epic-size="XL"] .${OVERLAY_TSHIRT_CLASS} { background: #DE350B; }
-      /* Sizing-drift outline — 2px ring around the badge when the Epic's
-         real child SP disagrees with the macro-estimate: amber when the
-         macro was under-sized (actual < 70%), red when it's overflown
-         (actual > 130%). The "on-target" state is the absence of any
-         ring (clean visual). */
-      .${OVERLAY_CLASS}[data-sizing-drift="under"] .${OVERLAY_TSHIRT_CLASS} {
-        box-shadow: 0 0 0 2px rgba(255, 171, 0, 0.85);
-      }
-      .${OVERLAY_CLASS}[data-sizing-drift="over"] .${OVERLAY_TSHIRT_CLASS} {
-        box-shadow: 0 0 0 2px rgba(222, 53, 11, 0.9);
       }
       /* Shift the centered SP label a touch to the right when a badge is
          present so the two don't visually collide on narrow bars. */
       .${OVERLAY_CLASS}[data-epic-size] .${OVERLAY_LABEL_CLASS} {
-        padding-left: 36px;
+        padding-left: 32px;
       }
 
       /* Sprint-fill variant: a full-height translucent wash that covers the
@@ -1297,21 +1245,6 @@
       #${VELOCITY_BANNER_ID}[data-state="error"] .momentum-velocity-banner__chip {
         background: #F4F5F7;
         color: #6B778C;
-      }
-      /* Macro-estimated backlog chip — sits next to the velocity chip. Uses
-         a distinct hue (Atlaskit teal) so viewers can tell at a glance
-         whether they're reading "velocity of the past" vs. "backlog of
-         the future". Inherits all base chip styling (padding, radius,
-         shadow, font). */
-      #${VELOCITY_BANNER_ID} .momentum-velocity-banner__macro {
-        background: #E3FCEF;
-        color: #006644;
-      }
-      #${VELOCITY_BANNER_ID} .momentum-velocity-banner__macro:hover {
-        background: #ABF5D1;
-      }
-      #${VELOCITY_BANNER_ID} .momentum-velocity-banner__macro .momentum-velocity-banner__label {
-        color: #006644;
       }
 
       /* Confidence legend — compact reference chip that lives inside the
@@ -1823,7 +1756,6 @@
       // An Epic with a T-Shirt size but zero chiffred children still gets
       // painted: the badge IS the signal in that case.
       if (stats.totalChildren === 0 && (!total || total <= 0) && !tshirtSize) {
-        tshirtBacklog.clear(epicKey);
         removeOverlay(bar);
         delete bar.dataset.momentumTooltip;
         return;
@@ -1964,21 +1896,6 @@
       bar.dataset.momentumTooltip = tooltipText;
       bar.setAttribute('aria-label', tooltipText);
       bar.title = tooltipText;
-
-      // Feed the shared backlog ledger so the velocity banner can roll up
-      // a macro-estimated total across every Epic currently on screen.
-      if (macroSP != null) {
-        tshirtBacklog.set(epicKey, {
-          size: tshirtSize,
-          sizeSP: macroSP,
-          doneSP: done,
-          realSP: total,
-          drift,
-          statusCategory,
-        });
-      } else {
-        tshirtBacklog.clear(epicKey);
-      }
     }
 
     // Non-Epic variant: just paint the ticket's SP estimate as a chip on the
@@ -2405,55 +2322,6 @@
       return wrapper;
     }
 
-    // Macro-estimated backlog chip — aggregates the T-Shirt sizes of every
-    // Epic currently being decorated on the timeline and projects how many
-    // sprints that total represents at the current velocity average.
-    // Appears as a second pill in the banner, next to the velocity chip;
-    // it's hidden entirely when no macro-estimate is available yet (or
-    // when velocity isn't computed), so users who don't use T-Shirt sizes
-    // see no visual noise.
-    function refreshMacroChip(el, velocityAvg) {
-      const entries = tshirtBacklog.snapshot();
-      let macroChip = el.querySelector('.momentum-velocity-banner__macro');
-      if (!entries.length || !(velocityAvg > 0)) {
-        if (macroChip) macroChip.remove();
-        return;
-      }
-      const totalSizeSP = entries.reduce((acc, e) => acc + (e.sizeSP || 0), 0);
-      const totalDone = entries.reduce((acc, e) => acc + (e.doneSP || 0), 0);
-      const remaining = Math.max(0, totalSizeSP - totalDone);
-      const sprintsNeeded = remaining === 0
-        ? 0
-        : Math.max(1, Math.ceil(remaining / velocityAvg));
-      const plural = sprintsNeeded > 1 ? 's' : '';
-      const valueText = sprintsNeeded === 0
-        ? `${totalSizeSP} SP (déjà couvert)`
-        : `${totalSizeSP} SP ≈ ${sprintsNeeded} sprint${plural}`;
-      if (!macroChip) {
-        macroChip = document.createElement('span');
-        macroChip.className = 'momentum-velocity-banner__chip momentum-velocity-banner__macro';
-        el.appendChild(macroChip);
-      }
-      // Per-size breakdown for the tooltip — gives the planning lead a
-      // one-glance understanding of which bucket dominates the backlog.
-      const bySize = new Map();
-      for (const e of entries) {
-        bySize.set(e.size, (bySize.get(e.size) || 0) + 1);
-      }
-      const sizesLine = ['XS', 'S', 'M', 'L', 'XL']
-        .filter((s) => bySize.has(s))
-        .map((s) => `${bySize.get(s)}×${s}`)
-        .join(' · ');
-      macroChip.title =
-        `Backlog macro-estimé (${entries.length} Epic${entries.length > 1 ? 's' : ''} visible${entries.length > 1 ? 's' : ''})\n` +
-        `  Total : ${totalSizeSP} SP (déjà chiffrage réel : ${totalDone} SP)\n` +
-        `  Restant : ${remaining} SP à ${Math.round(velocityAvg)} SP/sprint → ${sprintsNeeded} sprint${plural}\n` +
-        (sizesLine ? `  Répartition : ${sizesLine}` : '');
-      macroChip.innerHTML =
-        '<span class="momentum-velocity-banner__label">Backlog macro-estimé</span>' +
-        `<span class="momentum-velocity-banner__value">${valueText}</span>`;
-    }
-
     function ensure() {
       const anchor = findAnchor();
       if (!anchor) return null;
@@ -2489,19 +2357,15 @@
       updating = true;
       try {
         const { average, sprints } = await velocity.get();
-        // The macro chip reflects whichever Epics have been decorated so
-        // far — independent of velocity success — so refresh it on every
-        // cycle even before the velocity numbers are in.
-        refreshMacroChip(el, average);
-        const chip = el.querySelector('.momentum-velocity-banner__chip:not(.momentum-velocity-banner__macro)');
-        const value = chip?.querySelector('.momentum-velocity-banner__value');
+        const chip = el.querySelector('.momentum-velocity-banner__chip');
+        const value = el.querySelector('.momentum-velocity-banner__value');
         if (sprints.length === 0) {
-          if (value) value.textContent = 'N/A';
+          value.textContent = 'N/A';
           el.dataset.state = 'error';
           if (chip) chip.title = 'Aucun sprint clos trouvé';
           return;
         }
-        if (value) value.textContent = `${Math.round(average)} SP`;
+        value.textContent = `${Math.round(average)} SP`;
         el.dataset.state = 'ok';
         const breakdown = sprints
           .map((s) => `${s.name}: ${s.velocity} SP`)
@@ -2510,8 +2374,8 @@
           chip.title = `Moyenne de ${sprints.length} sprint(s) clos :\n${breakdown}\n(cliquer pour rafraîchir)`;
         }
       } catch (e) {
-        const chip = el.querySelector('.momentum-velocity-banner__chip:not(.momentum-velocity-banner__macro)');
-        const value = chip?.querySelector('.momentum-velocity-banner__value');
+        const chip = el.querySelector('.momentum-velocity-banner__chip');
+        const value = el.querySelector('.momentum-velocity-banner__value');
         if (value) value.textContent = 'N/A';
         el.dataset.state = 'error';
         if (chip) chip.title = `Vélocité indisponible : ${e?.message || e}`;
