@@ -1,12 +1,13 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.7.0
-// @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne, macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, menu « How-to » guidé qui surligne chaque feature au premier lancement, et surcharge du menu Export → Image (.png) pour générer une carte enrichie avec vélocité, charge des sprints, progression & confiance des Epics et macro-estimations T-Shirt.
+// @version      0.7.1
+// @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne, macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, menu « How-to » guidé qui surligne chaque feature au premier lancement, et surcharge du menu Export → Image (.png) qui capture la Timeline au format natif (via html2canvas) avec tous les overlays Momentum-Light visibles dessus.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
 // @run-at       document-idle
 // @grant        none
+// @require      https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js
 // @updateURL    https://raw.githubusercontent.com/corentinpoisson44-collab/Momentum-Light/main/momentum-light.user.js
 // @downloadURL  https://raw.githubusercontent.com/corentinpoisson44-collab/Momentum-Light/main/momentum-light.user.js
 // ==/UserScript==
@@ -2753,22 +2754,28 @@
   // injects a companion menu entry "Image enrichie Momentum (.png)" right
   // after the native "Image (.png)" item.
   //
-  // The enriched export does NOT try to DOM-to-PNG the timeline (which would
-  // require html2canvas / foreignObject gymnastics and break on cross-origin
-  // avatars and icons). Instead, it renders a self-contained summary card
-  // directly onto a 2D canvas with the key Momentum-Light signals:
+  // Unlike Jira's native PNG export (which rasterises server-side from the
+  // raw plan data and therefore loses every Momentum-Light overlay), this
+  // export captures the live DOM of the timeline — epic progress bars, SP
+  // labels, T-Shirt badges, confidence washes, sprint-fill chips and the
+  // velocity banner are all included in the final image, pixel-identical
+  // to what the user sees on screen.
   //
-  //   • Vélocité moyenne (N derniers sprints clos) + détail par sprint
-  //   • Charge des sprints actif/futurs vs. vélocité (état under / on-target /
-  //     over, même lecture que l'overlay sprint-fill)
-  //   • Liste des Epics visibles : clé, SP done/total, %, confiance (tier),
-  //     macro-estimation T-Shirt et drift éventuel
-  //   • Chiffrage des tickets visibles (SP)
+  // Implementation:
+  //   1. Menu MutationObserver spots the Export popover when it opens and
+  //      adds "Image enrichie Momentum (.png)" right after the native item.
+  //   2. On click we locate the outermost Advanced Roadmaps container
+  //      (`data-testid` starting with `roadmap.timeline-table-kit`, falling
+  //      back to `[role="main"]`) and hand it to html2canvas, which is
+  //      bundled via the userscript `@require` directive so Atlassian's
+  //      aggressive CSP never has to allow a runtime CDN fetch.
+  //   3. We stamp a discreet Momentum-Light footer into the bottom-right
+  //      corner so the PNG reads as a branded export.
+  //   4. The resulting canvas is downloaded as `momentum-timeline-<iso>.png`.
   //
-  // We read the snapshot straight from what the decorator already wrote into
-  // `data-momentum-tooltip` on every bar/chip — that dataset is the ground
-  // truth for "what the user is currently seeing on the timeline", so the
-  // PNG matches the live overlays exactly without re-walking the JIRA API.
+  // UX: a floating toast reports progress ("capture en cours…", "rendu de
+  // la Timeline…", "export prêt ✓") so the user knows the click registered
+  // — html2canvas on a wide plan can take a couple of seconds.
   // ---------------------------------------------------------------------------
 
   const exportPng = (() => {
@@ -2879,444 +2886,73 @@
     }
 
     // ------------------------------------------------------------------
-    // Snapshot — collect everything the overlays are currently showing
+    // Capture root detection — we want the outermost Advanced Roadmaps
+    // container so the exported PNG matches the live layout (list + chart +
+    // sprint chips row, with our overlays in place). Fallbacks keep the
+    // feature working even if Atlassian's testid taxonomy shifts.
     // ------------------------------------------------------------------
 
-    function parseEpicTooltip(tooltip) {
-      // Format produced by timelineDom.applyProgress:
-      //   KEY — X / Y SP (P%)
-      //   Macro-estimé S (~8 SP) · dépassement 🔴            (optional)
-      //   Projection : ...                                    (optional)
-      //   Confiance : 73% (medium · Discovery) — 2 done, 3 todo
-      if (!tooltip) return null;
-      const lines = tooltip.split('\n');
-      const head = lines[0] || '';
-      const hm = head.match(
-        /^([A-Z][A-Z0-9]+-\d+)\s*—\s*(\d+(?:\.\d+)?)\s*\/\s*(\d+(?:\.\d+)?)\s*SP\s*\((\d+)%\)/,
-      );
-      if (!hm) return null;
-      const out = {
-        kind: 'epic',
-        key: hm[1],
-        done: Number(hm[2]),
-        total: Number(hm[3]),
-        pct: Number(hm[4]),
-        tshirt: null,
-        tshirtSp: null,
-        drift: null,
-        confidence: null,
-        tier: null,
-        isDiscovery: false,
+    function findCaptureRoot() {
+      // Strategy 1 — outermost `[data-testid^="roadmap.timeline-table-kit"]`.
+      // That prefix is stable on Plans / Advanced Roadmaps and wraps the
+      // entire timeline table (list side + chart side + header rows).
+      const kitHits = [...document.querySelectorAll('[data-testid]')].filter((el) => {
+        const tid = el.getAttribute('data-testid') || '';
+        return tid.startsWith('roadmap.timeline-table-kit');
+      });
+      if (kitHits.length) {
+        // Outermost = the one that contains the most other hits.
+        let best = null;
+        let bestCount = -1;
+        for (const el of kitHits) {
+          const count = kitHits.reduce((acc, other) => acc + (el.contains(other) ? 1 : 0), 0);
+          if (count > bestCount) { best = el; bestCount = count; }
+        }
+        if (best) return best;
+      }
+      // Strategy 2 — Jira main region (works for the native Timeline view
+      // inside boards & project roadmaps, not just Plans).
+      const main = document.querySelector('[role="main"]') || document.querySelector('main');
+      if (main) return main;
+      // Last resort so the feature at least produces something.
+      return document.body;
+    }
+
+    // ------------------------------------------------------------------
+    // Loading toast — html2canvas takes a couple of seconds on large
+    // plans, so we surface progress so the user doesn't wonder whether
+    // their click registered.
+    // ------------------------------------------------------------------
+
+    function showToast(text) {
+      const toast = document.createElement('div');
+      toast.id = 'momentum-export-toast';
+      toast.textContent = text;
+      Object.assign(toast.style, {
+        position: 'fixed',
+        top: '20px',
+        left: '50%',
+        transform: 'translateX(-50%)',
+        padding: '10px 18px',
+        background: 'rgba(9, 30, 66, 0.88)',
+        color: '#FFFFFF',
+        borderRadius: '6px',
+        fontSize: '13px',
+        fontWeight: '500',
+        fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+        zIndex: '99999',
+        boxShadow: '0 4px 12px rgba(0,0,0,0.18)',
+        pointerEvents: 'none',
+        transition: 'opacity 200ms ease-out',
+      });
+      document.body.appendChild(toast);
+      return {
+        update(t) { toast.textContent = t; },
+        hide() {
+          toast.style.opacity = '0';
+          setTimeout(() => toast.remove(), 250);
+        },
       };
-      for (const line of lines.slice(1)) {
-        const mt = line.match(/Macro-estimé\s+(\w+)\s*\(~(\d+)\s*SP\)(.*)$/);
-        if (mt) {
-          out.tshirt = mt[1];
-          out.tshirtSp = Number(mt[2]);
-          const tail = mt[3] || '';
-          if (/sous-cadrage/i.test(tail)) out.drift = 'under';
-          else if (/dépassement/i.test(tail)) out.drift = 'over';
-          continue;
-        }
-        const mc = line.match(/Confiance\s*:\s*(\d+)%\s*\(([^)]+)\)/);
-        if (mc) {
-          out.confidence = Number(mc[1]);
-          const tierRaw = mc[2].split('·').map((s) => s.trim());
-          out.tier = tierRaw[0] || null;
-          out.isDiscovery = tierRaw.some((s) => /discovery/i.test(s));
-        }
-      }
-      return out;
-    }
-
-    function parseTicketTooltip(tooltip) {
-      if (!tooltip) return null;
-      const m = tooltip.match(/^([A-Z][A-Z0-9]+-\d+)\s*—\s*(\d+(?:\.\d+)?)\s*SP\s*$/);
-      if (!m) return null;
-      return { kind: 'ticket', key: m[1], sp: Number(m[2]) };
-    }
-
-    async function collectSnapshot() {
-      // Plan title — best-effort from the breadcrumb / document title.
-      const planTitle =
-        document.querySelector('[data-testid*="breadcrumbs"] :last-child')?.textContent?.trim() ||
-        (document.title || '').replace(/\s*[-–—]\s*Jira.*$/i, '').trim() ||
-        'Plan';
-      const planUrl = location.href;
-
-      // Epics & tickets — keyed off the decorated bars' tooltip.
-      const bars = timelineDom.findBars(document.body);
-      const epics = [];
-      const tickets = [];
-      const seenKeys = new Set();
-      for (const bar of bars) {
-        const tooltip = bar.dataset?.momentumTooltip;
-        if (!tooltip) continue;
-        const ep = parseEpicTooltip(tooltip);
-        if (ep) {
-          if (seenKeys.has(ep.key)) continue;
-          seenKeys.add(ep.key);
-          epics.push(ep);
-          continue;
-        }
-        const tk = parseTicketTooltip(tooltip);
-        if (tk) {
-          if (seenKeys.has(tk.key)) continue;
-          seenKeys.add(tk.key);
-          tickets.push(tk);
-        }
-      }
-      // Stable order: by SP total desc (largest Epic first), tickets by SP desc.
-      epics.sort((a, b) => b.total - a.total || a.key.localeCompare(b.key));
-      tickets.sort((a, b) => b.sp - a.sp || a.key.localeCompare(b.key));
-
-      // Velocity + sprint loads — fresh where available, cached snapshot as
-      // fallback. `velocity.get()` is cached 5 min so this is cheap.
-      let vctx = null;
-      try { vctx = await velocity.get(); } catch (_) { vctx = velocity.getCachedSnapshot(); }
-      const sprintLoads = [];
-      if (vctx?.openSprints?.length) {
-        for (const s of vctx.openSprints) {
-          let capacity = null;
-          try { capacity = await sprintCapacity.get(s.id, s.state); } catch (_) { /* ignore */ }
-          const load = capacity?.load ?? null;
-          const avg = vctx.average || 0;
-          let state = null;
-          if (avg > 0 && load != null) {
-            const ratio = load / avg;
-            if (ratio > 1.10) state = 'over';
-            else if (ratio >= 0.90) state = 'on-target';
-            else state = 'under';
-          }
-          sprintLoads.push({
-            id: s.id,
-            name: s.name,
-            state: s.state,   // 'active' | 'future'
-            load,
-            remaining: capacity?.remaining ?? null,
-            total: capacity?.total ?? null,
-            fillState: state, // 'under' | 'on-target' | 'over' | null
-          });
-        }
-      }
-
-      return { planTitle, planUrl, epics, tickets, vctx, sprintLoads };
-    }
-
-    // ------------------------------------------------------------------
-    // Canvas rendering — self-contained summary card
-    // ------------------------------------------------------------------
-
-    // Atlaskit-ish palette so the PNG feels at home next to the native export.
-    const COLORS = {
-      bg: '#FFFFFF',
-      panel: '#F4F5F7',
-      border: '#DFE1E6',
-      text: '#172B4D',
-      muted: '#5E6C84',
-      accent: '#0052CC',
-      done: '#36B37E',
-      progress: '#0052CC',
-      under: '#36B37E',
-      onTarget: '#FFAB00',
-      over: '#DE350B',
-      tierHigh: '#36B37E',
-      tierMedium: '#FFAB00',
-      tierLow: '#DE350B',
-    };
-
-    function tierColor(tier) {
-      if (tier === 'high') return COLORS.tierHigh;
-      if (tier === 'medium') return COLORS.tierMedium;
-      if (tier === 'low') return COLORS.tierLow;
-      return COLORS.muted;
-    }
-
-    function fillStateColor(state) {
-      if (state === 'under') return COLORS.under;
-      if (state === 'on-target') return COLORS.onTarget;
-      if (state === 'over') return COLORS.over;
-      return COLORS.muted;
-    }
-
-    function drawRoundedRect(ctx, x, y, w, h, r, fill, stroke) {
-      const rr = Math.min(r, w / 2, h / 2);
-      ctx.beginPath();
-      ctx.moveTo(x + rr, y);
-      ctx.arcTo(x + w, y, x + w, y + h, rr);
-      ctx.arcTo(x + w, y + h, x, y + h, rr);
-      ctx.arcTo(x, y + h, x, y, rr);
-      ctx.arcTo(x, y, x + w, y, rr);
-      ctx.closePath();
-      if (fill) { ctx.fillStyle = fill; ctx.fill(); }
-      if (stroke) { ctx.strokeStyle = stroke; ctx.stroke(); }
-    }
-
-    function drawProgressBar(ctx, x, y, w, h, pct, color) {
-      drawRoundedRect(ctx, x, y, w, h, h / 2, '#EBECF0');
-      const fw = Math.max(0, Math.min(1, pct / 100)) * w;
-      if (fw > 0) drawRoundedRect(ctx, x, y, fw, h, h / 2, color);
-    }
-
-    function drawBadge(ctx, x, y, label, bg, fg) {
-      ctx.font = '600 11px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
-      const padX = 8;
-      const w = Math.ceil(ctx.measureText(label).width) + padX * 2;
-      const h = 18;
-      drawRoundedRect(ctx, x, y, w, h, h / 2, bg);
-      ctx.fillStyle = fg;
-      ctx.textBaseline = 'middle';
-      ctx.fillText(label, x + padX, y + h / 2);
-      return w;
-    }
-
-    function formatDate(d) {
-      try {
-        return d.toLocaleString('fr-FR', {
-          day: '2-digit', month: '2-digit', year: 'numeric',
-          hour: '2-digit', minute: '2-digit',
-        });
-      } catch (_) {
-        return d.toISOString();
-      }
-    }
-
-    function renderCanvas(snap) {
-      const W = 1200;
-      const PAD = 32;
-      const HEADER_H = 108;
-      const SECTION_GAP = 24;
-      const SECTION_TITLE_H = 30;
-      const ROW_H = 32;
-      const SUBTITLE_H = 20;
-
-      // Estimate canvas height top-down.
-      const velocityRows = snap.vctx?.sprints?.length || 0;
-      const velocityH = SECTION_TITLE_H + SUBTITLE_H + Math.max(1, velocityRows) * 22 + 12;
-
-      const sprintRows = snap.sprintLoads.length;
-      const sprintsH = sprintRows > 0 ? SECTION_TITLE_H + sprintRows * ROW_H + 12 : 0;
-
-      const epicsRows = Math.min(snap.epics.length, 40); // cap to keep the PNG readable
-      const epicsH = epicsRows > 0 ? SECTION_TITLE_H + epicsRows * ROW_H + 12 : 0;
-
-      const ticketsShown = Math.min(snap.tickets.length, 20);
-      const ticketsH = ticketsShown > 0 ? SECTION_TITLE_H + ticketsShown * 22 + 12 : 0;
-
-      const footerH = 48;
-      const H = HEADER_H
-        + velocityH + SECTION_GAP
-        + (sprintsH ? sprintsH + SECTION_GAP : 0)
-        + (epicsH ? epicsH + SECTION_GAP : 0)
-        + (ticketsH ? ticketsH + SECTION_GAP : 0)
-        + footerH;
-
-      const canvas = document.createElement('canvas');
-      const dpr = Math.min(window.devicePixelRatio || 1, 2);
-      canvas.width = W * dpr;
-      canvas.height = H * dpr;
-      canvas.style.width = `${W}px`;
-      canvas.style.height = `${H}px`;
-      const ctx = canvas.getContext('2d');
-      ctx.scale(dpr, dpr);
-
-      // Background
-      ctx.fillStyle = COLORS.bg;
-      ctx.fillRect(0, 0, W, H);
-
-      // ---------------- Header ----------------
-      drawRoundedRect(ctx, 0, 0, W, HEADER_H, 0, COLORS.accent);
-      ctx.fillStyle = '#FFFFFF';
-      ctx.textBaseline = 'alphabetic';
-      ctx.font = '700 22px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
-      ctx.fillText('Momentum-Light — Export Timeline', PAD, 42);
-      ctx.font = '400 14px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
-      ctx.fillStyle = 'rgba(255,255,255,0.92)';
-      ctx.fillText(snap.planTitle, PAD, 66);
-      ctx.font = '400 12px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
-      ctx.fillStyle = 'rgba(255,255,255,0.78)';
-      ctx.fillText(`Exporté le ${formatDate(new Date())}`, PAD, 88);
-      // Right-aligned URL (ellipsized if too long)
-      const url = snap.planUrl;
-      ctx.textAlign = 'right';
-      ctx.fillText(url.length > 110 ? `${url.slice(0, 107)}…` : url, W - PAD, 88);
-      ctx.textAlign = 'left';
-
-      let y = HEADER_H + SECTION_GAP;
-
-      // ---------------- Vélocité ----------------
-      ctx.fillStyle = COLORS.text;
-      ctx.font = '700 16px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
-      const vavg = snap.vctx?.average || 0;
-      const vcount = snap.vctx?.sprints?.length || 0;
-      ctx.fillText(`Vélocité moyenne : ${vavg ? vavg.toFixed(1) : '—'} SP`, PAD, y + 20);
-      ctx.font = '400 12px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
-      ctx.fillStyle = COLORS.muted;
-      ctx.fillText(
-        vcount > 0
-          ? `${vcount} derniers sprints clos`
-          : 'Données de vélocité indisponibles (ouvrir la Timeline pour déclencher le calcul)',
-        PAD, y + 40,
-      );
-      y += SECTION_TITLE_H + SUBTITLE_H;
-      if (vcount > 0) {
-        ctx.font = '400 12px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
-        for (const s of snap.vctx.sprints) {
-          ctx.fillStyle = COLORS.muted;
-          ctx.fillText(`• ${s.name}`, PAD + 4, y + 14);
-          ctx.fillStyle = COLORS.text;
-          ctx.textAlign = 'right';
-          ctx.fillText(`${s.velocity.toFixed(1)} SP`, PAD + 420, y + 14);
-          ctx.textAlign = 'left';
-          y += 22;
-        }
-      } else {
-        y += 22;
-      }
-      y += 12;
-
-      // ---------------- Sprints actif/futurs ----------------
-      if (sprintsH) {
-        y += SECTION_GAP - 12;
-        ctx.font = '700 16px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
-        ctx.fillStyle = COLORS.text;
-        ctx.fillText('Sprints actifs & planifiés', PAD, y + 20);
-        y += SECTION_TITLE_H;
-        for (const s of snap.sprintLoads) {
-          const rowY = y + 4;
-          // Sprint name + state badge
-          ctx.font = '600 13px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
-          ctx.fillStyle = COLORS.text;
-          ctx.textBaseline = 'middle';
-          const nameMax = 360;
-          let name = s.name;
-          while (ctx.measureText(name).width > nameMax && name.length > 4) {
-            name = `${name.slice(0, -2)}…`;
-          }
-          ctx.fillText(name, PAD, rowY + ROW_H / 2);
-          drawBadge(
-            ctx, PAD + nameMax + 8, rowY + ROW_H / 2 - 9,
-            s.state === 'active' ? 'Actif' : 'Futur',
-            s.state === 'active' ? '#DEEBFF' : '#F4F5F7',
-            s.state === 'active' ? '#0052CC' : '#5E6C84',
-          );
-          // Fill bar
-          const barX = PAD + 520;
-          const barW = W - barX - PAD - 140;
-          drawRoundedRect(ctx, barX, rowY + ROW_H / 2 - 7, barW, 14, 7, '#EBECF0');
-          if (s.load != null && vavg > 0) {
-            const fw = Math.max(0, Math.min(1.5, s.load / vavg)) * barW;
-            const color = fillStateColor(s.fillState);
-            drawRoundedRect(
-              ctx, barX, rowY + ROW_H / 2 - 7,
-              Math.min(fw, barW), 14, 7, color,
-            );
-          }
-          // Load label
-          ctx.font = '600 12px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
-          ctx.fillStyle = COLORS.text;
-          const loadStr = s.load != null
-            ? (s.state === 'active'
-              ? `${s.load.toFixed(0)} SP restants / ${vavg.toFixed(0)}`
-              : `${s.load.toFixed(0)} SP planifiés / ${vavg.toFixed(0)}`)
-            : '— SP';
-          ctx.textAlign = 'right';
-          ctx.fillText(loadStr, W - PAD, rowY + ROW_H / 2);
-          ctx.textAlign = 'left';
-          y += ROW_H;
-        }
-        y += 12;
-      }
-
-      // ---------------- Epics ----------------
-      if (epicsH) {
-        y += SECTION_GAP - 12;
-        ctx.font = '700 16px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
-        ctx.fillStyle = COLORS.text;
-        ctx.textBaseline = 'alphabetic';
-        const title = snap.epics.length > epicsRows
-          ? `Epics visibles (top ${epicsRows} / ${snap.epics.length})`
-          : `Epics visibles (${snap.epics.length})`;
-        ctx.fillText(title, PAD, y + 20);
-        y += SECTION_TITLE_H;
-        ctx.textBaseline = 'middle';
-        for (const e of snap.epics.slice(0, epicsRows)) {
-          const rowY = y + 4;
-          // Key
-          ctx.font = '600 13px ui-monospace, SFMono-Regular, Menlo, monospace';
-          ctx.fillStyle = COLORS.text;
-          ctx.fillText(e.key, PAD, rowY + ROW_H / 2);
-          // Progress bar
-          const barX = PAD + 140;
-          const barW = 360;
-          drawProgressBar(ctx, barX, rowY + ROW_H / 2 - 6, barW, 12, e.pct, COLORS.progress);
-          // "X / Y SP (P%)"
-          ctx.font = '400 12px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
-          ctx.fillStyle = COLORS.text;
-          ctx.fillText(
-            `${e.done} / ${e.total} SP (${e.pct}%)`,
-            barX + barW + 12, rowY + ROW_H / 2,
-          );
-          // Badges on the right (tier, tshirt, drift)
-          let bx = PAD + 140 + barW + 170;
-          if (e.tier) {
-            const lbl = e.isDiscovery ? `${e.tier} · Discovery` : e.tier;
-            bx += drawBadge(ctx, bx, rowY + ROW_H / 2 - 9, lbl, '#F4F5F7', tierColor(e.tier)) + 6;
-          }
-          if (e.tshirt) {
-            bx += drawBadge(
-              ctx, bx, rowY + ROW_H / 2 - 9,
-              `${e.tshirt} · ~${e.tshirtSp} SP`,
-              '#EAE6FF', '#5243AA',
-            ) + 6;
-          }
-          if (e.drift === 'under') {
-            bx += drawBadge(ctx, bx, rowY + ROW_H / 2 - 9, 'sous-cadrage', '#FFFAE6', '#974F0C') + 6;
-          } else if (e.drift === 'over') {
-            bx += drawBadge(ctx, bx, rowY + ROW_H / 2 - 9, 'dépassement', '#FFEBE6', '#BF2600') + 6;
-          }
-          y += ROW_H;
-        }
-        y += 12;
-      }
-
-      // ---------------- Tickets ----------------
-      if (ticketsH) {
-        y += SECTION_GAP - 12;
-        ctx.textBaseline = 'alphabetic';
-        ctx.font = '700 16px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
-        ctx.fillStyle = COLORS.text;
-        const ttitle = snap.tickets.length > ticketsShown
-          ? `Tickets chiffrés (top ${ticketsShown} / ${snap.tickets.length})`
-          : `Tickets chiffrés (${snap.tickets.length})`;
-        ctx.fillText(ttitle, PAD, y + 20);
-        y += SECTION_TITLE_H;
-        ctx.textBaseline = 'middle';
-        for (const t of snap.tickets.slice(0, ticketsShown)) {
-          const rowY = y + 2;
-          ctx.font = '600 12px ui-monospace, SFMono-Regular, Menlo, monospace';
-          ctx.fillStyle = COLORS.text;
-          ctx.fillText(t.key, PAD, rowY + 10);
-          ctx.font = '400 12px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
-          ctx.fillStyle = COLORS.muted;
-          ctx.textAlign = 'right';
-          ctx.fillText(`${t.sp} SP`, PAD + 500, rowY + 10);
-          ctx.textAlign = 'left';
-          y += 22;
-        }
-        y += 12;
-      }
-
-      // ---------------- Footer ----------------
-      ctx.textBaseline = 'alphabetic';
-      ctx.font = '400 11px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
-      ctx.fillStyle = COLORS.muted;
-      ctx.fillText(
-        'Généré par Momentum-Light — https://github.com/corentinpoisson44-collab/Momentum-Light',
-        PAD, H - 16,
-      );
-
-      return canvas;
     }
 
     function downloadCanvas(canvas, filename) {
@@ -3337,13 +2973,100 @@
       }, 'image/png');
     }
 
+    // Stamp a discreet Momentum-Light footer on the bottom-right of the
+    // captured canvas so the exported PNG reads as a branded export
+    // (without covering timeline content). Painted directly into the
+    // bitmap — no DOM, no layout side effects.
+    function stampCanvas(canvas) {
+      const ctx = canvas.getContext('2d');
+      // Keep font size proportional to the canvas DPR scaling so the
+      // stamp stays readable whether the plan was captured at 1x or 2x.
+      const scale = Math.max(1, Math.min(2, canvas.width / 1600));
+      const fontPx = Math.round(12 * scale);
+      const padX = Math.round(10 * scale);
+      const padY = Math.round(7 * scale);
+      const text = `Momentum-Light · ${new Date().toLocaleString('fr-FR', {
+        day: '2-digit', month: '2-digit', year: 'numeric',
+        hour: '2-digit', minute: '2-digit',
+      })}`;
+      ctx.font = `600 ${fontPx}px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif`;
+      const w = Math.ceil(ctx.measureText(text).width) + padX * 2;
+      const h = fontPx + padY * 2;
+      const x = canvas.width - w - 12 * scale;
+      const y = canvas.height - h - 12 * scale;
+      ctx.fillStyle = 'rgba(9, 30, 66, 0.82)';
+      ctx.fillRect(x, y, w, h);
+      ctx.fillStyle = '#FFFFFF';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(text, x + padX, y + h / 2);
+    }
+
+    // Elements we hide from the captured image — ours (toast, how-to
+    // overlay) and Jira's transient UI (open menus, tooltips) so the
+    // PNG shows the timeline in its clean resting state.
+    function isCaptureChrome(el) {
+      if (!(el instanceof HTMLElement)) return false;
+      if (el.id === 'momentum-export-toast') return true;
+      if (el.id === HOWTO_BUTTON_ID) return true;
+      if (el.id === HOWTO_OVERLAY_ID) return true;
+      const role = el.getAttribute?.('role');
+      if (role === 'menu') return true;
+      if (role === 'tooltip') return true;
+      // Atlaskit renders transient overlays into a sibling portal layer.
+      // Skip the portal container entirely so unrelated popovers don't
+      // leak into the export.
+      if (el.classList?.contains('atlaskit-portal')) return true;
+      return false;
+    }
+
     async function runExport() {
-      log('exportPng: generating enriched PNG…');
-      const snap = await collectSnapshot();
-      const canvas = renderCanvas(snap);
-      const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-      downloadCanvas(canvas, `momentum-timeline-${stamp}.png`);
-      log('exportPng: done');
+      const toast = showToast('Momentum-Light — préparation de l\'export…');
+      try {
+        if (typeof window.html2canvas !== 'function') {
+          throw new Error(
+            'html2canvas introuvable — le userscript doit être chargé via '
+            + 'Tampermonkey/Violentmonkey pour que la directive @require '
+            + 'fournisse la dépendance.',
+          );
+        }
+        const root = findCaptureRoot();
+        // Give Jira a couple of rAF ticks to settle (pending paint from
+        // hover states, menu close animations, etc.) before we snapshot.
+        await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+        toast.update('Momentum-Light — rendu de la Timeline…');
+
+        log('exportPng: capturing', root);
+        const canvas = await window.html2canvas(root, {
+          backgroundColor: '#FFFFFF',
+          useCORS: true,
+          allowTaint: false,
+          logging: false,
+          // Scale governs the output resolution. Cap at 2× so wide plans
+          // don't generate 20 MB PNGs, but still match Retina clarity.
+          scale: Math.min(window.devicePixelRatio || 1, 2),
+          // Match the viewport Jira renders against. Without these,
+          // html2canvas sometimes clips the chart to the default 800×600.
+          windowWidth: document.documentElement.clientWidth,
+          windowHeight: document.documentElement.clientHeight,
+          ignoreElements: isCaptureChrome,
+          // Forward scroll position so the exported image matches the
+          // user's current view of the timeline.
+          scrollX: -window.scrollX,
+          scrollY: -window.scrollY,
+        });
+        stampCanvas(canvas);
+
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        downloadCanvas(canvas, `momentum-timeline-${stamp}.png`);
+        toast.update('Momentum-Light — export prêt ✓');
+        setTimeout(() => toast.hide(), 1400);
+        log('exportPng: done');
+      } catch (err) {
+        error('exportPng failed:', err?.message || err);
+        toast.update('Momentum-Light — échec de l\'export (voir console)');
+        setTimeout(() => toast.hide(), 3200);
+        throw err;
+      }
     }
 
     return { install };
@@ -4011,7 +3734,7 @@
     // Initial pass (in case the timeline is already rendered at document-idle).
     runActiveFeatures();
     log(
-      'loaded — version 0.7.0',
+      'loaded — version 0.7.1',
       isDebug()
         ? '(debug on)'
         : '(debug off — enable with: localStorage.setItem(\'momentum-light-debug\', \'1\'))',
