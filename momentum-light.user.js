@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.7.3
+// @version      0.7.4
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne, macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, menu « How-to » guidé qui surligne chaque feature au premier lancement, et surcharge du menu Export → Image (.png) qui capture la Timeline au format natif (via html2canvas) avec tous les overlays Momentum-Light visibles dessus.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -2766,29 +2766,27 @@
   //      adds "Image enrichie Momentum (.png)" right after the native item.
   //   2. On click we locate the capture root. Priority order:
   //        a. `#sr-timeline` — Plans / Advanced Roadmaps renders the whole
-  //           plan into this container at its intrinsic height, so
-  //           html2canvas gets every Epic and ticket in a single pass.
+  //           plan into this container, so html2canvas gets every Epic
+  //           and ticket currently in the DOM in a single pass.
   //        b. outermost `[data-testid^="roadmap.timeline-table-kit"]`.
   //        c. `[role="main"]` as a last resort.
   //      We hand the chosen root to html2canvas, which is bundled via the
   //      userscript `@require` directive so Atlassian's aggressive CSP
   //      never has to allow a runtime CDN fetch.
-  //   3. Fallback for virtualised roots: if the root has a descendant that
-  //      scrolls vertically (non-#sr-timeline case), we scroll it in
-  //      non-overlapping steps, capture each slice, then stitch them
-  //      vertically with the sticky header cropped off every slice past
-  //      the first so it doesn't repeat. Each slice waits ~450ms so the
-  //      virtualisation library and our own overlay decorator (200ms
-  //      debounce) have time to render. When the root is `#sr-timeline`
-  //      (preferred path) a single capture is enough.
+  //   3. Single-shot, viewport-only capture: we only snapshot what the
+  //      user can currently see. Plans virtualises its rows, so trying
+  //      to scroll-and-stitch ends up fighting the framework and produces
+  //      artefacts (misaligned seams, ghost rows, sticky headers repeated
+  //      down the page). If the user wants to cover a plan that overflows
+  //      their viewport, they scroll and export again — stitching two or
+  //      three PNGs manually is simpler and more reliable than doing it
+  //      in-browser.
   //   4. We stamp a discreet Momentum-Light footer into the bottom-right
   //      corner so the PNG reads as a branded export.
   //   5. The resulting canvas is downloaded as `momentum-timeline-<iso>.png`.
   //
-  // UX: a floating toast reports progress ("rendu de la Timeline…", or
-  // "capture X/Y…" + "assemblage…" on the stitched path, followed by
-  // "export prêt ✓") so the user can follow along — wide plans can take
-  // a few seconds.
+  // UX: a floating toast reports progress ("rendu de la Timeline…" →
+  // "export prêt ✓") so the user knows the click registered.
   // ---------------------------------------------------------------------------
 
   const exportPng = (() => {
@@ -3041,85 +3039,15 @@
     }
 
     // ------------------------------------------------------------------
-    // Virtualisation-aware capture
+    // Capture — single-shot, viewport-only
     //
-    // Plans / Advanced Roadmaps virtualise the timeline rows — only the
-    // rows currently in the viewport exist in the DOM, the rest are
-    // placeholder whitespace that html2canvas faithfully captures as a
-    // long grey bar. To produce a PNG that actually shows *every* Epic we
-    // scroll the inner list in non-overlapping steps, capture each slice,
-    // then stitch them vertically (cropping the sticky header on every
-    // slice past the first so it doesn't repeat).
+    // We deliberately capture only what's currently on screen. Plans
+    // virtualises its rows, so trying to scroll-and-stitch a taller frame
+    // fights the framework and produces artefacts. If the user wants to
+    // export a plan that overflows their viewport, they just scroll and
+    // click the export entry again — two or three PNGs stitched by the
+    // user in their image viewer is more reliable than us doing it here.
     // ------------------------------------------------------------------
-
-    // Find the inner vertical scroll container of the capture root. This is
-    // the element whose scrollHeight > clientHeight — typically a wrapper
-    // around the list/chart body. We pick the candidate with the most
-    // overflow since Atlaskit nests a few overflow:auto layers.
-    function findInnerVerticalScroll(root) {
-      const candidates = [];
-      const stack = [root];
-      while (stack.length) {
-        const el = stack.pop();
-        if (!(el instanceof HTMLElement)) continue;
-        // Only inspect reasonably-sized elements to skip tiny inner
-        // overflow:auto cells (cell content truncation tooltips etc.).
-        if (el.clientHeight < 120) {
-          for (const c of el.children) stack.push(c);
-          continue;
-        }
-        const style = getComputedStyle(el);
-        const oy = style.overflowY;
-        if ((oy === 'auto' || oy === 'scroll') && el.scrollHeight > el.clientHeight + 2) {
-          candidates.push(el);
-        }
-        for (const c of el.children) stack.push(c);
-      }
-      if (!candidates.length) return null;
-      candidates.sort(
-        (a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight),
-      );
-      return candidates[0];
-    }
-
-    // Measure the height of the sticky header area at the top of the
-    // capture root. We use it to crop each non-first slice so the header
-    // doesn't repeat in the stitched PNG. Returns 0 when no sticky header
-    // is detected — the stitching code handles that cleanly.
-    function measureStickyHeaderHeight(root) {
-      const rootRect = root.getBoundingClientRect();
-      let maxBottom = 0;
-      for (const el of root.querySelectorAll('*')) {
-        if (!(el instanceof HTMLElement)) continue;
-        const style = getComputedStyle(el);
-        const pos = style.position;
-        if (pos !== 'sticky' && pos !== 'fixed') continue;
-        const rect = el.getBoundingClientRect();
-        // Must stick to the top of the root (within a 12px tolerance to
-        // account for sub-pixel rounding and thin borders).
-        if (Math.abs(rect.top - rootRect.top) > 12) continue;
-        maxBottom = Math.max(maxBottom, rect.bottom - rootRect.top);
-      }
-      return Math.round(maxBottom);
-    }
-
-    // Wait long enough for:
-    //   1. React/virtualisation to render the new row slice after a scroll.
-    //   2. Our MutationObserver (debounced 200ms) to decorate the fresh bars
-    //      with Momentum-Light overlays.
-    //   3. Any pending paint to commit.
-    // Sum of debounces + a small margin → 450ms is reliable without being
-    // painful on small plans.
-    function waitForVirtualRender() {
-      return new Promise((r) => {
-        requestAnimationFrame(() => {
-          requestAnimationFrame(() => {
-            setTimeout(r, 450);
-          });
-        });
-      });
-    }
-
     function html2canvasOpts() {
       return {
         backgroundColor: '#FFFFFF',
@@ -3137,92 +3065,6 @@
       };
     }
 
-    // Stitch an ordered list of per-slice canvases into a single canvas,
-    // cropping off the first `stickyPx` pixels from every slice past the
-    // first so the repeated header isn't duplicated in the final PNG.
-    function stitchVertical(slices, stickyPx) {
-      if (slices.length === 1) return slices[0];
-      const W = slices[0].width;
-      let H = slices[0].height;
-      for (let i = 1; i < slices.length; i += 1) {
-        H += Math.max(1, slices[i].height - stickyPx);
-      }
-      const out = document.createElement('canvas');
-      out.width = W;
-      out.height = H;
-      const ctx = out.getContext('2d');
-      ctx.fillStyle = '#FFFFFF';
-      ctx.fillRect(0, 0, W, H);
-      let y = 0;
-      for (let i = 0; i < slices.length; i += 1) {
-        const c = slices[i];
-        if (i === 0) {
-          ctx.drawImage(c, 0, y);
-          y += c.height;
-        } else {
-          const srcY = Math.min(stickyPx, c.height - 1);
-          const srcH = c.height - srcY;
-          ctx.drawImage(c, 0, srcY, c.width, srcH, 0, y, c.width, srcH);
-          y += srcH;
-        }
-      }
-      return out;
-    }
-
-    async function captureTimeline(root, toast) {
-      const scroller = findInnerVerticalScroll(root);
-      // No virtualisation (short plan that fits in view) → a single capture
-      // is enough.
-      if (!scroller || scroller.scrollHeight <= scroller.clientHeight + 2) {
-        toast.update('Momentum-Light — rendu de la Timeline…');
-        await waitForVirtualRender();
-        return window.html2canvas(root, html2canvasOpts());
-      }
-
-      const origScroll = scroller.scrollTop;
-      const viewH = scroller.clientHeight;
-      const totalH = scroller.scrollHeight;
-      const extra = totalH - viewH;
-
-      // Stride: advance by the viewport minus the sticky header so the rows
-      // hidden behind the header in one slice become fully visible in the
-      // next. If we can't detect the header we stride by the full viewport
-      // and accept that a small sliver may be clipped at each boundary.
-      const stickyH = measureStickyHeaderHeight(root);
-      const stride = Math.max(120, viewH - stickyH - 24);
-
-      // Enumerate target scrollTop positions up-front so we can report
-      // accurate "capture X/Y" progress to the user.
-      const targets = [];
-      for (let pos = 0; pos < extra + stride; pos += stride) {
-        targets.push(Math.min(pos, extra));
-        if (pos >= extra) break;
-      }
-      // Deduplicate consecutive duplicates that appear on short lists.
-      const uniqueTargets = targets.filter((t, i) => i === 0 || t !== targets[i - 1]);
-
-      const slices = [];
-      for (let i = 0; i < uniqueTargets.length; i += 1) {
-        toast.update(
-          `Momentum-Light — capture ${i + 1}/${uniqueTargets.length}…`,
-        );
-        scroller.scrollTop = uniqueTargets[i];
-        await waitForVirtualRender();
-        const canvas = await window.html2canvas(root, html2canvasOpts());
-        slices.push(canvas);
-      }
-
-      // Restore scroll so the user's view is left untouched.
-      scroller.scrollTop = origScroll;
-
-      toast.update('Momentum-Light — assemblage…');
-      // Scale between CSS pixels and bitmap pixels (html2canvas applies
-      // `scale`) — translate the CSS sticky height into bitmap rows.
-      const scale = slices[0].height / root.getBoundingClientRect().height;
-      const stickyPx = Math.max(0, Math.round(stickyH * scale));
-      return stitchVertical(slices, stickyPx);
-    }
-
     async function runExport() {
       const toast = showToast('Momentum-Light — préparation de l\'export…');
       try {
@@ -3238,8 +3080,9 @@
         // hover states, menu close animations, etc.) before we snapshot.
         await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
 
+        toast.update('Momentum-Light — rendu de la Timeline…');
         log('exportPng: capturing', root);
-        const canvas = await captureTimeline(root, toast);
+        const canvas = await window.html2canvas(root, html2canvasOpts());
         stampCanvas(canvas);
 
         const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
@@ -3920,7 +3763,7 @@
     // Initial pass (in case the timeline is already rendered at document-idle).
     runActiveFeatures();
     log(
-      'loaded — version 0.7.3',
+      'loaded — version 0.7.4',
       isDebug()
         ? '(debug on)'
         : '(debug off — enable with: localStorage.setItem(\'momentum-light-debug\', \'1\'))',
