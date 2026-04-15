@@ -1,12 +1,13 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.6.2
-// @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne, macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, et menu « How-to » guidé qui surligne chaque feature au premier lancement.
+// @version      0.7.8
+// @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne, macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, menu « How-to » guidé qui surligne chaque feature au premier lancement, et surcharge du menu Export → Image (.png) qui capture la Timeline au format natif (via html2canvas) avec tous les overlays Momentum-Light visibles dessus.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
 // @run-at       document-idle
 // @grant        none
+// @require      https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js
 // @updateURL    https://raw.githubusercontent.com/corentinpoisson44-collab/Momentum-Light/main/momentum-light.user.js
 // @downloadURL  https://raw.githubusercontent.com/corentinpoisson44-collab/Momentum-Light/main/momentum-light.user.js
 // ==/UserScript==
@@ -2749,6 +2750,436 @@
   })();
 
   // ---------------------------------------------------------------------------
+  // exportPng — intercepts the native Plans/Timeline "Export" popover and
+  // injects a companion menu entry "Image enrichie Momentum (.png)" right
+  // after the native "Image (.png)" item.
+  //
+  // Unlike Jira's native PNG export (which rasterises server-side from the
+  // raw plan data and therefore loses every Momentum-Light overlay), this
+  // export captures the live DOM of the timeline — epic progress bars, SP
+  // labels, T-Shirt badges, confidence washes, sprint-fill chips and the
+  // velocity banner are all included in the final image, pixel-identical
+  // to what the user sees on screen.
+  //
+  // Implementation:
+  //   1. Menu MutationObserver spots the Export popover when it opens and
+  //      adds "Image enrichie Momentum (.png)" right after the native item.
+  //   2. On click we locate the capture root. Priority order:
+  //        a. `#sr-timeline` — Plans / Advanced Roadmaps renders the whole
+  //           plan into this container, so html2canvas gets every Epic
+  //           and ticket currently in the DOM in a single pass.
+  //        b. outermost `[data-testid^="roadmap.timeline-table-kit"]`.
+  //        c. `[role="main"]` as a last resort.
+  //      We hand the chosen root to html2canvas, which is bundled via the
+  //      userscript `@require` directive so Atlassian's aggressive CSP
+  //      never has to allow a runtime CDN fetch.
+  //   3. Single-shot, viewport-only capture: we only snapshot what the
+  //      user can currently see. Plans virtualises its rows, so trying
+  //      to scroll-and-stitch ends up fighting the framework and produces
+  //      artefacts (misaligned seams, ghost rows, sticky headers repeated
+  //      down the page). If the user wants to cover a plan that overflows
+  //      their viewport, they scroll and export again — stitching two or
+  //      three PNGs manually is simpler and more reliable than doing it
+  //      in-browser.
+  //   4. The resulting canvas is downloaded as `momentum-timeline-<iso>.png`.
+  //
+  // UX: a floating toast reports progress ("rendu de la Timeline…" →
+  // "export prêt ✓") so the user knows the click registered.
+  // ---------------------------------------------------------------------------
+
+  const exportPng = (() => {
+    let installed = false;
+    // Match both EN ("Image (.png)") and FR ("Image (.png)") — Atlaskit keeps
+    // the ".png" suffix across locales, so the token is enough to key off.
+    // Guarded against false positives by requiring the word "image" near it.
+    const IMAGE_LABEL = /image[^]*\.\s*png/i;
+    const INJECTED_ATTR = 'data-momentum-export-injected';
+    const ITEM_ATTR = 'data-momentum-export-item';
+
+    function textLeafMatching(root, rx) {
+      // Find the deepest element whose own trimmed textContent matches `rx`.
+      // We purposefully avoid TreeWalker on text nodes here because Atlaskit
+      // wraps labels in a couple of <span>s we want to preserve for styling.
+      const all = [...root.querySelectorAll('*')];
+      for (let i = all.length - 1; i >= 0; i -= 1) {
+        const el = all[i];
+        if (el.children.length > 0) continue;
+        const t = (el.textContent || '').trim();
+        if (t && rx.test(t)) return el;
+      }
+      return null;
+    }
+
+    function findImagePngItem(menu) {
+      const items = menu.querySelectorAll('[role="menuitem"]');
+      for (const item of items) {
+        const t = (item.textContent || '').trim();
+        if (IMAGE_LABEL.test(t)) return item;
+      }
+      return null;
+    }
+
+    function closeOpenMenus() {
+      // Atlaskit popovers close on Escape. Firing it at document level
+      // propagates to the open menu without needing a reference to it.
+      document.dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }),
+      );
+    }
+
+    function injectEnrichedEntry(menu) {
+      if (menu.getAttribute(INJECTED_ATTR) === '1') return;
+      const native = findImagePngItem(menu);
+      if (!native) return;
+      menu.setAttribute(INJECTED_ATTR, '1');
+
+      // Clone to inherit Atlaskit styling (focus ring, hover, spacing).
+      const enriched = native.cloneNode(true);
+      enriched.setAttribute(ITEM_ATTR, '1');
+      // Strip attributes that would make the clone collide with the native
+      // item (React keys, aria IDs).
+      enriched.removeAttribute('id');
+      enriched.removeAttribute('aria-describedby');
+
+      const leaf = textLeafMatching(enriched, IMAGE_LABEL)
+        || (IMAGE_LABEL.test(enriched.textContent || '') ? enriched : null);
+      if (leaf) leaf.textContent = 'Image enrichie Momentum (.png)';
+
+      // Swap the click handler. `capture:true` + stopImmediatePropagation
+      // beats Atlaskit's own delegate — we don't want Jira to also trigger
+      // its native export pipeline.
+      enriched.addEventListener(
+        'click',
+        (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          e.stopImmediatePropagation();
+          closeOpenMenus();
+          runExport().catch((err) => warn('export failed:', err?.message || err));
+        },
+        true,
+      );
+      // Keyboard parity — Atlaskit menu items fire on Enter/Space too.
+      enriched.addEventListener(
+        'keydown',
+        (e) => {
+          if (e.key !== 'Enter' && e.key !== ' ') return;
+          e.preventDefault();
+          e.stopPropagation();
+          e.stopImmediatePropagation();
+          closeOpenMenus();
+          runExport().catch((err) => warn('export failed:', err?.message || err));
+        },
+        true,
+      );
+
+      native.parentNode.insertBefore(enriched, native.nextSibling);
+      debug('exportPng: enriched menu entry injected');
+    }
+
+    function install() {
+      if (installed) return;
+      installed = true;
+      const obs = new MutationObserver((muts) => {
+        for (const m of muts) {
+          for (const n of m.addedNodes) {
+            if (!(n instanceof HTMLElement)) continue;
+            const menus = n.matches?.('[role="menu"]')
+              ? [n]
+              : [...(n.querySelectorAll?.('[role="menu"]') || [])];
+            for (const menu of menus) injectEnrichedEntry(menu);
+          }
+        }
+      });
+      obs.observe(document.body, { childList: true, subtree: true });
+    }
+
+    // ------------------------------------------------------------------
+    // Capture root detection — we want the outermost Advanced Roadmaps
+    // container so the exported PNG matches the live layout (list + chart +
+    // sprint chips row, with our overlays in place). Fallbacks keep the
+    // feature working even if Atlassian's testid taxonomy shifts.
+    // ------------------------------------------------------------------
+
+    function findCaptureRoot() {
+      // Strategy 1 — the `#sr-timeline` element. Plans / Advanced Roadmaps
+      // renders the whole plan into this container at its intrinsic height,
+      // so html2canvas gets every Epic / ticket in a single pass — no
+      // virtualisation scroll-and-stitch required. If it's present, always
+      // prefer it over the Atlaskit testid wrappers (which can expose only
+      // the currently-visible rows).
+      const sr = document.getElementById('sr-timeline');
+      if (sr instanceof HTMLElement) return sr;
+      // Strategy 2 — outermost `[data-testid^="roadmap.timeline-table-kit"]`.
+      // That prefix is stable on Plans / Advanced Roadmaps and wraps the
+      // entire timeline table (list side + chart side + header rows).
+      const kitHits = [...document.querySelectorAll('[data-testid]')].filter((el) => {
+        const tid = el.getAttribute('data-testid') || '';
+        return tid.startsWith('roadmap.timeline-table-kit');
+      });
+      if (kitHits.length) {
+        // Outermost = the one that contains the most other hits.
+        let best = null;
+        let bestCount = -1;
+        for (const el of kitHits) {
+          const count = kitHits.reduce((acc, other) => acc + (el.contains(other) ? 1 : 0), 0);
+          if (count > bestCount) { best = el; bestCount = count; }
+        }
+        if (best) return best;
+      }
+      // Strategy 3 — Jira main region (works for the native Timeline view
+      // inside boards & project roadmaps, not just Plans).
+      const main = document.querySelector('[role="main"]') || document.querySelector('main');
+      if (main) return main;
+      // Last resort so the feature at least produces something.
+      return document.body;
+    }
+
+    // ------------------------------------------------------------------
+    // Loading toast — html2canvas takes a couple of seconds on large
+    // plans, so we surface progress so the user doesn't wonder whether
+    // their click registered.
+    // ------------------------------------------------------------------
+
+    function showToast(text) {
+      const toast = document.createElement('div');
+      toast.id = 'momentum-export-toast';
+      toast.textContent = text;
+      Object.assign(toast.style, {
+        position: 'fixed',
+        top: '20px',
+        left: '50%',
+        transform: 'translateX(-50%)',
+        padding: '10px 18px',
+        background: 'rgba(9, 30, 66, 0.88)',
+        color: '#FFFFFF',
+        borderRadius: '6px',
+        fontSize: '13px',
+        fontWeight: '500',
+        fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+        zIndex: '99999',
+        boxShadow: '0 4px 12px rgba(0,0,0,0.18)',
+        pointerEvents: 'none',
+        transition: 'opacity 200ms ease-out',
+      });
+      document.body.appendChild(toast);
+      return {
+        update(t) { toast.textContent = t; },
+        hide() {
+          toast.style.opacity = '0';
+          setTimeout(() => toast.remove(), 250);
+        },
+      };
+    }
+
+    function downloadCanvas(canvas, filename) {
+      canvas.toBlob((blob) => {
+        if (!blob) {
+          warn('exportPng: toBlob returned null');
+          return;
+        }
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        // Revoke after a tick — Safari needs the blob to survive the click.
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      }, 'image/png');
+    }
+
+    // Elements we hide from the captured image — ours (toast, how-to
+    // overlay) and Jira's transient UI (open menus, tooltips) so the
+    // PNG shows the timeline in its clean resting state.
+    function isCaptureChrome(el) {
+      if (!(el instanceof HTMLElement)) return false;
+      if (el.id === 'momentum-export-toast') return true;
+      if (el.id === HOWTO_BUTTON_ID) return true;
+      if (el.id === HOWTO_OVERLAY_ID) return true;
+      const role = el.getAttribute?.('role');
+      if (role === 'menu') return true;
+      if (role === 'tooltip') return true;
+      // Atlaskit renders transient overlays into a sibling portal layer.
+      // Skip the portal container entirely so unrelated popovers don't
+      // leak into the export.
+      if (el.classList?.contains('atlaskit-portal')) return true;
+      return false;
+    }
+
+    // ------------------------------------------------------------------
+    // Discovery hatching — inject temporary canvases so html2canvas
+    // can capture them natively
+    //
+    // Low/medium-confidence Epic bars still in Discovery are marked with
+    // diagonal white stripes via `::after { background-image:
+    // repeating-linear-gradient(45deg, ...) }`. html2canvas 1.4.1 drops
+    // that gradient on pseudo-elements — the stripes are missing from
+    // the PNG even though the `::before` wash makes it through.
+    //
+    // Earlier attempts tried to paint the hatch onto the returned canvas
+    // by mapping each overlay's viewport rect through the capture root's
+    // rect + scale, but that proved fragile (the hatching landed at the
+    // wrong Y across the whole export). Instead we:
+    //   1. Append a real `<canvas>` child to every eligible overlay,
+    //      sized to the overlay via inset:0, filled with the hatch
+    //      pattern at the current DPR.
+    //   2. Suppress the CSS `::after` hatch globally via a throwaway
+    //      <style> tag so the live view doesn't double up.
+    //   3. Run html2canvas — it captures the <canvas> children natively,
+    //      no coordinate math required, because the browser's own
+    //      layout engine has already placed them exactly where the
+    //      `::after` would have been.
+    //   4. Remove the injected canvases and the <style> in `finally`.
+    //
+    // The browser sees the same visual both before and during the export
+    // (swapping one hatch for a pixel-equivalent one), so there's no
+    // flicker beyond maybe a single frame at cleanup.
+    // ------------------------------------------------------------------
+
+    // Draw the 45° hatch into a canvas sized `w × h` at the given DPR.
+    // Matches the CSS `repeating-linear-gradient(45deg, transparent 0
+    // 5px, rgba(255,255,255,0.22) 5px 9px)`: stripes perpendicular to a
+    // 45° axis with a 9px period and 4px opaque band per period.
+    function drawHatchInto(ctx, w, h, dpr) {
+      ctx.save();
+      ctx.scale(dpr, dpr);
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.22)';
+      ctx.lineWidth = 4;
+      ctx.lineCap = 'square';
+      ctx.beginPath();
+      const period = 9 * Math.SQRT2;
+      // Stripes go top-left → bottom-right. Starting x ranges from -h
+      // (so a stripe starting above-left of the rect reaches the top
+      // edge) through w (so the last stripe starts past the right
+      // edge). Each stripe is `h` long so it always crosses the rect.
+      for (let ax = -h; ax < w + period; ax += period) {
+        ctx.moveTo(ax, 0);
+        ctx.lineTo(ax + h, h);
+      }
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    function injectDiscoveryHatchCanvases() {
+      const overlays = document.querySelectorAll(
+        `.${OVERLAY_CLASS}[data-discovery][data-confidence="low"],`
+        + `.${OVERLAY_CLASS}[data-discovery][data-confidence="medium"]`,
+      );
+      const injections = [];
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      for (const overlay of overlays) {
+        if (!(overlay instanceof HTMLElement)) continue;
+        if (overlay.classList.contains(OVERLAY_ESTIMATE_MOD)) continue;
+        if (overlay.classList.contains(OVERLAY_SPRINT_FILL_MOD)) continue;
+        const w = overlay.offsetWidth;
+        const h = overlay.offsetHeight;
+        if (!w || !h) continue;
+
+        const c = document.createElement('canvas');
+        c.width = Math.ceil(w * dpr);
+        c.height = Math.ceil(h * dpr);
+        c.style.cssText =
+          'position:absolute;inset:0;width:100%;height:100%;'
+          + 'pointer-events:none;border-radius:inherit;z-index:1;';
+        c.setAttribute('data-momentum-export-hatch', '');
+        drawHatchInto(c.getContext('2d'), w, h, dpr);
+        overlay.appendChild(c);
+        injections.push(c);
+      }
+      log(`exportPng: injected ${injections.length} hatch canvas(es)`);
+      return injections;
+    }
+
+    // Globally hide the CSS `::after` hatch while our injected canvases
+    // are in play, so the live screen doesn't render two layers stacked
+    // (which would read as darker stripes). Returns the <style> node so
+    // the caller can remove it when export is done.
+    function suppressCssHatch() {
+      const style = document.createElement('style');
+      style.id = 'momentum-export-hatch-suppressor';
+      style.textContent = `.${OVERLAY_CLASS}::after { display: none !important; }`;
+      document.head.appendChild(style);
+      return style;
+    }
+
+    // ------------------------------------------------------------------
+    // Capture — single-shot, viewport-only
+    //
+    // We deliberately capture only what's currently on screen. Plans
+    // virtualises its rows, so trying to scroll-and-stitch a taller frame
+    // fights the framework and produces artefacts. If the user wants to
+    // export a plan that overflows their viewport, they just scroll and
+    // click the export entry again — two or three PNGs stitched by the
+    // user in their image viewer is more reliable than us doing it here.
+    // ------------------------------------------------------------------
+    function html2canvasOpts() {
+      return {
+        backgroundColor: '#FFFFFF',
+        useCORS: true,
+        allowTaint: false,
+        logging: false,
+        // Cap at 2× so wide plans don't produce 20 MB PNGs, but still
+        // match Retina clarity on HiDPI displays.
+        scale: Math.min(window.devicePixelRatio || 1, 2),
+        windowWidth: document.documentElement.clientWidth,
+        windowHeight: document.documentElement.clientHeight,
+        ignoreElements: isCaptureChrome,
+        scrollX: -window.scrollX,
+        scrollY: -window.scrollY,
+      };
+    }
+
+    async function runExport() {
+      const toast = showToast('Momentum-Light — préparation de l\'export…');
+      try {
+        if (typeof window.html2canvas !== 'function') {
+          throw new Error(
+            'html2canvas introuvable — le userscript doit être chargé via '
+            + 'Tampermonkey/Violentmonkey pour que la directive @require '
+            + 'fournisse la dépendance.',
+          );
+        }
+        const root = findCaptureRoot();
+        // Give Jira a couple of rAF ticks to settle (pending paint from
+        // hover states, menu close animations, etc.) before we snapshot.
+        await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+
+        // Swap the CSS `::after` hatch for live <canvas> children so
+        // html2canvas can capture the stripes (it can't render
+        // `repeating-linear-gradient` on pseudo-elements reliably).
+        // Both operations are guarded by `finally` so the DOM is left
+        // clean even if the capture throws.
+        const suppressor = suppressCssHatch();
+        const injections = injectDiscoveryHatchCanvases();
+        let canvas;
+        try {
+          toast.update('Momentum-Light — rendu de la Timeline…');
+          log('exportPng: capturing', root);
+          canvas = await window.html2canvas(root, html2canvasOpts());
+        } finally {
+          for (const c of injections) c.remove();
+          suppressor.remove();
+        }
+
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        downloadCanvas(canvas, `momentum-timeline-${stamp}.png`);
+        toast.update('Momentum-Light — export prêt ✓');
+        setTimeout(() => toast.hide(), 1400);
+        log('exportPng: done');
+      } catch (err) {
+        error('exportPng failed:', err?.message || err);
+        toast.update('Momentum-Light — échec de l\'export (voir console)');
+        setTimeout(() => toast.hide(), 3200);
+        throw err;
+      }
+    }
+
+    return { install };
+  })();
+
+  // ---------------------------------------------------------------------------
   // Feature registry — add future Momentum features here
   // ---------------------------------------------------------------------------
 
@@ -3391,6 +3822,7 @@
   function bootstrap() {
     ensureStyles();
     tooltipInterceptor.install();
+    exportPng.install();
     // Two debounces: the DOM one is conservative (coalesces Jira's re-render
     // storm), the API one is tight — once the server has acknowledged a sprint
     // mutation the user is waiting on the overlay, so we want the refresh to
@@ -3409,7 +3841,7 @@
     // Initial pass (in case the timeline is already rendered at document-idle).
     runActiveFeatures();
     log(
-      'loaded — version 0.4.0',
+      'loaded — version 0.7.8',
       isDebug()
         ? '(debug on)'
         : '(debug off — enable with: localStorage.setItem(\'momentum-light-debug\', \'1\'))',
