@@ -25,6 +25,7 @@ Les mises à jour sont poussées automatiquement (Tampermonkey vérifie le `@upd
 | 3 | **Sprint Velocity** — chip intégrée dans le toolbar de la Timeline, affichant la vélocité moyenne des 5 derniers sprints clos. | ✅ v0.2.1 |
 | 4 | **Sprint Fill Indicator** — barre de remplissage dans chaque chip de sprint actif/futur de la ligne « Sprints », comparant le SP chargé à la vélocité moyenne (vert < 90 %, ambre 90–110 %, rouge > 110 %). | ✅ v0.3.0 |
 | 5 | **How-to Menu** — bouton flottant `?` qui lance une visite guidée surlignant chaque feature, étape par étape, avec boutons _Précédent_ / _Suivant_ / _Passer_. Auto-lancé au premier chargement d'une Timeline, puis accessible à tout moment via le bouton. | ✅ v0.4.0 |
+| 6 | **Export enrichi (.png)** — injecte une entrée `Image enrichie Momentum (.png)` dans le menu natif `… › Export` de la Timeline. Génère un PNG autonome rendu sur `<canvas>` résumant la vélocité (moyenne + détail sprint par sprint), la charge des sprints actifs/futurs vs. la vélocité (état under / on-target / over), et la liste des Epics visibles avec progression SP, confiance et macro-estimation T-Shirt. | ✅ v0.7.0 |
 
 ### Configuration
 
@@ -50,6 +51,7 @@ Structure interne :
 - `sprintChipDom` — détection des chips de sprint dans la ligne « Sprints » + injection d'un overlay de remplissage coloré
 - `velocityBanner` — bandeau fixe sur les vues timeline/plan
 - `howto` — bouton flottant `?` + overlay de visite guidée (spotlight + carte étape par étape, navigable via _Précédent_ / _Suivant_ / _Passer_, auto-lancée une fois par navigateur)
+- `exportPng` — surcharge du menu natif `… › Export` : observe les popovers Atlaskit, injecte une entrée `Image enrichie Momentum (.png)` après `Image (.png)`, lit les tooltips décorés par les overlays pour reconstruire l'état courant, puis rend un résumé (vélocité, charge des sprints, Epics, tickets) directement sur un `<canvas>` 2D — aucune conversion DOM→PNG, donc pas de souci d'origine croisée sur les avatars
 - `features[]` — registre des features, avec cycle de vie `onMutation` / `onInactive`
 
 ## Licence
