@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.7.4
+// @version      0.7.5
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne, macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, menu « How-to » guidé qui surligne chaque feature au premier lancement, et surcharge du menu Export → Image (.png) qui capture la Timeline au format natif (via html2canvas) avec tous les overlays Momentum-Light visibles dessus.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -2781,9 +2781,7 @@
   //      their viewport, they scroll and export again — stitching two or
   //      three PNGs manually is simpler and more reliable than doing it
   //      in-browser.
-  //   4. We stamp a discreet Momentum-Light footer into the bottom-right
-  //      corner so the PNG reads as a branded export.
-  //   5. The resulting canvas is downloaded as `momentum-timeline-<iso>.png`.
+  //   4. The resulting canvas is downloaded as `momentum-timeline-<iso>.png`.
   //
   // UX: a floating toast reports progress ("rendu de la Timeline…" →
   // "export prêt ✓") so the user knows the click registered.
@@ -2992,34 +2990,6 @@
       }, 'image/png');
     }
 
-    // Stamp a discreet Momentum-Light footer on the bottom-right of the
-    // captured canvas so the exported PNG reads as a branded export
-    // (without covering timeline content). Painted directly into the
-    // bitmap — no DOM, no layout side effects.
-    function stampCanvas(canvas) {
-      const ctx = canvas.getContext('2d');
-      // Keep font size proportional to the canvas DPR scaling so the
-      // stamp stays readable whether the plan was captured at 1x or 2x.
-      const scale = Math.max(1, Math.min(2, canvas.width / 1600));
-      const fontPx = Math.round(12 * scale);
-      const padX = Math.round(10 * scale);
-      const padY = Math.round(7 * scale);
-      const text = `Momentum-Light · ${new Date().toLocaleString('fr-FR', {
-        day: '2-digit', month: '2-digit', year: 'numeric',
-        hour: '2-digit', minute: '2-digit',
-      })}`;
-      ctx.font = `600 ${fontPx}px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif`;
-      const w = Math.ceil(ctx.measureText(text).width) + padX * 2;
-      const h = fontPx + padY * 2;
-      const x = canvas.width - w - 12 * scale;
-      const y = canvas.height - h - 12 * scale;
-      ctx.fillStyle = 'rgba(9, 30, 66, 0.82)';
-      ctx.fillRect(x, y, w, h);
-      ctx.fillStyle = '#FFFFFF';
-      ctx.textBaseline = 'middle';
-      ctx.fillText(text, x + padX, y + h / 2);
-    }
-
     // Elements we hide from the captured image — ours (toast, how-to
     // overlay) and Jira's transient UI (open menus, tooltips) so the
     // PNG shows the timeline in its clean resting state.
@@ -3083,7 +3053,6 @@
         toast.update('Momentum-Light — rendu de la Timeline…');
         log('exportPng: capturing', root);
         const canvas = await window.html2canvas(root, html2canvasOpts());
-        stampCanvas(canvas);
 
         const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
         downloadCanvas(canvas, `momentum-timeline-${stamp}.png`);
@@ -3763,7 +3732,7 @@
     // Initial pass (in case the timeline is already rendered at document-idle).
     runActiveFeatures();
     log(
-      'loaded — version 0.7.4',
+      'loaded — version 0.7.5',
       isDebug()
         ? '(debug on)'
         : '(debug off — enable with: localStorage.setItem(\'momentum-light-debug\', \'1\'))',
