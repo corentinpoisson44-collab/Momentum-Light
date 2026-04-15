@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.7.6
+// @version      0.7.7
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne, macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, menu « How-to » guidé qui surligne chaque feature au premier lancement, et surcharge du menu Export → Image (.png) qui capture la Timeline au format natif (via html2canvas) avec tous les overlays Momentum-Light visibles dessus.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -3016,8 +3016,13 @@
     // repeating-linear-gradient(45deg, ...) }`. html2canvas 1.4.1 doesn't
     // render that pattern on pseudo-elements reliably — the stripes drop
     // out of the PNG even though the translucent wash on `::before` is
-    // captured correctly. We paint the hatch directly onto the returned
-    // canvas using a tiled CanvasPattern, which is bulletproof.
+    // captured correctly.
+    //
+    // Fix: draw each diagonal stripe directly onto the returned canvas,
+    // one by one, clipped to the bar's rounded rect. We use the simple
+    // stroke-per-line approach rather than a CanvasPattern tile because
+    // the tile approach requires a delicate seamless-tiling dance that's
+    // easy to get wrong, whereas `moveTo/lineTo` strokes always render.
     //
     // We enumerate the live DOM (what the user sees right now) and match
     // each eligible overlay to a rect on the canvas via the capture
@@ -3029,29 +3034,19 @@
       const scale = canvas.width / rootRect.width;
       const ctx = canvas.getContext('2d');
 
-      // Build a tileable diagonal-hatch pattern at the capture's DPR.
-      // The tile is a square with one stripe running corner-to-corner
-      // plus two half-stubs at the opposite corners so repeats chain
-      // seamlessly along both axes.
-      const tileSize = Math.max(4, Math.round(9 * Math.SQRT2 * scale));
-      const tile = document.createElement('canvas');
-      tile.width = tile.height = tileSize;
-      const tctx = tile.getContext('2d');
-      tctx.strokeStyle = 'rgba(255, 255, 255, 0.22)';
-      tctx.lineWidth = Math.max(1, Math.round(4 * scale));
-      tctx.lineCap = 'square';
-      tctx.beginPath();
-      tctx.moveTo(-1, 1); tctx.lineTo(1, -1);
-      tctx.moveTo(0, tileSize); tctx.lineTo(tileSize, 0);
-      tctx.moveTo(tileSize - 1, tileSize + 1); tctx.lineTo(tileSize + 1, tileSize - 1);
-      tctx.stroke();
-      const pattern = ctx.createPattern(tile, 'repeat');
-      if (!pattern) return;
-
       const overlays = document.querySelectorAll(
         `.${OVERLAY_CLASS}[data-discovery][data-confidence="low"],`
         + `.${OVERLAY_CLASS}[data-discovery][data-confidence="medium"]`,
       );
+      log(`paintDiscoveryHatching: ${overlays.length} candidate overlay(s)`);
+
+      // Matches the CSS `repeating-linear-gradient(45deg, transparent 0 5px,
+      // rgba(255,255,255,0.22) 5px 9px)` — a 9px period along the gradient
+      // axis becomes 9*√2 ≈ 12.73px horizontal stride for a 45° stripe set.
+      const period = Math.max(6, 9 * Math.SQRT2) * scale;
+      const lineWidth = Math.max(2, 4 * scale);
+
+      let painted = 0;
       for (const overlay of overlays) {
         if (!(overlay instanceof HTMLElement)) continue;
         // Variants that don't receive the hatch in CSS — mirror that here.
@@ -3064,7 +3059,7 @@
         const y = (rect.top - rootRect.top) * scale;
         const w = rect.width * scale;
         const h = rect.height * scale;
-        // Skip overlays that fall fully outside the captured region.
+        // Skip overlays fully outside the captured region.
         if (x + w <= 0 || y + h <= 0 || x >= canvas.width || y >= canvas.height) {
           continue;
         }
@@ -3073,6 +3068,7 @@
         const r = Math.min(brPx * scale, w / 2, h / 2);
 
         ctx.save();
+        // Clip to the overlay's rounded rect so stripes stop at the bar edge.
         ctx.beginPath();
         ctx.moveTo(x + r, y);
         ctx.arcTo(x + w, y, x + w, y + h, r);
@@ -3081,10 +3077,24 @@
         ctx.arcTo(x, y, x + w, y, r);
         ctx.closePath();
         ctx.clip();
-        ctx.fillStyle = pattern;
-        ctx.fillRect(x, y, w, h);
+
+        // 45° stripes (top-left → bottom-right in DOM coordinates). For each
+        // stripe, start on the top edge (or above-left of the rect) and draw
+        // down-right by `h` pixels — that's long enough to exit the rect no
+        // matter where in x it starts.
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.22)';
+        ctx.lineWidth = lineWidth;
+        ctx.lineCap = 'square';
+        ctx.beginPath();
+        for (let ax = x - h; ax < x + w + period; ax += period) {
+          ctx.moveTo(ax, y);
+          ctx.lineTo(ax + h, y + h);
+        }
+        ctx.stroke();
         ctx.restore();
+        painted += 1;
       }
+      log(`paintDiscoveryHatching: painted ${painted} overlay(s)`);
     }
 
     // ------------------------------------------------------------------
@@ -3814,7 +3824,7 @@
     // Initial pass (in case the timeline is already rendered at document-idle).
     runActiveFeatures();
     log(
-      'loaded — version 0.7.6',
+      'loaded — version 0.7.7',
       isDebug()
         ? '(debug on)'
         : '(debug off — enable with: localStorage.setItem(\'momentum-light-debug\', \'1\'))',
