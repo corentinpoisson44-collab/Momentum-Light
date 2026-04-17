@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.8.1
+// @version      0.8.2
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne, macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, bouton « Projection » qui génère une timeline prévisionnelle (dates de livraison par Epic, scénario probable + prudent à 1σ) à partir du macro-chiffrage et de la vélocité, menu « How-to » guidé qui surligne chaque feature au premier lancement, et surcharge du menu Export → Image (.png) qui capture la Timeline au format natif (via html2canvas) avec tous les overlays Momentum-Light visibles dessus.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -1416,13 +1416,15 @@
       #${PROJECTION_MODAL_ID} .momentum-projection__table tbody tr:hover {
         background: #FAFBFC;
       }
+      /* Same rationale as __landing below: keep <td> at its default
+         display: table-cell so it sits in the table row correctly, and
+         stack children via display: block. */
       #${PROJECTION_MODAL_ID} .momentum-projection__epic {
-        display: flex;
-        flex-direction: column;
-        gap: 2px;
         min-width: 220px;
+        line-height: 1.35;
       }
       #${PROJECTION_MODAL_ID} .momentum-projection__epic a {
+        display: block;
         font-weight: 700;
         color: #0052CC;
         text-decoration: none;
@@ -1431,6 +1433,7 @@
         text-decoration: underline;
       }
       #${PROJECTION_MODAL_ID} .momentum-projection__summary {
+        display: block;
         color: #42526E;
         font-size: 12px;
       }
@@ -1446,16 +1449,20 @@
         text-align: center;
         margin-right: 4px;
       }
+      /* Landing cells MUST stay display: table-cell — applying flex to a
+         <td> drops it out of the table row layout so the prudent cell
+         collapses under the probable one instead of sitting in its own
+         column. Stack the two lines via block-level children instead. */
       #${PROJECTION_MODAL_ID} .momentum-projection__landing {
-        display: flex;
-        flex-direction: column;
-        gap: 2px;
         white-space: nowrap;
+        line-height: 1.35;
       }
       #${PROJECTION_MODAL_ID} .momentum-projection__landing strong {
+        display: block;
         font-size: 12px;
       }
       #${PROJECTION_MODAL_ID} .momentum-projection__landing span {
+        display: block;
         font-size: 11px;
         color: #6B778C;
       }
