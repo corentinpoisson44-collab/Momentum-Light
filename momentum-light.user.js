@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.8.2
+// @version      0.9.0
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne, macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, bouton « Projection » qui génère une timeline prévisionnelle (dates de livraison par Epic, scénario probable + prudent à 1σ) à partir du macro-chiffrage et de la vélocité, menu « How-to » guidé qui surligne chaque feature au premier lancement, et surcharge du menu Export → Image (.png) qui capture la Timeline au format natif (via html2canvas) avec tous les overlays Momentum-Light visibles dessus.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -42,6 +42,8 @@
   const OVERLAY_TSHIRT_CLASS = 'momentum-progress__tshirt';
   const PROJECTION_BUTTON_CLASS = 'momentum-velocity-banner__projection';
   const PROJECTION_MODAL_ID = 'momentum-projection-modal';
+  const PROJECTION_BADGE_CLASS = 'momentum-projection-badge';
+  const PROJECTION_INLINE_TTL_MS = 60_000;
 
   // ---------------------------------------------------------------------------
   // Macro-estimation (T-Shirt sizing) — each Epic-level size bucket is mapped
@@ -1147,6 +1149,45 @@
         padding-left: 32px;
       }
 
+      /* Inline projection badge — pinned at the RIGHT edge of the Epic
+         bar, reporting the probable delivery sprint at a glance. Sits
+         as a direct sibling of the overlay (NOT inside it) so the
+         overlay's overflow:hidden clipping doesn't cut it off; it's
+         free to extend a few px past the bar on very narrow Epics.
+         pointer-events:none lets native resize handles keep working. */
+      .${PROJECTION_BADGE_CLASS} {
+        position: absolute;
+        top: 50%;
+        right: 4px;
+        transform: translateY(-50%);
+        display: inline-flex;
+        align-items: center;
+        max-width: calc(100% - 8px);
+        height: 16px;
+        padding: 0 8px;
+        border-radius: 8px;
+        background: #0747A6;
+        color: #FFFFFF;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        font-size: 10px;
+        font-weight: 600;
+        line-height: 1;
+        letter-spacing: 0.02em;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        box-shadow: 0 1px 2px rgba(9, 30, 66, 0.25);
+        pointer-events: none;
+        z-index: 4;
+      }
+      /* Extrapolated landings (past the last known sprint) get a dashed
+         outline to communicate "modeled, not scheduled". */
+      .${PROJECTION_BADGE_CLASS}[data-extrapolated="1"] {
+        background: #403294;
+        box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.5) inset, 0 1px 2px rgba(9, 30, 66, 0.25);
+        border: 1px dashed rgba(255, 255, 255, 0.6);
+      }
+
       /* Sprint-fill variant: a full-height translucent wash that covers the
          chip's body, so the fill level reads at a glance across the whole
          button while the chip's own text ("FHSBFF Sprint 53…") stays fully
@@ -1990,6 +2031,7 @@
       // painted: the badge IS the signal in that case.
       if (stats.totalChildren === 0 && (!total || total <= 0) && !tshirtSize) {
         removeOverlay(bar);
+        timelineProjection.clearInlineBadge(bar);
         delete bar.dataset.momentumTooltip;
         return;
       }
@@ -2129,6 +2171,15 @@
       bar.dataset.momentumTooltip = tooltipText;
       bar.setAttribute('aria-label', tooltipText);
       bar.title = tooltipText;
+
+      // Inline projection badge on the right edge — fire-and-forget, the
+      // first call in this mutation cycle triggers a full projection
+      // pass that's shared with every other Epic bar via the inline
+      // cache. Epics without a T-Shirt macro-estimate will quietly
+      // resolve to null and the badge is removed.
+      timelineProjection.decorateEpicBar(bar, epicKey).catch((e) => {
+        warn('projection badge failed:', e?.message || e);
+      });
     }
 
     // Non-Epic variant: just paint the ticket's SP estimate as a chip on the
@@ -2137,6 +2188,7 @@
     function applyEstimate(bar, { sp, issueKey }) {
       if (sp == null || !(sp > 0)) {
         removeOverlay(bar);
+        timelineProjection.clearInlineBadge(bar);
         delete bar.dataset.momentumTooltip;
         return;
       }
@@ -2148,6 +2200,9 @@
       delete overlay.dataset.confidence;
       delete overlay.dataset.discovery;
       resetBarConfidence(bar);
+      // Tickets never carry a projection badge either. Clean up in case
+      // this bar was previously decorated as an Epic.
+      timelineProjection.clearInlineBadge(bar);
       const label = overlay.querySelector(`.${OVERLAY_LABEL_CLASS}`);
       if (label) label.textContent = `${sp} SP`;
 
@@ -3058,7 +3113,127 @@
       }
     }
 
-    return { show, close: closeModal };
+    // ---------- Inline-badge rendering on Epic bars ----------
+    //
+    // Per-key projection cache. Computing a landing requires knowing the
+    // full DOM order of Epics on the timeline (FIFO sequencing is global),
+    // so the very first Epic bar decorated in a mutation cycle triggers a
+    // full buildProjection pass; every subsequent bar in the same pass
+    // hits this cache for free. The inflight-dedup ensures only one
+    // buildProjection runs even when decorateEpicBar is called for N
+    // bars in parallel.
+    let inlineCache = null; // { expiresAt, byKey: Map<string, {likely, pessimistic}> }
+    let inlineInflight = null;
+
+    function formatShortDate(d) {
+      if (!d) return '';
+      try {
+        return d.toLocaleDateString(undefined, {
+          day: '2-digit', month: 'short',
+        });
+      } catch (_) {
+        return d.toISOString().slice(0, 10);
+      }
+    }
+
+    function formatLandingShort(land) {
+      if (!land) return null;
+      return {
+        sprintName: land.sprintName,
+        dateShort: formatShortDate(land.endDate),
+        extrapolated: !!land.extrapolated,
+      };
+    }
+
+    async function ensureInlineCache() {
+      const now = Date.now();
+      if (inlineCache && inlineCache.expiresAt > now) return inlineCache.byKey;
+      if (inlineInflight) return inlineInflight;
+      inlineInflight = (async () => {
+        try {
+          const data = await buildProjection();
+          const byKey = new Map();
+          if (data && Array.isArray(data.rows)) {
+            for (const r of data.rows) {
+              byKey.set(r.key, {
+                likely: formatLandingShort(r.likely),
+                pessimistic: formatLandingShort(r.pessimistic),
+              });
+            }
+          }
+          inlineCache = { expiresAt: Date.now() + PROJECTION_INLINE_TTL_MS, byKey };
+          return byKey;
+        } finally {
+          inlineInflight = null;
+        }
+      })();
+      return inlineInflight;
+    }
+
+    function invalidateInline() {
+      inlineCache = null;
+    }
+
+    // Look up the landing for a given Epic key. Returns null when the Epic
+    // has no T-Shirt size (nothing to project) or when velocity is absent.
+    async function getLanding(epicKey) {
+      try {
+        const byKey = await ensureInlineCache();
+        return byKey.get(epicKey) || null;
+      } catch (_) {
+        return null;
+      }
+    }
+
+    // Idempotent badge painter. Mounts the badge as a direct child of the
+    // bar (NOT the overlay), because the overlay is clipped via
+    // overflow:hidden and we want the badge to be able to extend slightly
+    // past the bar edge on narrow Epics. pointer-events:none lets clicks
+    // pass through to the resize handles Jira paints underneath.
+    function renderInlineBadge(bar, landing) {
+      let badge = bar.querySelector(`:scope > .${PROJECTION_BADGE_CLASS}`);
+      if (!landing || !landing.likely) {
+        if (badge) badge.remove();
+        return;
+      }
+      if (!badge) {
+        badge = document.createElement('div');
+        badge.className = PROJECTION_BADGE_CLASS;
+        bar.appendChild(badge);
+      }
+      const { sprintName, dateShort, extrapolated } = landing.likely;
+      badge.textContent = dateShort
+        ? `→ ${sprintName} · ${dateShort}`
+        : `→ ${sprintName}`;
+      if (extrapolated) badge.dataset.extrapolated = '1';
+      else delete badge.dataset.extrapolated;
+      // Tooltip carries both scenarios so hover reveals the prudent date.
+      const pess = landing.pessimistic;
+      const pessText = pess
+        ? ` (prudent : ${pess.sprintName}${pess.dateShort ? ' · ' + pess.dateShort : ''})`
+        : '';
+      badge.title = `Livraison projetée : ${sprintName}${dateShort ? ' · ' + dateShort : ''}${pessText}`;
+    }
+
+    async function decorateEpicBar(bar, epicKey) {
+      const landing = await getLanding(epicKey);
+      renderInlineBadge(bar, landing);
+    }
+
+    // Public cleanup — removes a stale badge off a bar that is no longer
+    // an Epic (e.g. a virtualized row that now hosts a Story).
+    function clearInlineBadge(bar) {
+      const badge = bar.querySelector(`:scope > .${PROJECTION_BADGE_CLASS}`);
+      if (badge) badge.remove();
+    }
+
+    return {
+      show,
+      close: closeModal,
+      decorateEpicBar,
+      clearInlineBadge,
+      invalidateInline,
+    };
   })();
 
   // ---------------------------------------------------------------------------
