@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.8.0
+// @version      0.8.1
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne, macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, bouton « Projection » qui génère une timeline prévisionnelle (dates de livraison par Epic, scénario probable + prudent à 1σ) à partir du macro-chiffrage et de la vélocité, menu « How-to » guidé qui surligne chaque feature au premier lancement, et surcharge du menu Export → Image (.png) qui capture la Timeline au format natif (via html2canvas) avec tous les overlays Momentum-Light visibles dessus.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -1450,6 +1450,7 @@
         display: flex;
         flex-direction: column;
         gap: 2px;
+        white-space: nowrap;
       }
       #${PROJECTION_MODAL_ID} .momentum-projection__landing strong {
         font-size: 12px;
@@ -2921,7 +2922,10 @@
         if (driftRatio > TSHIRT_DRIFT_OVER) drift = ' ⚠︎ dépassement';
         else if (r.total > 0 && driftRatio < TSHIRT_DRIFT_UNDER) drift = ' · sous-chiffré';
       }
-      const flag = r.pessimistic.extrapolated ? ' extrapolé' : '';
+      // The "extrapolated" flag used to be appended as a suffix on the
+      // date line but forced the cell to wrap. The "Sprint +N" label
+      // already signals extrapolation and the footer explains it, so the
+      // inline tag is redundant — drop it entirely.
       return `
         <tr>
           <td class="momentum-projection__epic">
@@ -2937,7 +2941,7 @@
           </td>
           <td class="momentum-projection__landing momentum-projection__landing--pessimistic">
             <strong>${escapeHtml(r.pessimistic.sprintName)}</strong>
-            <span>${formatDate(r.pessimistic.endDate)}${flag}</span>
+            <span>${formatDate(r.pessimistic.endDate)}</span>
           </td>
         </tr>
       `;
