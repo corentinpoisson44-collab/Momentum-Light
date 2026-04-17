@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.7.8
-// @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne, macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, menu « How-to » guidé qui surligne chaque feature au premier lancement, et surcharge du menu Export → Image (.png) qui capture la Timeline au format natif (via html2canvas) avec tous les overlays Momentum-Light visibles dessus.
+// @version      0.8.0
+// @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne, macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, bouton « Projection » qui génère une timeline prévisionnelle (dates de livraison par Epic, scénario probable + prudent à 1σ) à partir du macro-chiffrage et de la vélocité, menu « How-to » guidé qui surligne chaque feature au premier lancement, et surcharge du menu Export → Image (.png) qui capture la Timeline au format natif (via html2canvas) avec tous les overlays Momentum-Light visibles dessus.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
 // @run-at       document-idle
@@ -40,6 +40,8 @@
   const HOWTO_OVERLAY_ID = 'momentum-howto-overlay';
   const HOWTO_SEEN_KEY = 'momentum-light::howto-seen';
   const OVERLAY_TSHIRT_CLASS = 'momentum-progress__tshirt';
+  const PROJECTION_BUTTON_CLASS = 'momentum-velocity-banner__projection';
+  const PROJECTION_MODAL_ID = 'momentum-projection-modal';
 
   // ---------------------------------------------------------------------------
   // Macro-estimation (T-Shirt sizing) — each Epic-level size bucket is mapped
@@ -689,13 +691,27 @@
         average = perSprint.length ? total / perSprint.length : 0;
       }
 
+      // Population stdev across the window — the window IS our sample, we
+      // aren't estimating a broader population. Used by the projection
+      // module to compute a pessimistic landing date (avg - 1σ).
+      let stdev = 0;
+      if (perSprint.length > 1) {
+        const variance = perSprint.reduce(
+          (acc, s) => acc + (s.velocity - average) ** 2,
+          0,
+        ) / perSprint.length;
+        stdev = Math.sqrt(variance);
+      }
+
       const openLite = openSprints.map((s) => ({
         id: s.id,
         name: s.name,
         state: s.state, // 'active' | 'future'
+        startDate: s.startDate || null,
+        endDate: s.endDate || null,
       }));
 
-      return { average, sprints: perSprint, boardId, openSprints: openLite };
+      return { average, stdev, sprints: perSprint, boardId, openSprints: openLite };
     }
 
     async function getCached() {
@@ -1246,6 +1262,214 @@
       #${VELOCITY_BANNER_ID}[data-state="error"] .momentum-velocity-banner__chip {
         background: #F4F5F7;
         color: #6B778C;
+      }
+
+      /* Projection launcher — same visual language as the velocity chip
+         (rounded pill, pointer-events opt-in through the banner's
+         transparent wrapper) but with an accent color to signal action. */
+      .${PROJECTION_BUTTON_CLASS} {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 6px 12px;
+        border: 0;
+        border-radius: 14px;
+        background: #0052CC;
+        color: #FFFFFF;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        font-size: 12px;
+        font-weight: 600;
+        line-height: 1.3;
+        cursor: pointer;
+        user-select: none;
+        white-space: nowrap;
+        pointer-events: auto;
+        box-shadow: 0 1px 2px rgba(9, 30, 66, 0.2);
+      }
+      .${PROJECTION_BUTTON_CLASS}:hover { background: #0747A6; }
+      .${PROJECTION_BUTTON_CLASS}:focus-visible {
+        outline: 2px solid #4C9AFF;
+        outline-offset: 2px;
+      }
+
+      /* Projection modal — full-screen overlay anchored on document.body
+         so it sits above every Atlaskit layer (we pick a z-index that
+         beats Atlaskit's highest documented stack, 9000). */
+      #${PROJECTION_MODAL_ID} {
+        position: fixed;
+        inset: 0;
+        z-index: 10000;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        color: #172B4D;
+      }
+      #${PROJECTION_MODAL_ID} .momentum-projection__backdrop {
+        position: absolute;
+        inset: 0;
+        background: rgba(9, 30, 66, 0.54);
+      }
+      #${PROJECTION_MODAL_ID} .momentum-projection__card {
+        position: relative;
+        width: min(1080px, 94vw);
+        max-height: 86vh;
+        display: flex;
+        flex-direction: column;
+        background: #FFFFFF;
+        border-radius: 8px;
+        box-shadow: 0 20px 50px rgba(9, 30, 66, 0.35);
+        overflow: hidden;
+      }
+      #${PROJECTION_MODAL_ID} .momentum-projection__header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 16px 20px;
+        border-bottom: 1px solid #DFE1E6;
+      }
+      #${PROJECTION_MODAL_ID} .momentum-projection__header h2 {
+        margin: 0;
+        font-size: 16px;
+        font-weight: 600;
+      }
+      #${PROJECTION_MODAL_ID} .momentum-projection__close {
+        border: 0;
+        background: transparent;
+        font-size: 22px;
+        line-height: 1;
+        color: #6B778C;
+        cursor: pointer;
+        padding: 4px 8px;
+        border-radius: 4px;
+      }
+      #${PROJECTION_MODAL_ID} .momentum-projection__close:hover {
+        background: #F4F5F7;
+        color: #172B4D;
+      }
+      #${PROJECTION_MODAL_ID} .momentum-projection__empty {
+        padding: 32px 20px;
+        text-align: center;
+        color: #6B778C;
+        font-size: 13px;
+      }
+      #${PROJECTION_MODAL_ID} .momentum-projection__kpis {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+        gap: 12px;
+        padding: 16px 20px;
+        background: #F4F5F7;
+        border-bottom: 1px solid #DFE1E6;
+      }
+      #${PROJECTION_MODAL_ID} .momentum-projection__kpis > div {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+      }
+      #${PROJECTION_MODAL_ID} .momentum-projection__kpis span {
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        color: #6B778C;
+      }
+      #${PROJECTION_MODAL_ID} .momentum-projection__kpis b {
+        font-size: 14px;
+        font-weight: 700;
+        font-variant-numeric: tabular-nums;
+      }
+      #${PROJECTION_MODAL_ID} .momentum-projection__kpis small {
+        font-size: 11px;
+        color: #6B778C;
+        font-weight: 500;
+      }
+      #${PROJECTION_MODAL_ID} .momentum-projection__kpi--final b {
+        color: #0052CC;
+      }
+      #${PROJECTION_MODAL_ID} .momentum-projection__table-wrap {
+        overflow: auto;
+        flex: 1 1 auto;
+      }
+      #${PROJECTION_MODAL_ID} .momentum-projection__table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 13px;
+      }
+      #${PROJECTION_MODAL_ID} .momentum-projection__table thead th {
+        position: sticky;
+        top: 0;
+        background: #FFFFFF;
+        text-align: left;
+        font-weight: 600;
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        color: #6B778C;
+        padding: 10px 12px;
+        border-bottom: 2px solid #DFE1E6;
+      }
+      #${PROJECTION_MODAL_ID} .momentum-projection__table tbody td {
+        padding: 10px 12px;
+        border-bottom: 1px solid #F4F5F7;
+        vertical-align: top;
+        font-variant-numeric: tabular-nums;
+      }
+      #${PROJECTION_MODAL_ID} .momentum-projection__table tbody tr:hover {
+        background: #FAFBFC;
+      }
+      #${PROJECTION_MODAL_ID} .momentum-projection__epic {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        min-width: 220px;
+      }
+      #${PROJECTION_MODAL_ID} .momentum-projection__epic a {
+        font-weight: 700;
+        color: #0052CC;
+        text-decoration: none;
+      }
+      #${PROJECTION_MODAL_ID} .momentum-projection__epic a:hover {
+        text-decoration: underline;
+      }
+      #${PROJECTION_MODAL_ID} .momentum-projection__summary {
+        color: #42526E;
+        font-size: 12px;
+      }
+      #${PROJECTION_MODAL_ID} .momentum-projection__tshirt span[data-size] {
+        display: inline-block;
+        min-width: 22px;
+        padding: 0 6px;
+        border-radius: 10px;
+        background: #DFE1E6;
+        color: #172B4D;
+        font-weight: 700;
+        font-size: 11px;
+        text-align: center;
+        margin-right: 4px;
+      }
+      #${PROJECTION_MODAL_ID} .momentum-projection__landing {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+      }
+      #${PROJECTION_MODAL_ID} .momentum-projection__landing strong {
+        font-size: 12px;
+      }
+      #${PROJECTION_MODAL_ID} .momentum-projection__landing span {
+        font-size: 11px;
+        color: #6B778C;
+      }
+      #${PROJECTION_MODAL_ID} .momentum-projection__landing--likely strong {
+        color: #0747A6;
+      }
+      #${PROJECTION_MODAL_ID} .momentum-projection__landing--pessimistic strong {
+        color: #974F0C;
+      }
+      #${PROJECTION_MODAL_ID} .momentum-projection__footer {
+        padding: 12px 20px;
+        border-top: 1px solid #DFE1E6;
+        font-size: 11px;
+        color: #6B778C;
+        line-height: 1.5;
       }
 
       /* Confidence legend — compact reference chip that lives inside the
@@ -2320,6 +2544,20 @@
         update();
       });
       wrapper.appendChild(chip);
+
+      // Projection launcher — sits next to the velocity chip so the team
+      // can go from "we average N SP/sprint" to "here are the landing
+      // dates" in a single click.
+      const projection = document.createElement('button');
+      projection.type = 'button';
+      projection.className = PROJECTION_BUTTON_CLASS;
+      projection.title =
+        'Générer une projection Timeline basée sur le macro-chiffrage T-Shirt et la vélocité moyenne';
+      projection.innerHTML = '<span aria-hidden="true">📅</span> Projection';
+      projection.addEventListener('click', () => {
+        timelineProjection.show();
+      });
+      wrapper.appendChild(projection);
       return wrapper;
     }
 
@@ -2387,6 +2625,429 @@
     }
 
     return { ensure, remove, update };
+  })();
+
+  // ---------------------------------------------------------------------------
+  // timelineProjection — combines Epic macro-estimates (T-Shirt sizing) with
+  // the 5-sprint average velocity to generate a data-driven delivery
+  // forecast. The team's priority order is read straight from the Timeline
+  // DOM (top-to-bottom order of Epic bars), so no separate config is
+  // needed — reorder in Jira and the projection follows.
+  //
+  // Sequencing algorithm (FIFO):
+  //   For each Epic in priority order, consume `remaining SP` from a sprint
+  //   budget of `velocity.average` SP. Overflow spills into the next sprint.
+  //   Two passes are run: P50 with capacity = average (likely landing), and
+  //   P85 with capacity = max(1, average - stdev) (conservative landing).
+  //
+  // Sprint cursor mapping:
+  //   - For open sprints (active + future) we know name + endDate from the
+  //     Agile API, so landings map to a real sprint with a real date.
+  //   - Beyond the last open sprint, we extrapolate with an "avg sprint
+  //     length" computed from the open sprints' (endDate - startDate) — or
+  //     14 days if we can't measure it — and label projected sprints as
+  //     "Sprint +N".
+  //
+  // The active sprint is treated as a fresh sprint with full capacity. This
+  // is intentionally optimistic — explicitly documented in the modal
+  // footer so readers understand what's being assumed.
+  // ---------------------------------------------------------------------------
+
+  const timelineProjection = (() => {
+    const DEFAULT_SPRINT_LEN_MS = 14 * 24 * 60 * 60 * 1000;
+
+    // Ordered list of Epic keys visible in the current Timeline DOM. Epic
+    // bars tend to be taller and have a progress-wrapper sibling, but to
+    // keep the selector resilient we rely on issueMeta.isEpic downstream.
+    function collectOrderedKeys() {
+      const root = document.querySelector('[role="main"]') || document.body;
+      const bars = timelineDom.findBars(root);
+      if (!bars.length) return [];
+      // Sort by visual Y so DOM reordering (virtualization) doesn't shuffle
+      // the priority order compared to what the user sees.
+      const withPos = bars
+        .map((bar) => {
+          try {
+            const rect = bar.getBoundingClientRect();
+            return { bar, top: rect.top };
+          } catch (_) {
+            return null;
+          }
+        })
+        .filter(Boolean)
+        .sort((a, b) => a.top - b.top);
+      const keys = [];
+      const seen = new Set();
+      for (const { bar } of withPos) {
+        // Re-use timelineDom's extractor indirectly: it's private, so we
+        // replicate the "walk-up" trick via a lightweight selector.
+        let cursor = bar.parentElement;
+        let steps = 0;
+        let key = null;
+        while (cursor && cursor !== document.body && steps < 20) {
+          const keyEl = cursor.querySelector(
+            '[data-testid="roadmap.timeline-table-kit.ui.list-item-content.summary.key"]',
+          );
+          if (keyEl) {
+            const m = (keyEl.textContent || '').trim().match(ISSUE_KEY_REGEX);
+            if (m) { key = m[1]; break; }
+          }
+          cursor = cursor.parentElement;
+          steps += 1;
+        }
+        if (!key) {
+          const anchor = bar.querySelector?.('a[href*="/browse/"]');
+          if (anchor) {
+            const m = anchor.getAttribute('href').match(ISSUE_KEY_REGEX);
+            if (m) key = m[1];
+          }
+        }
+        if (key && !seen.has(key)) {
+          seen.add(key);
+          keys.push(key);
+        }
+      }
+      return keys;
+    }
+
+    // Find the summary text for an Epic by walking up from any bar matching
+    // its key. Falls back to the key itself if the summary cell isn't
+    // visible — this can happen when the row is virtualized out.
+    function findSummary(key) {
+      const anchors = document.querySelectorAll(`a[href*="/browse/${key}"]`);
+      for (const a of anchors) {
+        const row = a.closest('[role="row"]') || a.parentElement;
+        if (!row) continue;
+        const summaryEl = row.querySelector(
+          '[data-testid="roadmap.timeline-table-kit.ui.list-item-content.summary.title"]',
+        );
+        const text = (summaryEl?.textContent || a.textContent || '').trim();
+        if (text && text !== key) return text;
+      }
+      return key;
+    }
+
+    function remainingSP(macroSP, total, done) {
+      // Expected scope = max(macro-estimate, real chiffrage). If the team
+      // has already sized past the T-Shirt budget we trust the real
+      // chiffrage (drift-over); otherwise the T-Shirt is the floor.
+      const scope = Math.max(macroSP || 0, total || 0);
+      return Math.max(0, scope - (done || 0));
+    }
+
+    // FIFO-sequence a list of Epics into sprints with `capacity` SP each.
+    // Returns [{ ...epic, landingIndex }] where landingIndex is the 0-based
+    // sprint number at which the Epic finishes (same index as the sprint
+    // cursor). Epics with zero remaining SP get landingIndex = -1 (already
+    // delivered).
+    function sequence(epics, capacity) {
+      const safeCap = Math.max(capacity, 1);
+      const out = [];
+      let cursor = 0;
+      let remainInCur = safeCap;
+      for (const e of epics) {
+        if (e.remaining <= 0) {
+          out.push({ ...e, landingIndex: -1 });
+          continue;
+        }
+        let need = e.remaining;
+        while (need > remainInCur + 1e-9) {
+          need -= remainInCur;
+          cursor += 1;
+          remainInCur = safeCap;
+        }
+        remainInCur = Math.max(0, remainInCur - need);
+        out.push({ ...e, landingIndex: cursor });
+      }
+      return out;
+    }
+
+    // Compute the average sprint duration from the open sprints that carry
+    // both start and end dates. Falls back to 14 days if the data is
+    // insufficient (e.g. sprints created without dates).
+    function averageSprintLengthMs(openSprints) {
+      const durations = [];
+      for (const s of openSprints) {
+        if (!s.startDate || !s.endDate) continue;
+        const a = new Date(s.startDate).getTime();
+        const b = new Date(s.endDate).getTime();
+        if (Number.isFinite(a) && Number.isFinite(b) && b > a) {
+          durations.push(b - a);
+        }
+      }
+      if (!durations.length) return DEFAULT_SPRINT_LEN_MS;
+      return durations.reduce((a, d) => a + d, 0) / durations.length;
+    }
+
+    // Turn a landingIndex into a { sprintName, endDate, extrapolated } tuple.
+    function landingFor(index, openSprints, avgLenMs) {
+      if (index < 0) {
+        return { sprintName: '—', endDate: null, extrapolated: false };
+      }
+      const known = openSprints[index];
+      if (known) {
+        return {
+          sprintName: known.name,
+          endDate: known.endDate ? new Date(known.endDate) : null,
+          extrapolated: false,
+        };
+      }
+      // Extrapolate past the last open sprint.
+      const lastKnown = openSprints[openSprints.length - 1];
+      const baseEnd = lastKnown?.endDate
+        ? new Date(lastKnown.endDate).getTime()
+        : Date.now();
+      const offset = index - (openSprints.length - 1);
+      const endDate = new Date(baseEnd + offset * avgLenMs);
+      return { sprintName: `Sprint +${offset}`, endDate, extrapolated: true };
+    }
+
+    function formatDate(d) {
+      if (!d) return '—';
+      try {
+        return d.toLocaleDateString(undefined, {
+          day: '2-digit', month: 'short', year: 'numeric',
+        });
+      } catch (_) {
+        return d.toISOString().slice(0, 10);
+      }
+    }
+
+    async function buildProjection() {
+      const ctx = await velocity.getPlanningContext();
+      if (!ctx || !(ctx.average > 0)) {
+        return { error: 'Vélocité indisponible — impossible de projeter.' };
+      }
+      const orderedKeys = collectOrderedKeys();
+      if (!orderedKeys.length) {
+        return {
+          error:
+            'Aucune barre détectée sur la Timeline. Faites défiler jusqu\'à voir les Epics à projeter puis relancez.',
+        };
+      }
+
+      // Pull meta for every key visible on the timeline. issueMeta already
+      // coalesces these into a single JQL under the hood.
+      const metas = await Promise.all(
+        orderedKeys.map((k) => issueMeta.get(k).catch(() => null)),
+      );
+
+      // Keep only Epics with a T-Shirt macro size — those are the planning
+      // units. Non-sized Epics would yield an unknown scope, so we skip
+      // them rather than fudge a guess.
+      const sizedEpics = [];
+      for (let i = 0; i < orderedKeys.length; i += 1) {
+        const key = orderedKeys[i];
+        const meta = metas[i];
+        if (!meta || !meta.isEpic || !meta.tshirtSize) continue;
+        sizedEpics.push({ key, meta });
+      }
+      if (!sizedEpics.length) {
+        return {
+          error:
+            'Aucun Epic chiffré avec T-Shirt sur la Timeline visible. ' +
+            'Renseignez le champ « T-Shirt Sizing » sur les Epics pour activer la projection.',
+        };
+      }
+
+      // Per-Epic progress in parallel (all reads are cached TTL 60s).
+      const progresses = await Promise.all(
+        sizedEpics.map((e) => epicProgress.get(e.key).catch(() => ({ done: 0, total: 0, confidence: 0 }))),
+      );
+
+      const epics = sizedEpics.map((e, i) => {
+        const macroSP = TSHIRT_SIZE_SP[e.meta.tshirtSize] || 0;
+        const { done, total, confidence } = progresses[i];
+        const remaining = remainingSP(macroSP, total, done);
+        return {
+          key: e.key,
+          summary: findSummary(e.key),
+          tshirtSize: e.meta.tshirtSize,
+          macroSP,
+          done: done || 0,
+          total: total || 0,
+          confidence: confidence || 0,
+          remaining,
+        };
+      });
+
+      const capacityP50 = ctx.average;
+      const capacityP85 = Math.max(1, ctx.average - ctx.stdev);
+      const p50 = sequence(epics, capacityP50);
+      const p85 = sequence(epics, capacityP85);
+      const avgLenMs = averageSprintLengthMs(ctx.openSprints || []);
+
+      const rows = epics.map((e, i) => {
+        const land50 = landingFor(p50[i].landingIndex, ctx.openSprints || [], avgLenMs);
+        const land85 = landingFor(p85[i].landingIndex, ctx.openSprints || [], avgLenMs);
+        return {
+          ...e,
+          likely: land50,
+          pessimistic: land85,
+        };
+      });
+
+      return {
+        rows,
+        summary: {
+          average: ctx.average,
+          stdev: ctx.stdev,
+          sprintsKnown: (ctx.openSprints || []).length,
+          capacityP50,
+          capacityP85,
+          totalRemaining: epics.reduce((a, e) => a + e.remaining, 0),
+          finalLikely: rows.length ? rows[rows.length - 1].likely : null,
+          finalPessimistic: rows.length ? rows[rows.length - 1].pessimistic : null,
+        },
+      };
+    }
+
+    // ---------- DOM rendering ----------
+
+    function closeModal() {
+      const existing = document.getElementById(PROJECTION_MODAL_ID);
+      if (existing) existing.remove();
+      document.removeEventListener('keydown', onKeydown);
+    }
+
+    function onKeydown(e) {
+      if (e.key === 'Escape') closeModal();
+    }
+
+    function renderRow(r) {
+      const driftRatio = r.macroSP > 0 ? r.total / r.macroSP : null;
+      let drift = '';
+      if (driftRatio != null) {
+        if (driftRatio > TSHIRT_DRIFT_OVER) drift = ' ⚠︎ dépassement';
+        else if (r.total > 0 && driftRatio < TSHIRT_DRIFT_UNDER) drift = ' · sous-chiffré';
+      }
+      const flag = r.pessimistic.extrapolated ? ' extrapolé' : '';
+      return `
+        <tr>
+          <td class="momentum-projection__epic">
+            <a href="/browse/${r.key}" target="_blank" rel="noopener">${r.key}</a>
+            <span class="momentum-projection__summary">${escapeHtml(r.summary)}</span>
+          </td>
+          <td class="momentum-projection__tshirt"><span data-size="${r.tshirtSize}">${r.tshirtSize}</span> · ${r.macroSP} SP</td>
+          <td class="momentum-projection__progress">${Math.round(r.done)} / ${Math.round(r.total || r.macroSP)} SP${drift}</td>
+          <td class="momentum-projection__remaining">${Math.round(r.remaining)} SP</td>
+          <td class="momentum-projection__landing momentum-projection__landing--likely">
+            <strong>${escapeHtml(r.likely.sprintName)}</strong>
+            <span>${formatDate(r.likely.endDate)}</span>
+          </td>
+          <td class="momentum-projection__landing momentum-projection__landing--pessimistic">
+            <strong>${escapeHtml(r.pessimistic.sprintName)}</strong>
+            <span>${formatDate(r.pessimistic.endDate)}${flag}</span>
+          </td>
+        </tr>
+      `;
+    }
+
+    function escapeHtml(s) {
+      return String(s ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+    }
+
+    function renderModal({ rows, summary, error }) {
+      const modal = document.createElement('div');
+      modal.id = PROJECTION_MODAL_ID;
+      modal.setAttribute('role', 'dialog');
+      modal.setAttribute('aria-modal', 'true');
+      modal.setAttribute('aria-labelledby', `${PROJECTION_MODAL_ID}__title`);
+
+      if (error) {
+        modal.innerHTML = `
+          <div class="momentum-projection__backdrop"></div>
+          <div class="momentum-projection__card">
+            <header class="momentum-projection__header">
+              <h2 id="${PROJECTION_MODAL_ID}__title">Projection Timeline</h2>
+              <button type="button" class="momentum-projection__close" aria-label="Fermer">×</button>
+            </header>
+            <div class="momentum-projection__empty">${escapeHtml(error)}</div>
+          </div>
+        `;
+      } else {
+        const kpis = `
+          <div class="momentum-projection__kpis">
+            <div><span>Vélocité moyenne</span><b>${Math.round(summary.average)} SP/sprint</b></div>
+            <div><span>Écart-type</span><b>±${Math.round(summary.stdev)} SP</b></div>
+            <div><span>Epics projetés</span><b>${rows.length}</b></div>
+            <div><span>SP restants total</span><b>${Math.round(summary.totalRemaining)} SP</b></div>
+            <div class="momentum-projection__kpi--final">
+              <span>Livraison dernière pièce</span>
+              <b>${escapeHtml(summary.finalLikely?.sprintName || '—')} · ${formatDate(summary.finalLikely?.endDate)}</b>
+              <small>prudent : ${escapeHtml(summary.finalPessimistic?.sprintName || '—')} · ${formatDate(summary.finalPessimistic?.endDate)}</small>
+            </div>
+          </div>
+        `;
+        const tableBody = rows.map(renderRow).join('');
+        modal.innerHTML = `
+          <div class="momentum-projection__backdrop"></div>
+          <div class="momentum-projection__card">
+            <header class="momentum-projection__header">
+              <h2 id="${PROJECTION_MODAL_ID}__title">Projection Timeline</h2>
+              <button type="button" class="momentum-projection__close" aria-label="Fermer">×</button>
+            </header>
+            ${kpis}
+            <div class="momentum-projection__table-wrap">
+              <table class="momentum-projection__table">
+                <thead>
+                  <tr>
+                    <th>Epic</th>
+                    <th>Macro</th>
+                    <th>Avancement</th>
+                    <th>Restant</th>
+                    <th>Sprint probable</th>
+                    <th>Sprint prudent</th>
+                  </tr>
+                </thead>
+                <tbody>${tableBody}</tbody>
+              </table>
+            </div>
+            <footer class="momentum-projection__footer">
+              Hypothèses : capacité = vélocité moyenne (${Math.round(summary.capacityP50)} SP) ou prudente
+              (vélocité − 1σ = ${Math.round(summary.capacityP85)} SP). Les Epics sont séquencés FIFO
+              dans leur ordre d'affichage sur la Timeline. Le sprint actif est compté plein — les points
+              déjà brûlés cette itération ne sont pas retranchés. Les lignes « Sprint +N » sont extrapolées
+              via la durée moyenne des ${summary.sprintsKnown} sprints connus.
+            </footer>
+          </div>
+        `;
+      }
+
+      modal.addEventListener('click', (e) => {
+        const target = e.target;
+        if (target instanceof HTMLElement) {
+          if (target.classList.contains('momentum-projection__backdrop')) {
+            closeModal();
+          } else if (target.closest('.momentum-projection__close')) {
+            closeModal();
+          }
+        }
+      });
+      document.body.appendChild(modal);
+      document.addEventListener('keydown', onKeydown);
+    }
+
+    async function show() {
+      closeModal();
+      // Placeholder so the user gets immediate feedback while JQL resolves.
+      renderModal({ error: 'Calcul de la projection…' });
+      try {
+        const data = await buildProjection();
+        closeModal();
+        renderModal(data);
+      } catch (e) {
+        closeModal();
+        renderModal({ error: `Projection indisponible : ${e?.message || e}` });
+        warn('projection failed:', e);
+      }
+    }
+
+    return { show, close: closeModal };
   })();
 
   // ---------------------------------------------------------------------------
@@ -3227,6 +3888,9 @@
         // User navigated away from a timeline/plan page — clean up so the
         // banner doesn't linger on unrelated views.
         velocityBanner.remove();
+        // Close the projection modal too if it was left open — it's
+        // anchored on the banner and has no meaning off a timeline.
+        timelineProjection.close();
       },
     },
     {
