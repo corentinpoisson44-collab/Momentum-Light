@@ -1909,16 +1909,34 @@
       resetBarConfidence(bar);
     }
 
-    // True if the bar currently contains JIRA's native link-icon — the
-    // small square widget rendered at the bar's end edge when the Epic
-    // has a dependency on another Epic. JIRA marks the icon's inner
-    // span with a stable testid ending in ".link-icon" (e.g.
+    // True if the bar currently has JIRA's native link-icon associated
+    // with it — the small square widget rendered at the bar's end edge
+    // when the Epic has a dependency on another Epic. JIRA tags the
+    // icon's inner span with a testid containing "link-icon" (e.g.
     // "roadmap.timeline-table-kit.ui.chart-item-content.date-content.
-    // bar.bar-content.bar-icon.link-icon"), so we match on that.
-    // `*=` (contains) rather than `$=` (ends-with) keeps the check
-    // resilient if Atlassian appends suffixes in future DOM revisions.
+    // bar.bar-content.bar-icon.link-icon").
+    //
+    // The icon isn't always a strict DOM descendant of the element we
+    // treat as the "bar" — Atlaskit sometimes portals the dependency
+    // button into a sibling container within the same chart-item cell.
+    // We therefore search within the bar AND up a few ancestors until
+    // we escape the chart-item-content subtree. Capped at 6 hops so we
+    // never leak into neighbouring rows.
     function barHasLinkIcon(bar) {
-      return bar.querySelector('[data-testid*="link-icon"]') !== null;
+      let scope = bar;
+      for (let i = 0; i < 6 && scope; i += 1) {
+        if (scope.querySelector && scope.querySelector('[data-testid*="link-icon"]')) {
+          return true;
+        }
+        const tid = scope.getAttribute?.('data-testid') || '';
+        if (tid.startsWith(CHART_CONTENT_TESTID_PREFIX) && scope !== bar) {
+          // We've reached and searched the enclosing chart-item-content
+          // container — no icon found, stop before we climb into the row.
+          break;
+        }
+        scope = scope.parentElement;
+      }
+      return false;
     }
 
     // Confidence tiers drive the opacity / hatch treatment applied to the
