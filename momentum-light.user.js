@@ -1492,20 +1492,13 @@
 
       /* ---------------------------------------------------------------------
        * Landing-date variant (Business view) — the overlay covers the whole
-       * Epic bar with a subtle dark wash (to keep the formatted date
-       * readable on any Atlaskit bar color) and renders the formatted
-       * duedate centered. No fill width, no T-Shirt badge, no confidence
-       * wash — the Business view is purely about the "when".
+       * Epic bar. No fill width, no T-Shirt badge, but the confidence
+       * wash + Discovery hatch are preserved (same [data-confidence] /
+       * [data-discovery] rules as PM view) so stakeholders still read
+       * the "is this date trustworthy?" signal alongside the "when".
        * ------------------------------------------------------------------ */
       .${OVERLAY_LANDING_MOD} .${OVERLAY_FILL_CLASS} {
         display: none;
-      }
-      .${OVERLAY_LANDING_MOD}::before,
-      .${OVERLAY_LANDING_MOD}::after {
-        display: none !important;
-      }
-      .${OVERLAY_LANDING_MOD} {
-        background-color: rgba(9, 30, 66, 0.25);
       }
       .${OVERLAY_LANDING_MOD} .${OVERLAY_LABEL_CLASS} {
         /* Right-align the landing date so it sits next to the bar's end
@@ -2128,20 +2121,34 @@
       bar.title = tooltipText;
     }
 
-    // Business view: paint the formatted landing date on the Epic bar. The
-    // overlay purposefully strips every PM-only signal (fill, confidence
-    // wash, T-Shirt badge) so the date is the only thing a stakeholder
-    // reads. Tickets aren't decorated in this view — their overlays are
-    // removed by decorateBar before we get here.
-    function applyLanding(bar, { issueKey, dueDate }) {
+    // Business view: paint the formatted landing date on the Epic bar.
+    // PM-only chiffrage (fill width, T-Shirt badge, SP label) is stripped,
+    // but the confidence wash and Discovery hatch are preserved so
+    // stakeholders keep the "is this date trustworthy?" read that drives
+    // the PM view's at-a-glance risk signal. Tickets aren't decorated in
+    // this view — their overlays are removed by decorateBar before we
+    // get here.
+    function applyLanding(bar, { issueKey, dueDate, confidence, statusCategory }) {
       const overlay = ensureOverlay(bar);
       overlay.classList.remove(OVERLAY_ESTIMATE_MOD);
       overlay.classList.add(OVERLAY_LANDING_MOD);
-      delete overlay.dataset.confidence;
-      delete overlay.dataset.discovery;
       delete overlay.dataset.epicSize;
       delete overlay.dataset.sizingDrift;
-      resetBarConfidence(bar);
+
+      // Same tier / wash / hatch rules as applyProgress — keep them in
+      // sync so a bar reads identically across the two views (minus the
+      // chiffrage label).
+      const conf = Number.isFinite(confidence) ? confidence : 0;
+      const tier = confidenceTier(conf);
+      const isOpen = statusCategory === 'new';
+      const showWash = tier !== 'high';
+      const showHatch = showWash && isOpen;
+      if (showWash) overlay.dataset.confidence = tier;
+      else delete overlay.dataset.confidence;
+      if (showHatch) overlay.dataset.discovery = '';
+      else delete overlay.dataset.discovery;
+      applyBarConfidence(bar, tier);
+
       // Strip the T-Shirt badge if the bar was previously PM-decorated.
       const badge = overlay.querySelector(`.${OVERLAY_TSHIRT_CLASS}`);
       if (badge) badge.remove();
@@ -2154,9 +2161,14 @@
       if (label) label.textContent = short || 'Sans date d\'atterrissage';
       overlay.dataset.hasDate = dueDate ? '1' : '0';
 
-      const tooltipText = dueDate
-        ? `${issueKey} — Atterrissage : ${long}`
-        : `${issueKey} — Aucune date d'atterrissage définie`;
+      const tierLabel = isOpen ? `${tier} · Discovery` : tier;
+      const landingLine = dueDate
+        ? `Atterrissage : ${long}`
+        : 'Aucune date d\'atterrissage définie';
+      const tooltipText = [
+        `${issueKey} — ${landingLine}`,
+        `Confiance : ${conf.toFixed(0)}% (${tierLabel})`,
+      ].join('\n');
       bar.dataset.momentumTooltip = tooltipText;
       bar.setAttribute('aria-label', tooltipText);
       bar.title = tooltipText;
@@ -2200,10 +2212,23 @@
 
       if (view === VIEW_MODE_BUSINESS) {
         if (meta.isEpic) {
+          // epicProgress drives the confidence tier; we still need it in
+          // Business view so the wash + Discovery hatch render alongside
+          // the landing date. 60s cache keeps this cheap.
+          const { confidence } = await epicProgress.get(issueKey);
           if (isDebug() && !isRefresh) {
-            debug(`${issueKey} (epic, business): dueDate=${meta.dueDate ?? '—'}`);
+            debug(
+              `${issueKey} (epic, business): dueDate=${meta.dueDate ?? '—'}, ` +
+              `confidence=${Math.round(confidence)}%, ` +
+              `statusCategory=${meta.statusCategory ?? '—'}`,
+            );
           }
-          applyLanding(bar, { issueKey, dueDate: meta.dueDate });
+          applyLanding(bar, {
+            issueKey,
+            dueDate: meta.dueDate,
+            confidence,
+            statusCategory: meta.statusCategory,
+          });
         } else {
           // Ticket bars: no overlay in Business view.
           removeOverlay(bar);
