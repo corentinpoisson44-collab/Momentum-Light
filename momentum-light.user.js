@@ -1490,13 +1490,6 @@
         color: #0052CC;
         box-shadow: 0 1px 2px rgba(9, 30, 66, 0.12);
       }
-      /* In Business view the PM-only legend chips (confidence / size) lose
-         their meaning — hide them so the banner stays uncluttered. */
-      body[data-momentum-view="business"] .${CONFIDENCE_LEGEND_CLASS},
-      body[data-momentum-view="business"] .${SIZE_LEGEND_CLASS} {
-        display: none;
-      }
-
       /* ---------------------------------------------------------------------
        * Landing-date variant (Business view) — the Epic bar keeps every
        * PM signal (fill, T-Shirt badge, confidence wash, Discovery
