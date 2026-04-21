@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.7.9
-// @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne, macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, menu « How-to » guidé qui surligne chaque feature au premier lancement, et surcharge du menu Export → Image (.png) qui capture la Timeline au format natif (via html2canvas) avec tous les overlays Momentum-Light visibles dessus.
+// @version      0.8.0
+// @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne, macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, menu « How-to » guidé qui surligne chaque feature au premier lancement, toggle « Vue PM / Vue Business » qui remplace les overlays de chiffrage par la date d'atterrissage (duedate) de chaque Epic, et surcharge du menu Export → Image (.png) qui capture la Timeline au format natif (via html2canvas) avec tous les overlays Momentum-Light visibles dessus.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
 // @run-at       document-idle
@@ -41,6 +41,13 @@
   const HOWTO_OVERLAY_ID = 'momentum-howto-overlay';
   const HOWTO_SEEN_KEY = 'momentum-light::howto-seen';
   const OVERLAY_TSHIRT_CLASS = 'momentum-progress__tshirt';
+  // View-mode toggle — "pm" (default, full chiffrage overlays) vs "business"
+  // (Epic bars show only their landing date; ticket overlays are hidden).
+  const VIEW_MODE_KEY = 'momentum-light::view-mode';
+  const VIEW_MODE_PM = 'pm';
+  const VIEW_MODE_BUSINESS = 'business';
+  const VIEW_TOGGLE_CLASS = 'momentum-view-toggle';
+  const OVERLAY_LANDING_MOD = 'momentum-progress--landing';
 
   // ---------------------------------------------------------------------------
   // Macro-estimation (T-Shirt sizing) — each Epic-level size bucket is mapped
@@ -146,6 +153,45 @@
     if (t > PERF_WINDOW_MS) return; // stale mark → skip silently
     console.log(LOG_PREFIX, `[t=${Math.round(t)}] ${reason}`);
   }
+
+  // ---------------------------------------------------------------------------
+  // viewMode — "pm" (default) vs "business". Persisted in localStorage so a
+  // refresh keeps the toggle where the user left it. Consumers subscribe via
+  // `onChange(cb)` — the velocity banner re-paints its toggle, and the main
+  // bootstrap re-runs the feature pipeline so every Epic bar is re-decorated
+  // under the new mode without waiting for the next DOM mutation.
+  // ---------------------------------------------------------------------------
+  const viewMode = (() => {
+    const listeners = new Set();
+    function read() {
+      try {
+        const v = localStorage.getItem(VIEW_MODE_KEY);
+        return v === VIEW_MODE_BUSINESS ? VIEW_MODE_BUSINESS : VIEW_MODE_PM;
+      } catch (_) {
+        return VIEW_MODE_PM;
+      }
+    }
+    let current = read();
+    function syncBody() {
+      if (document.body) document.body.dataset.momentumView = current;
+    }
+    function get() { return current; }
+    function set(next) {
+      if (next !== VIEW_MODE_PM && next !== VIEW_MODE_BUSINESS) return;
+      if (next === current) return;
+      current = next;
+      try { localStorage.setItem(VIEW_MODE_KEY, next); } catch (_) { /* private mode */ }
+      syncBody();
+      for (const cb of listeners) {
+        try { cb(current); } catch (e) { warn('viewMode listener error:', e?.message || e); }
+      }
+    }
+    function onChange(cb) {
+      listeners.add(cb);
+      return () => listeners.delete(cb);
+    }
+    return { get, set, onChange, syncBody };
+  })();
 
   // ---------------------------------------------------------------------------
   // jiraApi — thin fetch wrappers around /rest/api/3/*
@@ -369,7 +415,7 @@
           tshirtSizeField.resolve().catch(() => null),
         ]);
         const jql = `key in (${keys.map((k) => `"${k}"`).join(',')})`;
-        const fieldList = [spFieldId, 'issuetype', 'status'];
+        const fieldList = [spFieldId, 'issuetype', 'status', 'duedate'];
         if (tshirtFieldId) fieldList.push(tshirtFieldId);
         const data = await jiraApi.searchIssues(jql, fieldList, keys.length);
         const results = new Map();
@@ -386,11 +432,15 @@
           const tshirtSize = tshirtFieldId
             ? normalizeTshirtSize(issue.fields?.[tshirtFieldId])
             : null;
+          // Landing date (duedate) — populated in the Business view as the
+          // Epic's "date d'atterrissage". Raw ISO string (YYYY-MM-DD) or null.
+          const dueDate = issue.fields?.duedate || null;
           results.set(issue.key, {
             isEpic,
             storyPoints: Number.isFinite(sp) ? sp : null,
             statusCategory,
             tshirtSize,
+            dueDate,
           });
         }
         const expiresAt = Date.now() + ISSUE_TTL_MS;
@@ -400,6 +450,7 @@
             storyPoints: null,
             statusCategory: null,
             tshirtSize: null,
+            dueDate: null,
           };
           cache.set(key, { expiresAt, value });
           const ws = waiters.get(key) || [];
@@ -1398,6 +1449,76 @@
       }
 
       /* ---------------------------------------------------------------------
+       * View toggle — segmented "Vue PM / Vue Business" chip that lives in
+       * the sticky velocity banner alongside the legend chips. Switches
+       * every Epic bar between the PM overlays (progress, confidence, T-Shirt
+       * badge) and the Business overlay (landing date / duedate).
+       * ------------------------------------------------------------------ */
+      .${VIEW_TOGGLE_CLASS} {
+        display: inline-flex;
+        gap: 2px;
+        padding: 2px;
+        border-radius: 14px;
+        background: #DFE1E6;
+        pointer-events: auto;
+        box-shadow: 0 1px 2px rgba(9, 30, 66, 0.12);
+      }
+      .${VIEW_TOGGLE_CLASS}__btn {
+        padding: 4px 10px;
+        border: none;
+        background: transparent;
+        color: #42526E;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        font-size: 11px;
+        font-weight: 600;
+        line-height: 1.2;
+        cursor: pointer;
+        border-radius: 12px;
+      }
+      .${VIEW_TOGGLE_CLASS}__btn:hover {
+        color: #172B4D;
+      }
+      .${VIEW_TOGGLE_CLASS}__btn[data-active="1"] {
+        background: #FFFFFF;
+        color: #0052CC;
+        box-shadow: 0 1px 2px rgba(9, 30, 66, 0.12);
+      }
+      /* In Business view the PM-only legend chips (confidence / size) lose
+         their meaning — hide them so the banner stays uncluttered. */
+      body[data-momentum-view="business"] .${CONFIDENCE_LEGEND_CLASS},
+      body[data-momentum-view="business"] .${SIZE_LEGEND_CLASS} {
+        display: none;
+      }
+
+      /* ---------------------------------------------------------------------
+       * Landing-date variant (Business view) — the overlay covers the whole
+       * Epic bar with a subtle dark wash (to keep the formatted date
+       * readable on any Atlaskit bar color) and renders the formatted
+       * duedate centered. No fill width, no T-Shirt badge, no confidence
+       * wash — the Business view is purely about the "when".
+       * ------------------------------------------------------------------ */
+      .${OVERLAY_LANDING_MOD} .${OVERLAY_FILL_CLASS} {
+        display: none;
+      }
+      .${OVERLAY_LANDING_MOD}::before,
+      .${OVERLAY_LANDING_MOD}::after {
+        display: none !important;
+      }
+      .${OVERLAY_LANDING_MOD} {
+        background-color: rgba(9, 30, 66, 0.25);
+      }
+      .${OVERLAY_LANDING_MOD} .${OVERLAY_LABEL_CLASS} {
+        padding: 0 8px;
+        font-size: 11px;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+      }
+      .${OVERLAY_LANDING_MOD}[data-has-date="0"] .${OVERLAY_LABEL_CLASS} {
+        font-style: italic;
+        color: rgba(255, 255, 255, 0.82);
+      }
+
+      /* ---------------------------------------------------------------------
        * How-to menu — a small floating "?" button that opens a guided tour
        * spotlighting each feature one by one with Skip / Previous / Next.
        * ------------------------------------------------------------------ */
@@ -1854,6 +1975,8 @@
 
       const overlay = ensureOverlay(bar);
       overlay.classList.remove(OVERLAY_ESTIMATE_MOD);
+      overlay.classList.remove(OVERLAY_LANDING_MOD);
+      delete overlay.dataset.hasDate;
       if (showWash) {
         overlay.dataset.confidence = tier;
       } else {
@@ -1984,6 +2107,8 @@
       }
       const overlay = ensureOverlay(bar);
       overlay.classList.add(OVERLAY_ESTIMATE_MOD);
+      overlay.classList.remove(OVERLAY_LANDING_MOD);
+      delete overlay.dataset.hasDate;
       // Ticket variant never carries a confidence tier — strip any stale
       // attribute and bar opacity left over if this bar was previously
       // decorated as an epic.
@@ -1999,6 +2124,60 @@
       bar.title = tooltipText;
     }
 
+    // Business view: paint the formatted landing date on the Epic bar. The
+    // overlay purposefully strips every PM-only signal (fill, confidence
+    // wash, T-Shirt badge) so the date is the only thing a stakeholder
+    // reads. Tickets aren't decorated in this view — their overlays are
+    // removed by decorateBar before we get here.
+    function applyLanding(bar, { issueKey, dueDate }) {
+      const overlay = ensureOverlay(bar);
+      overlay.classList.remove(OVERLAY_ESTIMATE_MOD);
+      overlay.classList.add(OVERLAY_LANDING_MOD);
+      delete overlay.dataset.confidence;
+      delete overlay.dataset.discovery;
+      delete overlay.dataset.epicSize;
+      delete overlay.dataset.sizingDrift;
+      resetBarConfidence(bar);
+      // Strip the T-Shirt badge if the bar was previously PM-decorated.
+      const badge = overlay.querySelector(`.${OVERLAY_TSHIRT_CLASS}`);
+      if (badge) badge.remove();
+      const fill = overlay.querySelector(`.${OVERLAY_FILL_CLASS}`);
+      if (fill) fill.style.width = '0%';
+
+      const short = formatDueDate(dueDate, 'short');
+      const long = formatDueDate(dueDate, 'long');
+      const label = overlay.querySelector(`.${OVERLAY_LABEL_CLASS}`);
+      if (label) label.textContent = short || 'Sans date d\'atterrissage';
+      overlay.dataset.hasDate = dueDate ? '1' : '0';
+
+      const tooltipText = dueDate
+        ? `${issueKey} — Atterrissage : ${long}`
+        : `${issueKey} — Aucune date d'atterrissage définie`;
+      bar.dataset.momentumTooltip = tooltipText;
+      bar.setAttribute('aria-label', tooltipText);
+      bar.title = tooltipText;
+    }
+
+    // Format a raw Jira duedate (YYYY-MM-DD) for display. `short` is used
+    // inside the bar overlay (compact), `long` is the tooltip form.
+    // Graceful fallbacks: invalid / empty strings return null (short) or
+    // the raw string (long) so the tooltip still carries something useful.
+    function formatDueDate(raw, variant) {
+      if (!raw) return null;
+      const d = new Date(raw);
+      if (Number.isNaN(d.getTime())) {
+        return variant === 'long' ? String(raw) : null;
+      }
+      try {
+        const opts = variant === 'long'
+          ? { day: 'numeric', month: 'long', year: 'numeric' }
+          : { day: '2-digit', month: 'short', year: 'numeric' };
+        return new Intl.DateTimeFormat('fr-FR', opts).format(d);
+      } catch (_) {
+        return raw;
+      }
+    }
+
     async function decorateBar(bar) {
       const issueKey = extractIssueKey(bar);
       if (!issueKey) {
@@ -2006,11 +2185,29 @@
         return;
       }
 
+      const view = viewMode.get();
       const previous = decorated.get(bar);
-      const isRefresh = previous && previous.issueKey === issueKey;
-      if (!isRefresh) decorated.set(bar, { issueKey });
+      // Include the view in the refresh key so a PM → Business switch forces
+      // a re-decoration even on bars whose issueKey hasn't changed.
+      const isRefresh = previous && previous.issueKey === issueKey && previous.view === view;
+      if (!isRefresh) decorated.set(bar, { issueKey, view });
 
       const meta = await issueMeta.get(issueKey);
+
+      if (view === VIEW_MODE_BUSINESS) {
+        if (meta.isEpic) {
+          if (isDebug() && !isRefresh) {
+            debug(`${issueKey} (epic, business): dueDate=${meta.dueDate ?? '—'}`);
+          }
+          applyLanding(bar, { issueKey, dueDate: meta.dueDate });
+        } else {
+          // Ticket bars: no overlay in Business view.
+          removeOverlay(bar);
+          delete bar.dataset.momentumTooltip;
+        }
+        return;
+      }
+
       if (meta.isEpic) {
         const { done, total, childStats, confidence } = await epicProgress.get(issueKey);
         if (isDebug() && !isRefresh) {
@@ -2401,10 +2598,44 @@
       return legend;
     }
 
+    function buildViewToggle() {
+      const wrapper = document.createElement('div');
+      wrapper.className = VIEW_TOGGLE_CLASS;
+      wrapper.title =
+        'Vue PM : progression, chiffrage SP et badges T-Shirt.\n' +
+        'Vue Business : date d\'atterrissage (duedate) de chaque Epic.';
+      const options = [
+        { view: VIEW_MODE_PM, label: 'Vue PM' },
+        { view: VIEW_MODE_BUSINESS, label: 'Vue Business' },
+      ];
+      const buttons = [];
+      for (const { view, label } of options) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = `${VIEW_TOGGLE_CLASS}__btn`;
+        btn.dataset.view = view;
+        btn.textContent = label;
+        btn.addEventListener('click', () => viewMode.set(view));
+        wrapper.appendChild(btn);
+        buttons.push(btn);
+      }
+      function sync() {
+        const active = viewMode.get();
+        for (const btn of buttons) {
+          btn.dataset.active = btn.dataset.view === active ? '1' : '0';
+          btn.setAttribute('aria-pressed', btn.dataset.view === active ? 'true' : 'false');
+        }
+      }
+      sync();
+      viewMode.onChange(sync);
+      return wrapper;
+    }
+
     function build(mode) {
       const wrapper = document.createElement('div');
       wrapper.id = VELOCITY_BANNER_ID;
       wrapper.dataset.anchor = mode;
+      wrapper.appendChild(buildViewToggle());
       wrapper.appendChild(buildSizeLegend());
       wrapper.appendChild(buildLegend());
       const chip = document.createElement('span');
@@ -3920,6 +4151,10 @@
 
   function bootstrap() {
     ensureStyles();
+    // Reflect the persisted view mode on <body> before any feature runs so
+    // the CSS guards (e.g. hiding PM-only legends in Business view) apply
+    // on the very first paint, no flicker on refresh.
+    viewMode.syncBody();
     tooltipInterceptor.install();
     exportPng.install();
     // Two debounces: the DOM one is conservative (coalesces Jira's re-render
@@ -3935,12 +4170,15 @@
     // consumers got the stale value, the fresh one arrives async), trigger a
     // re-paint so chips actually update on screen.
     sprintCapacity.onFresh(onMutationFromApi);
+    // View-mode toggle — re-run the pipeline so every Epic bar is re-decorated
+    // under the new mode without waiting for the next DOM mutation.
+    viewMode.onChange(runActiveFeatures);
     const observer = new MutationObserver(onMutationFromDom);
     observer.observe(document.body, { childList: true, subtree: true });
     // Initial pass (in case the timeline is already rendered at document-idle).
     runActiveFeatures();
     log(
-      'loaded — version 0.7.8',
+      'loaded — version 0.8.0',
       isDebug()
         ? '(debug on)'
         : '(debug off — enable with: localStorage.setItem(\'momentum-light-debug\', \'1\'))',
