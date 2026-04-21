@@ -1508,6 +1508,10 @@
         background-color: rgba(9, 30, 66, 0.25);
       }
       .${OVERLAY_LANDING_MOD} .${OVERLAY_LABEL_CLASS} {
+        /* Right-align the landing date so it sits next to the bar's end
+           edge — the visual position of the "date d'atterrissage" the
+           stakeholder reads on the timeline ruler. */
+        justify-content: flex-end;
         padding: 0 8px;
         font-size: 11px;
         font-weight: 600;
@@ -2635,9 +2639,9 @@
       const wrapper = document.createElement('div');
       wrapper.id = VELOCITY_BANNER_ID;
       wrapper.dataset.anchor = mode;
-      wrapper.appendChild(buildViewToggle());
       wrapper.appendChild(buildSizeLegend());
       wrapper.appendChild(buildLegend());
+      wrapper.appendChild(buildViewToggle());
       const chip = document.createElement('span');
       chip.className = 'momentum-velocity-banner__chip';
       chip.title = 'Cliquez pour rafraîchir';
