@@ -1510,6 +1510,15 @@
         -webkit-text-stroke: 1px rgba(0, 0, 0, 0.95);
         paint-order: stroke fill;
       }
+      /* Reserve room on the right ONLY when JIRA actually rendered its
+         native link-icon inside the bar (dependency with another Epic
+         — a ~22-32 px square widget at the bar's end edge). Without a
+         link-icon the date stays flush right against the bar end, the
+         way it was originally designed. Mirrors the conditional
+         padding-left used for the T-shirt badge above. */
+      .${OVERLAY_LANDING_MOD}[data-has-link-icon] .${OVERLAY_LABEL_CLASS} {
+        padding-right: 34px;
+      }
       .${OVERLAY_LANDING_MOD}[data-has-date="0"] .${OVERLAY_LABEL_CLASS} {
         font-style: italic;
         color: rgba(255, 255, 255, 0.82);
@@ -1900,6 +1909,36 @@
       resetBarConfidence(bar);
     }
 
+    // True if the bar currently has JIRA's native link-icon associated
+    // with it — the small square widget rendered at the bar's end edge
+    // when the Epic has a dependency on another Epic. JIRA tags the
+    // icon's inner span with a testid containing "link-icon" (e.g.
+    // "roadmap.timeline-table-kit.ui.chart-item-content.date-content.
+    // bar.bar-content.bar-icon.link-icon").
+    //
+    // The icon isn't always a strict DOM descendant of the element we
+    // treat as the "bar" — Atlaskit sometimes portals the dependency
+    // button into a sibling container within the same chart-item cell.
+    // We therefore search within the bar AND up a few ancestors until
+    // we escape the chart-item-content subtree. Capped at 6 hops so we
+    // never leak into neighbouring rows.
+    function barHasLinkIcon(bar) {
+      let scope = bar;
+      for (let i = 0; i < 6 && scope; i += 1) {
+        if (scope.querySelector && scope.querySelector('[data-testid*="link-icon"]')) {
+          return true;
+        }
+        const tid = scope.getAttribute?.('data-testid') || '';
+        if (tid.startsWith(CHART_CONTENT_TESTID_PREFIX) && scope !== bar) {
+          // We've reached and searched the enclosing chart-item-content
+          // container — no icon found, stop before we climb into the row.
+          break;
+        }
+        scope = scope.parentElement;
+      }
+      return false;
+    }
+
     // Confidence tiers drive the opacity / hatch treatment applied to the
     // epic bar: low-confidence epics read as "uncertain" at a glance via
     // diagonal stripes + a faded host bar, without requiring a tooltip hover.
@@ -1981,8 +2020,17 @@
       overlay.classList.toggle(OVERLAY_LANDING_MOD, isBusiness);
       if (isBusiness) {
         overlay.dataset.hasDate = dueDate ? '1' : '0';
+        // Reserve right-padding on the label only when a native link-icon
+        // is actually present, so dateless / dependency-less bars keep
+        // the date flush against the bar's end edge.
+        if (barHasLinkIcon(bar)) {
+          overlay.dataset.hasLinkIcon = '';
+        } else {
+          delete overlay.dataset.hasLinkIcon;
+        }
       } else {
         delete overlay.dataset.hasDate;
+        delete overlay.dataset.hasLinkIcon;
       }
       if (showWash) {
         overlay.dataset.confidence = tier;
