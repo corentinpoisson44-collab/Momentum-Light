@@ -1910,23 +1910,15 @@
     }
 
     // True if the bar currently contains JIRA's native link-icon — the
-    // small square widget (~22-32 px) rendered at the bar's end edge
-    // when the Epic has a dependency on another Epic. Detection is
-    // geometric (square-ish, within a size range) rather than
-    // testid-based because Atlassian's widget naming is unstable and the
-    // same range already identifies link-icons in findBars above.
-    // Our own overlay is skipped explicitly.
+    // small square widget rendered at the bar's end edge when the Epic
+    // has a dependency on another Epic. JIRA marks the icon's inner
+    // span with a stable testid ending in ".link-icon" (e.g.
+    // "roadmap.timeline-table-kit.ui.chart-item-content.date-content.
+    // bar.bar-content.bar-icon.link-icon"), so we match on that.
+    // `*=` (contains) rather than `$=` (ends-with) keeps the check
+    // resilient if Atlassian appends suffixes in future DOM revisions.
     function barHasLinkIcon(bar) {
-      for (const child of bar.children) {
-        if (child.classList && child.classList.contains(OVERLAY_CLASS)) continue;
-        const rect = child.getBoundingClientRect();
-        if (rect.width <= 0 || rect.height <= 0) continue;
-        if (rect.width < 16 || rect.width > 40) continue;
-        if (rect.height < 16 || rect.height > 40) continue;
-        const aspect = rect.width / rect.height;
-        if (aspect >= 0.6 && aspect <= 1.6) return true;
-      }
-      return false;
+      return bar.querySelector('[data-testid*="link-icon"]') !== null;
     }
 
     // Confidence tiers drive the opacity / hatch treatment applied to the
