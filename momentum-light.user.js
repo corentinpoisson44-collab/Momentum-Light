@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.7.8
+// @version      0.7.9
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne, macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, menu « How-to » guidé qui surligne chaque feature au premier lancement, et surcharge du menu Export → Image (.png) qui capture la Timeline au format natif (via html2canvas) avec tous les overlays Momentum-Light visibles dessus.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -36,6 +36,7 @@
   const OVERLAY_SPRINT_FILL_MOD = 'momentum-progress--sprint-fill';
   const VELOCITY_BANNER_ID = 'momentum-velocity-banner';
   const CONFIDENCE_LEGEND_CLASS = 'momentum-confidence-legend';
+  const SIZE_LEGEND_CLASS = 'momentum-size-legend';
   const HOWTO_BUTTON_ID = 'momentum-howto-button';
   const HOWTO_OVERLAY_ID = 'momentum-howto-overlay';
   const HOWTO_SEEN_KEY = 'momentum-light::howto-seen';
@@ -59,6 +60,17 @@
     M: 20,
     L: 40,
     XL: 80,
+  };
+  // Sprint-count convention exposed to the team via the legend chip. Purely
+  // informational — the macro-estimation math still runs off TSHIRT_SIZE_SP.
+  // Follows the Fibonacci pattern used by most agile shops (1, 2, 3, 5, 8, 13).
+  const TSHIRT_SIZE_SPRINTS = {
+    XS: 1,
+    S: 2,
+    M: 3,
+    L: 5,
+    XL: 8,
+    XXL: 13,
   };
   const TSHIRT_FIELD_NAME = 'T-Shirt Sizing';
   // Sizing-drift tolerance window — ratio of (real child SP) / (macro size SP).
@@ -1339,6 +1351,52 @@
         font-weight: 500;
       }
 
+      /* Size legend — mirror of the confidence chip, but for the T-Shirt
+         macro-estimation scale. Each item shows the bucket name and its
+         sprint-count convention (XS=1, S=2, M=3, L=5, XL=8, XXL=13).
+         The swatch reuses the neutral pill treatment of the T-Shirt badge
+         painted on Epic bars so readers instantly map legend → bar. */
+      .${SIZE_LEGEND_CLASS} {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 10px;
+        border-radius: 14px;
+        background: #F4F5F7;
+        color: #42526E;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        font-size: 11px;
+        line-height: 1.3;
+        user-select: none;
+        white-space: nowrap;
+        pointer-events: auto;
+        box-shadow: 0 1px 2px rgba(9, 30, 66, 0.12);
+      }
+      .${SIZE_LEGEND_CLASS}__title {
+        font-weight: 600;
+        color: #172B4D;
+      }
+      .${SIZE_LEGEND_CLASS}__item {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+      }
+      .${SIZE_LEGEND_CLASS}__swatch {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 22px;
+        height: 14px;
+        padding: 0 5px;
+        border-radius: 7px;
+        background: rgba(9, 30, 66, 0.35);
+        color: rgba(255, 255, 255, 0.92);
+        font-size: 9px;
+        font-weight: 600;
+        letter-spacing: 0.04em;
+        box-sizing: border-box;
+      }
+
       /* ---------------------------------------------------------------------
        * How-to menu — a small floating "?" button that opens a guided tour
        * spotlighting each feature one by one with Skip / Previous / Next.
@@ -2319,10 +2377,35 @@
       return legend;
     }
 
+    function buildSizeLegend() {
+      // Reference-only chip — shows the T-Shirt size → sprint-count
+      // convention. Matches the swatch treatment of the T-Shirt badge
+      // painted on Epic bars so readers can decode a badge at a glance.
+      const legend = document.createElement('span');
+      legend.className = SIZE_LEGEND_CLASS;
+      const tooltipLines = Object.entries(TSHIRT_SIZE_SPRINTS)
+        .map(([size, sprints]) => `  • ${size} = ${sprints} sprint${sprints > 1 ? 's' : ''}`)
+        .join('\n');
+      legend.title = `Taille Epic → nombre de sprints estimé :\n${tooltipLines}`;
+      const items = Object.entries(TSHIRT_SIZE_SPRINTS)
+        .map(
+          ([size, sprints]) =>
+            `<span class="${SIZE_LEGEND_CLASS}__item">` +
+              `<span class="${SIZE_LEGEND_CLASS}__swatch">${size}</span>` +
+              `${sprints} sprint${sprints > 1 ? 's' : ''}` +
+            `</span>`,
+        )
+        .join('');
+      legend.innerHTML =
+        `<span class="${SIZE_LEGEND_CLASS}__title">Taille Epic :</span>${items}`;
+      return legend;
+    }
+
     function build(mode) {
       const wrapper = document.createElement('div');
       wrapper.id = VELOCITY_BANNER_ID;
       wrapper.dataset.anchor = mode;
+      wrapper.appendChild(buildSizeLegend());
       wrapper.appendChild(buildLegend());
       const chip = document.createElement('span');
       chip.className = 'momentum-velocity-banner__chip';
