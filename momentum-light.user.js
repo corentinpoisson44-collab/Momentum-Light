@@ -1078,6 +1078,12 @@
       .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="low"]::before {
         background-color: rgba(255, 255, 255, 0.60);
       }
+      /* Low-confidence bars are heavily washed (60% white) so they risk
+         disappearing into the timeline background. A 1px inset border
+         frames the bar so it stays readable as a distinct shape. */
+      .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="low"] {
+        box-shadow: inset 0 0 0 1px rgba(9, 30, 66, 0.35);
+      }
       .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="medium"][data-discovery]::after,
       .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="low"][data-discovery]::after {
         content: '';
@@ -1307,6 +1313,11 @@
       }
       .${CONFIDENCE_LEGEND_CLASS}__swatch[data-tier="low"]::before {
         background-color: rgba(255, 255, 255, 0.60);
+      }
+      /* Mirror the inset border we paint on low-confidence timeline bars so
+         the swatch stays readable under the heavy wash. */
+      .${CONFIDENCE_LEGEND_CLASS}__swatch[data-tier="low"] {
+        box-shadow: inset 0 0 0 1px rgba(9, 30, 66, 0.35);
       }
       /* Hatch overlay — only on swatches explicitly flagged as Discovery,
          mirroring the [data-discovery] gate on timeline Epic bars. */
@@ -1753,10 +1764,15 @@
       { done, total, epicKey, childStats, confidence, statusCategory, tshirtSize },
     ) {
       const stats = childStats || { done: 0, inProgress: 0, todo: 0, unestimated: 0, totalChildren: 0 };
-      // No children at all AND no macro-estimate either → nothing to visualize.
-      // An Epic with a T-Shirt size but zero chiffred children still gets
-      // painted: the badge IS the signal in that case.
-      if (stats.totalChildren === 0 && (!total || total <= 0) && !tshirtSize) {
+      const isOpen = statusCategory === 'new';
+      // No children at all AND no macro-estimate either → usually nothing to
+      // visualize. Two exceptions keep the overlay alive:
+      //   • an Epic with a T-Shirt size but zero chiffred children — the
+      //     badge IS the signal in that case;
+      //   • an Epic in "Open" status — it's still in Discovery (scope work
+      //     pending), and must read as such via the low-confidence wash +
+      //     hatch instead of falling back to a bare native bar.
+      if (stats.totalChildren === 0 && (!total || total <= 0) && !tshirtSize && !isOpen) {
         removeOverlay(bar);
         delete bar.dataset.momentumTooltip;
         return;
@@ -1775,7 +1791,7 @@
       //     pending", without cluttering bars for work in flight.
       // High-confidence Epics get neither treatment.
       const showWash = tier !== 'high';
-      const isDiscovery = statusCategory === 'new';
+      const isDiscovery = isOpen;
       const showHatch = showWash && isDiscovery;
 
       const overlay = ensureOverlay(bar);
