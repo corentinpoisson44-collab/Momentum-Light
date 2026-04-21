@@ -1458,25 +1458,32 @@
         display: inline-flex;
         gap: 2px;
         padding: 2px;
+        border: none;
         border-radius: 14px;
         background: #DFE1E6;
         pointer-events: auto;
+        cursor: pointer;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
         box-shadow: 0 1px 2px rgba(9, 30, 66, 0.12);
       }
+      .${VIEW_TOGGLE_CLASS}:hover {
+        background: #C1C7D0;
+      }
+      .${VIEW_TOGGLE_CLASS}:focus-visible {
+        outline: 2px solid #4C9AFF;
+        outline-offset: 2px;
+      }
       .${VIEW_TOGGLE_CLASS}__btn {
+        display: inline-flex;
+        align-items: center;
         padding: 4px 10px;
-        border: none;
-        background: transparent;
         color: #42526E;
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        font-family: inherit;
         font-size: 11px;
         font-weight: 600;
         line-height: 1.2;
-        cursor: pointer;
         border-radius: 12px;
-      }
-      .${VIEW_TOGGLE_CLASS}__btn:hover {
-        color: #172B4D;
+        pointer-events: none;
       }
       .${VIEW_TOGGLE_CLASS}__btn[data-active="1"] {
         background: #FFFFFF;
@@ -2583,31 +2590,45 @@
     }
 
     function buildViewToggle() {
-      const wrapper = document.createElement('div');
+      // Single toggle button: clicking anywhere on the chip swaps modes.
+      // A <button> root makes keyboard activation (Enter/Space) free and
+      // gives us a native focus ring. The two inner segments are pure
+      // visual labels that reflect the current selection via
+      // [data-active], not independent click targets.
+      const wrapper = document.createElement('button');
+      wrapper.type = 'button';
       wrapper.className = VIEW_TOGGLE_CLASS;
       wrapper.title =
+        'Cliquez pour basculer entre Vue PM et Vue Business.\n' +
         'Vue PM : progression, chiffrage SP et badges T-Shirt.\n' +
         'Vue Business : date d\'atterrissage (duedate) de chaque Epic.';
-      const options = [
+      const segments = [];
+      for (const { view, label } of [
         { view: VIEW_MODE_PM, label: 'Vue PM' },
         { view: VIEW_MODE_BUSINESS, label: 'Vue Business' },
-      ];
-      const buttons = [];
-      for (const { view, label } of options) {
-        const btn = document.createElement('button');
-        btn.type = 'button';
-        btn.className = `${VIEW_TOGGLE_CLASS}__btn`;
-        btn.dataset.view = view;
-        btn.textContent = label;
-        btn.addEventListener('click', () => viewMode.set(view));
-        wrapper.appendChild(btn);
-        buttons.push(btn);
+      ]) {
+        const seg = document.createElement('span');
+        seg.className = `${VIEW_TOGGLE_CLASS}__btn`;
+        seg.dataset.view = view;
+        seg.textContent = label;
+        wrapper.appendChild(seg);
+        segments.push(seg);
       }
+      wrapper.addEventListener('click', () => {
+        const next = viewMode.get() === VIEW_MODE_PM ? VIEW_MODE_BUSINESS : VIEW_MODE_PM;
+        viewMode.set(next);
+      });
       function sync() {
         const active = viewMode.get();
-        for (const btn of buttons) {
-          btn.dataset.active = btn.dataset.view === active ? '1' : '0';
-          btn.setAttribute('aria-pressed', btn.dataset.view === active ? 'true' : 'false');
+        wrapper.dataset.view = active;
+        wrapper.setAttribute(
+          'aria-label',
+          active === VIEW_MODE_PM
+            ? 'Vue PM active — cliquer pour basculer en Vue Business'
+            : 'Vue Business active — cliquer pour basculer en Vue PM',
+        );
+        for (const seg of segments) {
+          seg.dataset.active = seg.dataset.view === active ? '1' : '0';
         }
       }
       sync();
