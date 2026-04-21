@@ -1491,24 +1491,15 @@
       }
 
       /* ---------------------------------------------------------------------
-       * Landing-date variant (Business view) — the overlay covers the whole
-       * Epic bar. No fill width, no T-Shirt badge, but the confidence
-       * wash + Discovery hatch are preserved (same [data-confidence] /
-       * [data-discovery] rules as PM view) so stakeholders still read
-       * the "is this date trustworthy?" signal alongside the "when".
+       * Landing-date variant (Business view) — the Epic bar keeps every
+       * PM signal (fill, T-Shirt badge, confidence wash, Discovery
+       * hatch); the ONLY difference is that the centered "X / Y SP"
+       * label is swapped for the formatted landing date, right-aligned
+       * against the bar's end edge. A missing date renders italic so
+       * the absence is visible at a glance.
        * ------------------------------------------------------------------ */
-      .${OVERLAY_LANDING_MOD} .${OVERLAY_FILL_CLASS} {
-        display: none;
-      }
       .${OVERLAY_LANDING_MOD} .${OVERLAY_LABEL_CLASS} {
-        /* Right-align the landing date so it sits next to the bar's end
-           edge — the visual position of the "date d'atterrissage" the
-           stakeholder reads on the timeline ruler. */
         justify-content: flex-end;
-        padding: 0 8px;
-        font-size: 11px;
-        font-weight: 600;
-        letter-spacing: 0.02em;
       }
       .${OVERLAY_LANDING_MOD}[data-has-date="0"] .${OVERLAY_LABEL_CLASS} {
         font-style: italic;
@@ -1937,10 +1928,11 @@
 
     function applyProgress(
       bar,
-      { done, total, epicKey, childStats, confidence, statusCategory, tshirtSize },
+      { done, total, epicKey, childStats, confidence, statusCategory, tshirtSize, view, dueDate },
     ) {
       const stats = childStats || { done: 0, inProgress: 0, todo: 0, unestimated: 0, totalChildren: 0 };
       const isOpen = statusCategory === 'new';
+      const isBusiness = view === VIEW_MODE_BUSINESS;
       // No children at all AND no macro-estimate either → usually nothing to
       // visualize. Two exceptions keep the overlay alive:
       //   • an Epic with a T-Shirt size but zero chiffred children — the
@@ -1948,7 +1940,9 @@
       //   • an Epic in "Open" status — it's still in Discovery (scope work
       //     pending), and must read as such via the low-confidence wash +
       //     hatch instead of falling back to a bare native bar.
-      if (stats.totalChildren === 0 && (!total || total <= 0) && !tshirtSize && !isOpen) {
+      // In Business view the overlay ALWAYS stays (the landing date is the
+      // payload, even for an Epic with no children / no size / closed).
+      if (!isBusiness && stats.totalChildren === 0 && (!total || total <= 0) && !tshirtSize && !isOpen) {
         removeOverlay(bar);
         delete bar.dataset.momentumTooltip;
         return;
@@ -1972,8 +1966,15 @@
 
       const overlay = ensureOverlay(bar);
       overlay.classList.remove(OVERLAY_ESTIMATE_MOD);
-      overlay.classList.remove(OVERLAY_LANDING_MOD);
-      delete overlay.dataset.hasDate;
+      // Landing mod is the only thing that differs between PM and Business
+      // — toggle it here so the label alignment + "missing date" styling
+      // hooks pick up the right view automatically.
+      overlay.classList.toggle(OVERLAY_LANDING_MOD, isBusiness);
+      if (isBusiness) {
+        overlay.dataset.hasDate = dueDate ? '1' : '0';
+      } else {
+        delete overlay.dataset.hasDate;
+      }
       if (showWash) {
         overlay.dataset.confidence = tier;
       } else {
@@ -2031,7 +2032,17 @@
       // it fades alongside the rest of the text on narrow bars instead of
       // competing for its own reserved space.
       const missingSuffix = stats.unestimated > 0 ? ` (∅ ${stats.unestimated})` : '';
-      if (label) label.textContent = `${done} / ${total} SP${missingSuffix}`;
+      const pmLabel = `${done} / ${total} SP${missingSuffix}`;
+      const landingShort = formatDueDate(dueDate, 'short');
+      const landingLong = formatDueDate(dueDate, 'long');
+      if (label) {
+        // Business view swaps the "X / Y SP" read-out for the landing
+        // date. Everything else on the bar (fill, T-Shirt badge, wash,
+        // hatch) stays — only the in-bar text changes.
+        label.textContent = isBusiness
+          ? (landingShort || 'Sans date d\'atterrissage')
+          : pmLabel;
+      }
 
       // --- Sprint-end projection ----------------------------------------
       // Best-effort synchronous read of the cached velocity snapshot.
@@ -2082,12 +2093,28 @@
         else if (drift === 'over') driftTag = ' · dépassement 🔴';
         tshirtLine = `Macro-estimé ${tshirtSize} (~${macroSP} SP)${driftTag}`;
       }
-      const tooltipText = [
-        `${epicKey} — ${done} / ${total} SP (${pct.toFixed(0)}%)`,
-        tshirtLine,
-        projectionLine,
-        `${confidenceLine}${breakdown}`,
-      ].filter(Boolean).join('\n');
+      // Tooltip header: Business view leads with the landing date (the
+      // stakeholder payload) and keeps chiffrage as a secondary line so
+      // PM context is still one hover away.
+      const pmHeader = `${epicKey} — ${done} / ${total} SP (${pct.toFixed(0)}%)`;
+      const landingLine = dueDate
+        ? `Atterrissage : ${landingLong}`
+        : 'Aucune date d\'atterrissage définie';
+      const tooltipLines = isBusiness
+        ? [
+            `${epicKey} — ${landingLine}`,
+            pmHeader,
+            tshirtLine,
+            projectionLine,
+            `${confidenceLine}${breakdown}`,
+          ]
+        : [
+            pmHeader,
+            tshirtLine,
+            projectionLine,
+            `${confidenceLine}${breakdown}`,
+          ];
+      const tooltipText = tooltipLines.filter(Boolean).join('\n');
       bar.dataset.momentumTooltip = tooltipText;
       bar.setAttribute('aria-label', tooltipText);
       bar.title = tooltipText;
@@ -2116,59 +2143,6 @@
       if (label) label.textContent = `${sp} SP`;
 
       const tooltipText = `${issueKey} — ${sp} SP`;
-      bar.dataset.momentumTooltip = tooltipText;
-      bar.setAttribute('aria-label', tooltipText);
-      bar.title = tooltipText;
-    }
-
-    // Business view: paint the formatted landing date on the Epic bar.
-    // PM-only chiffrage (fill width, T-Shirt badge, SP label) is stripped,
-    // but the confidence wash and Discovery hatch are preserved so
-    // stakeholders keep the "is this date trustworthy?" read that drives
-    // the PM view's at-a-glance risk signal. Tickets aren't decorated in
-    // this view — their overlays are removed by decorateBar before we
-    // get here.
-    function applyLanding(bar, { issueKey, dueDate, confidence, statusCategory }) {
-      const overlay = ensureOverlay(bar);
-      overlay.classList.remove(OVERLAY_ESTIMATE_MOD);
-      overlay.classList.add(OVERLAY_LANDING_MOD);
-      delete overlay.dataset.epicSize;
-      delete overlay.dataset.sizingDrift;
-
-      // Same tier / wash / hatch rules as applyProgress — keep them in
-      // sync so a bar reads identically across the two views (minus the
-      // chiffrage label).
-      const conf = Number.isFinite(confidence) ? confidence : 0;
-      const tier = confidenceTier(conf);
-      const isOpen = statusCategory === 'new';
-      const showWash = tier !== 'high';
-      const showHatch = showWash && isOpen;
-      if (showWash) overlay.dataset.confidence = tier;
-      else delete overlay.dataset.confidence;
-      if (showHatch) overlay.dataset.discovery = '';
-      else delete overlay.dataset.discovery;
-      applyBarConfidence(bar, tier);
-
-      // Strip the T-Shirt badge if the bar was previously PM-decorated.
-      const badge = overlay.querySelector(`.${OVERLAY_TSHIRT_CLASS}`);
-      if (badge) badge.remove();
-      const fill = overlay.querySelector(`.${OVERLAY_FILL_CLASS}`);
-      if (fill) fill.style.width = '0%';
-
-      const short = formatDueDate(dueDate, 'short');
-      const long = formatDueDate(dueDate, 'long');
-      const label = overlay.querySelector(`.${OVERLAY_LABEL_CLASS}`);
-      if (label) label.textContent = short || 'Sans date d\'atterrissage';
-      overlay.dataset.hasDate = dueDate ? '1' : '0';
-
-      const tierLabel = isOpen ? `${tier} · Discovery` : tier;
-      const landingLine = dueDate
-        ? `Atterrissage : ${long}`
-        : 'Aucune date d\'atterrissage définie';
-      const tooltipText = [
-        `${issueKey} — ${landingLine}`,
-        `Confiance : ${conf.toFixed(0)}% (${tierLabel})`,
-      ].join('\n');
       bar.dataset.momentumTooltip = tooltipText;
       bar.setAttribute('aria-label', tooltipText);
       bar.title = tooltipText;
@@ -2210,40 +2184,14 @@
 
       const meta = await issueMeta.get(issueKey);
 
-      if (view === VIEW_MODE_BUSINESS) {
-        if (meta.isEpic) {
-          // epicProgress drives the confidence tier; we still need it in
-          // Business view so the wash + Discovery hatch render alongside
-          // the landing date. 60s cache keeps this cheap.
-          const { confidence } = await epicProgress.get(issueKey);
-          if (isDebug() && !isRefresh) {
-            debug(
-              `${issueKey} (epic, business): dueDate=${meta.dueDate ?? '—'}, ` +
-              `confidence=${Math.round(confidence)}%, ` +
-              `statusCategory=${meta.statusCategory ?? '—'}`,
-            );
-          }
-          applyLanding(bar, {
-            issueKey,
-            dueDate: meta.dueDate,
-            confidence,
-            statusCategory: meta.statusCategory,
-          });
-        } else {
-          // Ticket bars: no overlay in Business view.
-          removeOverlay(bar);
-          delete bar.dataset.momentumTooltip;
-        }
-        return;
-      }
-
       if (meta.isEpic) {
         const { done, total, childStats, confidence } = await epicProgress.get(issueKey);
         if (isDebug() && !isRefresh) {
           debug(
-            `${issueKey} (epic): ${done}/${total} SP, confidence=${Math.round(confidence)}%, ` +
+            `${issueKey} (epic, ${view}): ${done}/${total} SP, confidence=${Math.round(confidence)}%, ` +
             `unestimated=${childStats?.unestimated ?? 0}/${childStats?.totalChildren ?? 0}, ` +
-            `statusCategory=${meta.statusCategory ?? '—'}`,
+            `statusCategory=${meta.statusCategory ?? '—'}, ` +
+            `dueDate=${meta.dueDate ?? '—'}`,
           );
         }
         applyProgress(bar, {
@@ -2254,7 +2202,14 @@
           confidence,
           statusCategory: meta.statusCategory,
           tshirtSize: meta.tshirtSize,
+          view,
+          dueDate: meta.dueDate,
         });
+      } else if (view === VIEW_MODE_BUSINESS) {
+        // Ticket bars: no overlay in Business view — only Epics carry a
+        // landing-date payload.
+        removeOverlay(bar);
+        delete bar.dataset.momentumTooltip;
       } else {
         if (isDebug() && !isRefresh) debug(`${issueKey} (ticket): ${meta.storyPoints ?? '—'} SP`);
         applyEstimate(bar, { sp: meta.storyPoints, issueKey });
