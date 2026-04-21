@@ -1500,6 +1500,15 @@
        * ------------------------------------------------------------------ */
       .${OVERLAY_LANDING_MOD} .${OVERLAY_LABEL_CLASS} {
         justify-content: flex-end;
+        /* Thin dark outline around the date so the white text stays
+           legible when the host bar is a pale Atlaskit hue (confidence
+           wash pushes low-confidence bars very close to white). The
+           diffuse drop-shadow inherited from .momentum-progress__label
+           isn't enough in that case. paint-order: stroke fill draws
+           the stroke first, then the fill on top, so the glyph keeps
+           its original weight instead of thinning. */
+        -webkit-text-stroke: 0.6px rgba(9, 30, 66, 0.85);
+        paint-order: stroke fill;
       }
       .${OVERLAY_LANDING_MOD}[data-has-date="0"] .${OVERLAY_LABEL_CLASS} {
         font-style: italic;
