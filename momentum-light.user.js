@@ -1507,7 +1507,7 @@
            isn't enough in that case. paint-order: stroke fill draws
            the stroke first, then the fill on top, so the glyph keeps
            its original weight instead of thinning. */
-        -webkit-text-stroke: 0.6px rgba(9, 30, 66, 0.85);
+        -webkit-text-stroke: 1px rgba(0, 0, 0, 0.95);
         paint-order: stroke fill;
       }
       .${OVERLAY_LANDING_MOD}[data-has-date="0"] .${OVERLAY_LABEL_CLASS} {
