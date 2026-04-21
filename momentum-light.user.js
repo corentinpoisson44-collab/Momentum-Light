@@ -1500,6 +1500,12 @@
        * ------------------------------------------------------------------ */
       .${OVERLAY_LANDING_MOD} .${OVERLAY_LABEL_CLASS} {
         justify-content: flex-end;
+        /* Reserve room on the right for JIRA's native link-icon widget
+           (22–32 px square, rendered as a sibling at the bar's end edge
+           when the Epic has an inbound/outbound dependency) so the
+           right-aligned date doesn't superimpose the icon. Mirrors the
+           32 px left-reserve the T-shirt badge already applies. */
+        padding-right: 34px;
         /* Thin dark outline around the date so the white text stays
            legible when the host bar is a pale Atlaskit hue (confidence
            wash pushes low-confidence bars very close to white). The
