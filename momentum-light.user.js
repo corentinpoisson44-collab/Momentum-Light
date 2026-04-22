@@ -426,14 +426,26 @@
 
   // `new` → `indeterminate`: work is in motion, just waiting on a gate
   // or hand-off. Covers EN + FR spellings.
+  //
+  // Conservative guardrail: patterns like "Ready for X" / "Awaiting X" /
+  // "Pending X" only reclassify when X is an explicitly post-dev stage
+  // (UAT, QA, review, merge, release, deploy, validation, recette…).
+  // That avoids the false positive of treating "Ready for Development" /
+  // "Ready for Grooming" / "Awaiting Planning" as in-progress, when
+  // those are actually to-do states — work hasn't started yet. When in
+  // doubt we leave the JIRA category alone; the admin can add an
+  // explicit entry via the localStorage override map.
+  const POSTDEV_GATE_EN = 'uat|qa|review|test(?:ing)?|staging|pre[-\\s]?prod(?:uction)?|prod(?:uction)?|release|deploy(?:ment)?|merge|validation|sign[-\\s]?off|approval';
+  const POSTDEV_GATE_FR = 'uat|qa|review|revue|test|staging|recette|validation|d[eé]ploiement|production|mep|mise\\s+en\\s+prod|signature|approbation';
   const STATUS_INPROGRESS_PATTERNS = [
-    /ready\s+for\b/i,                                     // "Ready for UAT", "Ready for review"
+    new RegExp(`\\bready\\s+(?:for|to)\\s+(?:${POSTDEV_GATE_EN})\\b`, 'i'),
+    new RegExp(`\\bpr[eê]t\\s+(?:pour|à)\\s+(?:${POSTDEV_GATE_FR})\\b`, 'i'),
     /\bunder\s+review\b/i,                                // "Under review"
     /\bin\s+(review|qa|uat|test(ing)?|staging|pre[-\s]?prod(uction)?|validation)\b/i,
-    /\ben\s+(review|revue|recette|test|validation|attente|cours)\b/i,
+    /\ben\s+(review|revue|recette|test|validation|cours)\b/i,
     /\bà\s+(v[eé]rifier|valider|tester|recetter)\b/i,
-    /\bawaiting\b/i,                                      // "Awaiting merge", "Awaiting release"
-    /\bpending\b/i,                                       // "Pending approval"
+    new RegExp(`\\bawaiting\\s+(?:${POSTDEV_GATE_EN})\\b`, 'i'),
+    new RegExp(`\\bpending\\s+(?:${POSTDEV_GATE_EN})\\b`, 'i'),
     /\bto\s+(review|verify|validate|test)\b/i,
     /\b(code\s+review|peer\s+review)\b/i,
   ];
