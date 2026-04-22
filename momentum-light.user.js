@@ -655,6 +655,16 @@
           if (!flushTimer) flushTimer = setTimeout(flush, FLUSH_DELAY_MS);
         });
       },
+      // Drop the cached entry for a given issue. The next get() will
+      // trigger a fresh batch refetch — used by the API mutation
+      // interceptor to pick up duedate / status / T-Shirt / SP changes
+      // in real time instead of waiting the 60 s TTL.
+      invalidate(issueKey) {
+        cache.delete(issueKey);
+      },
+      invalidateAll() {
+        cache.clear();
+      },
     };
   })();
 
@@ -758,6 +768,16 @@
         })();
         inflight.set(epicKey, promise);
         return promise;
+      },
+      // Drop the cached progress for a given Epic so the next get()
+      // pulls fresh child SP / status figures. Used by the mutation
+      // interceptor when a child ticket moves or changes status — the
+      // parent Epic's progress bar repaints in real time.
+      invalidate(epicKey) {
+        cache.delete(epicKey);
+      },
+      invalidateAll() {
+        cache.clear();
       },
     };
   })();
@@ -4669,6 +4689,21 @@
       const sprintId = extractSprintId(url);
       if (sprintId) sprintCapacity.invalidate(sprintId);
       else sprintCapacity.invalidateAll();
+      // Drop the 60 s meta + progress caches so the repaint below reads
+      // post-mutation data instead of showing stale values until the TTL
+      // lapses. When the URL carries an explicit issue key we invalidate
+      // only that entry in issueMeta (the duedate / status / T-Shirt /
+      // SP that just changed) but clear epicProgress wholesale — the
+      // mutated issue could be the child of any Epic on the plan, and
+      // the parent→children map isn't cheap to resolve here.
+      const issueKey = extractIssueKey(url);
+      if (issueKey) {
+        issueMeta.invalidate(issueKey);
+        epicProgress.invalidateAll();
+      } else {
+        issueMeta.invalidateAll();
+        epicProgress.invalidateAll();
+      }
       if (onAfterInvalidate) {
         perfStamp('repaint scheduled (confirm-invalidate)');
         onAfterInvalidate();
