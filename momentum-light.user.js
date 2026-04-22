@@ -1371,7 +1371,7 @@
          the most but high-tier bars keep the same frame for visual
          consistency across the timeline. */
       .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD}) {
-        box-shadow: inset 0 0 0 1px rgba(9, 30, 66, 0.40);
+        box-shadow: 0 0 1px 1px rgb(0 0 0 / 33%);
       }
       .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="medium"][data-discovery]::after,
       .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="low"][data-discovery]::after {
