@@ -38,6 +38,15 @@ Les mises à jour sont poussées automatiquement (Tampermonkey vérifie le `@upd
   ```js
   localStorage.setItem('momentum-light::velocity-board-id', '123')
   ```
+- **Statuts custom — reclassification** : certaines équipes définissent des statuts JIRA custom (`"Ready for UAT"`, `"En recette"`, `"MEP effectuée"`…) que l'admin laisse souvent dans la catégorie `"To Do"`. Momentum-Light détecte automatiquement les motifs les plus courants (FR + EN) pour redresser la classification et ne plus compter ces tickets comme non-démarrés dans le calcul de confiance / progression d'Epic. Pour les statuts que les patterns par défaut ne reconnaîtraient pas, un override explicite est possible via `localStorage` :
+  ```js
+  localStorage.setItem('momentum-light::status-overrides', JSON.stringify({
+    'EN RECETTE CLIENT': 'indeterminate',
+    'VALIDATION BUSINESS': 'indeterminate',
+    'MEP EFFECTUÉE': 'done',
+  }))
+  ```
+  Les clés sont matchées case-insensitive contre le nom trimé du statut ; les valeurs doivent être `'new'`, `'indeterminate'` ou `'done'`. Un override supplante tout (y compris une catégorie JIRA non-`new`). En mode debug (voir ci-dessous), chaque reclassification est loguée une fois pour faciliter la vérification.
 - **Debug** : `localStorage.setItem('momentum-light-debug', '1')` dans la console du navigateur.
 - **Relancer le guide How-to** : cliquez sur le bouton flottant `?` en bas à droite, ou exécutez `localStorage.removeItem('momentum-light::howto-seen')` puis rechargez la page pour forcer l'auto-lancement.
 

@@ -392,6 +392,157 @@
   }
 
   // ---------------------------------------------------------------------------
+  // Status classification — bridges the gap between JIRA's three
+  // statusCategory keys ('new', 'indeterminate', 'done') and the way teams
+  // actually label their workflow. Admins routinely leave custom statuses
+  // like "Ready for UAT", "In Review", "Merged to prod" mapped to the
+  // "To Do" category, which wrecks confidence math that trusts JIRA's
+  // categorisation blindly (children look like todo when they're really
+  // in flight, pulling confidence scores artificially down).
+  //
+  // Two-layer override:
+  //   1. Default regex patterns (FR + EN) that spot obvious mid-flight or
+  //      delivered states in the status NAME and reclassify accordingly.
+  //   2. User-defined overrides via localStorage for anything the
+  //      patterns miss — shape:
+  //        localStorage.setItem(
+  //          'momentum-light::status-overrides',
+  //          JSON.stringify({
+  //            'EN RECETTE CLIENT': 'indeterminate',
+  //            'MEP EFFECTUÉE': 'done',
+  //          }),
+  //        )
+  //      Keys are matched case-insensitively against the trimmed status
+  //      name; values must be 'new' | 'indeterminate' | 'done'.
+  //
+  // Conservative guardrail: only statuses whose JIRA category is 'new'
+  // are rewritten by the regex layer. If JIRA already says 'indeterminate'
+  // or 'done', we trust it — second-guessing correctly-categorised work
+  // is how we'd introduce new bugs. User overrides DO override any
+  // category (they are explicit intent).
+  // ---------------------------------------------------------------------------
+
+  const STATUS_OVERRIDE_STORAGE_KEY = 'momentum-light::status-overrides';
+
+  // `new` → `indeterminate`: work is in motion, just waiting on a gate
+  // or hand-off. Covers EN + FR spellings.
+  const STATUS_INPROGRESS_PATTERNS = [
+    /ready\s+for\b/i,                                     // "Ready for UAT", "Ready for review"
+    /\bunder\s+review\b/i,                                // "Under review"
+    /\bin\s+(review|qa|uat|test(ing)?|staging|pre[-\s]?prod(uction)?|validation)\b/i,
+    /\ben\s+(review|revue|recette|test|validation|attente|cours)\b/i,
+    /\bà\s+(v[eé]rifier|valider|tester|recetter)\b/i,
+    /\bawaiting\b/i,                                      // "Awaiting merge", "Awaiting release"
+    /\bpending\b/i,                                       // "Pending approval"
+    /\bto\s+(review|verify|validate|test)\b/i,
+    /\b(code\s+review|peer\s+review)\b/i,
+  ];
+
+  // `new` → `done`: effectively delivered (merged / deployed / released)
+  // even when the workflow still has post-release hand-offs before the
+  // ticket formally closes.
+  const STATUS_DONE_PATTERNS = [
+    /\bmerged\b/i,
+    /\bdeployed\b/i,
+    /\breleased\b/i,
+    /\blivr[eé]\b/i,
+    /\bmis\s+en\s+prod\b/i,
+    /\b(mep|prod)\s+(ok|effectu[eé]e?|done)\b/i,
+    /\b(in|en)\s+prod\b/i,
+  ];
+
+  // Cached parse of the localStorage override map. Keyed by the raw
+  // storage string so a user edit (same tab) still takes effect without
+  // reloading — the cache invalidates transparently when the raw string
+  // changes.
+  let _statusOverrideRaw = null;
+  let _statusOverrideParsed = {};
+
+  function readStatusOverrides() {
+    let raw = null;
+    try {
+      raw = localStorage.getItem(STATUS_OVERRIDE_STORAGE_KEY);
+    } catch (_) {
+      return {};
+    }
+    if (raw === _statusOverrideRaw) return _statusOverrideParsed;
+    _statusOverrideRaw = raw;
+    if (!raw) {
+      _statusOverrideParsed = {};
+      return _statusOverrideParsed;
+    }
+    try {
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object') {
+        _statusOverrideParsed = {};
+        return _statusOverrideParsed;
+      }
+      const out = {};
+      for (const [name, cat] of Object.entries(parsed)) {
+        if (typeof name !== 'string') continue;
+        if (cat !== 'new' && cat !== 'indeterminate' && cat !== 'done') continue;
+        out[name.trim().toUpperCase()] = cat;
+      }
+      _statusOverrideParsed = out;
+      return out;
+    } catch (_) {
+      // Malformed JSON shouldn't crash the whole plugin — ignore silently
+      // (debug-log once so the admin can diagnose if they're looking).
+      if (isDebug()) debug('status-overrides: invalid JSON, ignoring');
+      _statusOverrideParsed = {};
+      return _statusOverrideParsed;
+    }
+  }
+
+  // Debug-log at most once per unique (statusName, mapped) pair so a
+  // busy plan doesn't flood the console when the same custom status
+  // appears on dozens of tickets.
+  const _reclassifiedLogged = new Set();
+  function _logReclassify(statusName, from, to, reason) {
+    if (!isDebug()) return;
+    const key = `${statusName}|${to}|${reason}`;
+    if (_reclassifiedLogged.has(key)) return;
+    _reclassifiedLogged.add(key);
+    debug(`status reclassified (${reason}): "${statusName}" ${from || '—'} → ${to}`);
+  }
+
+  // Classify a ticket status into JIRA's three-bucket categorisation,
+  // redressing admin miscategorisations of custom workflow states.
+  // Returns 'new' | 'indeterminate' | 'done' | null.
+  function classifyStatus(statusName, rawCategory) {
+    const name = (statusName || '').trim();
+    const cat = rawCategory || null;
+    // 1. User-defined override — highest priority, flips any category.
+    if (name) {
+      const overrides = readStatusOverrides();
+      const key = name.toUpperCase();
+      if (overrides[key]) {
+        if (overrides[key] !== cat) _logReclassify(name, cat, overrides[key], 'override');
+        return overrides[key];
+      }
+    }
+    // 2. Trust JIRA when it says 'indeterminate' or 'done'. Only 'new'
+    //    is eligible for pattern-based rewriting.
+    if (cat !== 'new') return cat;
+    if (!name) return cat;
+    // 3. Done-ish patterns win over in-progress (a status named
+    //    "Merged - awaiting release" should read as done, not mid-flight).
+    for (const rx of STATUS_DONE_PATTERNS) {
+      if (rx.test(name)) {
+        _logReclassify(name, cat, 'done', 'pattern');
+        return 'done';
+      }
+    }
+    for (const rx of STATUS_INPROGRESS_PATTERNS) {
+      if (rx.test(name)) {
+        _logReclassify(name, cat, 'indeterminate', 'pattern');
+        return 'indeterminate';
+      }
+    }
+    return cat;
+  }
+
+  // ---------------------------------------------------------------------------
   // Multiple concurrent requests within a 50 ms window are coalesced into a
   // single `key in (...)` JQL query so expanding an Epic with 20 children
   // costs one API round-trip instead of 20.
@@ -437,7 +588,13 @@
           // statusCategory key ∈ {'new' (≈ Open/To Do/Discovery),
           // 'indeterminate' (≈ In Progress), 'done'}. Used downstream to
           // restrict the confidence hatch to Epics still in discovery.
-          const statusCategory = issue.fields?.status?.statusCategory?.key || null;
+          // Routed through classifyStatus so a custom Epic status like
+          // "Ready for release" that an admin left in the 'new' bucket
+          // still reads as in-flight.
+          const statusCategory = classifyStatus(
+            issue.fields?.status?.name,
+            issue.fields?.status?.statusCategory?.key,
+          ) || null;
           const tshirtSize = tshirtFieldId
             ? normalizeTshirtSize(issue.fields?.[tshirtFieldId])
             : null;
@@ -545,10 +702,14 @@
         }
         countedChildren += 1;
         total += sp;
-        if (cat === 'done') {
+        // Let classifyStatus redress a 'new' category when the status
+        // name signals the ticket is actually in review / ready for
+        // UAT / merged / released (see top-of-file pattern list).
+        const effectiveCat = classifyStatus(statusName, cat);
+        if (effectiveCat === 'done') {
           done += sp;
           childStats.done += 1;
-        } else if (cat === 'indeterminate') {
+        } else if (effectiveCat === 'indeterminate') {
           childStats.inProgress += 1;
         } else {
           childStats.todo += 1;
@@ -684,7 +845,10 @@
       for (const issue of data.issues || []) {
         const sp = Number(issue.fields?.[spFieldId]);
         if (!Number.isFinite(sp) || sp <= 0) continue;
-        const cat = issue.fields?.status?.statusCategory?.key;
+        const cat = classifyStatus(
+          issue.fields?.status?.name,
+          issue.fields?.status?.statusCategory?.key,
+        );
         if (cat === 'done') done += sp;
       }
       return done;
@@ -882,7 +1046,10 @@
       for (const issue of data.issues || []) {
         const sp = Number(issue.fields?.[spFieldId]);
         if (!Number.isFinite(sp) || sp <= 0) continue;
-        const isDone = issue.fields?.status?.statusCategory?.key === 'done';
+        const isDone = classifyStatus(
+          issue.fields?.status?.name,
+          issue.fields?.status?.statusCategory?.key,
+        ) === 'done';
         const sprintsRaw = issue.fields?.[sprintFieldId];
         const sprintList = Array.isArray(sprintsRaw) ? sprintsRaw : [];
         const issueSprintIds = new Set();
