@@ -1364,19 +1364,14 @@
       .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="low"]::before {
         background-color: rgba(255, 255, 255, 0.60);
       }
-      /* Washed bars (low and medium confidence) combined with the fill-
-         remaining wash on the right can lose their outline against the
-         timeline background. A 1px inset border frames the bar so the
-         zone stays readable as a distinct shape, regardless of how
-         little of the native color remains visible.
-         Low tier gets a stronger border because it's the one with the
-         60 % white wash; medium's 30 % wash is less aggressive but
-         still benefits from a light frame. */
-      .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="low"] {
-        box-shadow: inset 0 0 0 1px rgba(9, 30, 66, 0.45);
-      }
-      .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="medium"] {
-        box-shadow: inset 0 0 0 1px rgba(9, 30, 66, 0.30);
+      /* Framing border — applied to EVERY Epic bar overlay (excluding
+         the ticket-estimate and sprint-fill variants, which have their
+         own language) with a single fixed alpha, so the bar zone stays
+         readable regardless of confidence tier. Washed bars benefit
+         the most but high-tier bars keep the same frame for visual
+         consistency across the timeline. */
+      .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD}) {
+        box-shadow: inset 0 0 0 1px rgba(9, 30, 66, 0.40);
       }
       .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="medium"][data-discovery]::after,
       .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="low"][data-discovery]::after {
@@ -1595,6 +1590,10 @@
         /* Base color mirrors a typical JIRA epic bar (Atlaskit purple). */
         background-color: #6554C0;
         overflow: hidden;
+        /* Fixed framing border — matches the Epic bar box-shadow so the
+           legend reads as the reference it's meant to be. Same alpha on
+           every tier, no confidence-specific variation. */
+        box-shadow: inset 0 0 0 1px rgba(9, 30, 66, 0.40);
       }
       .${CONFIDENCE_LEGEND_CLASS}__swatch[data-tier="medium"]::before,
       .${CONFIDENCE_LEGEND_CLASS}__swatch[data-tier="low"]::before {
@@ -1607,14 +1606,6 @@
       }
       .${CONFIDENCE_LEGEND_CLASS}__swatch[data-tier="low"]::before {
         background-color: rgba(255, 255, 255, 0.60);
-      }
-      /* Mirror the inset border we paint on washed timeline bars so the
-         swatches stay readable under the wash (same alpha values). */
-      .${CONFIDENCE_LEGEND_CLASS}__swatch[data-tier="low"] {
-        box-shadow: inset 0 0 0 1px rgba(9, 30, 66, 0.45);
-      }
-      .${CONFIDENCE_LEGEND_CLASS}__swatch[data-tier="medium"] {
-        box-shadow: inset 0 0 0 1px rgba(9, 30, 66, 0.30);
       }
       /* Hatch overlay — only on swatches explicitly flagged as Discovery,
          mirroring the [data-discovery] gate on timeline Epic bars. */
