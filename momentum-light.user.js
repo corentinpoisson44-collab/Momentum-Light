@@ -1782,15 +1782,11 @@
         -webkit-text-stroke: 1px rgba(0, 0, 0, 0.95);
         paint-order: stroke fill;
       }
-      /* Reserve room on the right ONLY when JIRA actually rendered its
-         native link-icon inside the bar (dependency with another Epic
-         — a ~22-32 px square widget at the bar's end edge). Without a
-         link-icon the date stays flush right against the bar end, the
-         way it was originally designed. Mirrors the conditional
-         padding-left used for the T-shirt badge above. */
-      .${OVERLAY_LANDING_MOD}[data-has-link-icon] .${OVERLAY_LABEL_CLASS} {
-        padding-right: 34px;
-      }
+      /* Old padding-right rule removed — the overlay itself now ends
+         34 px before the bar's right edge when data-has-link-icon is
+         set (see .momentum-progress[data-has-link-icon] above), so the
+         label's natural right-alignment already sits clear of the icon
+         without needing extra padding. */
       .${OVERLAY_LANDING_MOD}[data-has-date="0"] .${OVERLAY_LABEL_CLASS} {
         font-style: italic;
         color: rgba(255, 255, 255, 0.82);
@@ -1837,15 +1833,22 @@
       .${OVERLAY_CLASS}[data-status="unsized"] {
         background-color: #42526E;
       }
-      /* Keep JIRA's native dependency link-icon visible above the
-         Business status tint. Scoped to Business view so PM-view
-         rendering (where the overlay has no solid tint) is left
-         untouched. Uses position: relative without offsets to create a
-         stacking context — safe on top of whatever positioning JIRA
-         applies internally, no visual shift. */
-      body[data-momentum-view="business"] [data-testid*="link-icon"] {
-        position: relative;
-        z-index: 5;
+      /* Keep JIRA's native dependency link-icon visible in Business
+         view. z-index alone doesn't cut it — Atlaskit renders the icon
+         statically in some layouts, so our absolute overlay (with its
+         solid status tint) sits above it in paint order regardless of
+         stacking context tricks.
+         Approach : physically shrink the overlay by ~34 px on the right
+         when the bar carries a link-icon, exposing that zone for the
+         native widget. Right-side border-radius is squared off so the
+         overlay's right edge reads as a clean straight line instead of
+         a weird rounded corner mid-bar. The date label inside the
+         overlay naturally right-aligns against this new edge, which is
+         why the explicit padding-right hack below is no longer needed. */
+      .${OVERLAY_CLASS}[data-has-link-icon] {
+        right: 34px;
+        border-top-right-radius: 0;
+        border-bottom-right-radius: 0;
       }
 
       /* ---------------------------------------------------------------------
