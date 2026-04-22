@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.8.0
-// @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne, macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, menu « How-to » guidé qui surligne chaque feature au premier lancement, toggle « Vue PM / Vue Business » qui remplace les overlays de chiffrage par la date d'atterrissage (duedate) de chaque Epic, et surcharge du menu Export → Image (.png) qui capture la Timeline au format natif (via html2canvas) avec tous les overlays Momentum-Light visibles dessus.
+// @version      0.9.0
+// @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne, macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, menu « How-to » guidé qui surligne chaque feature au premier lancement, toggle « Vue PM / Vue Business » qui remplace les overlays de chiffrage par la date d'atterrissage (duedate) de chaque Epic, pastille de statut ternaire 🟢🟡🔴 (On Track / At Risk / Off Track) en Vue Business calculée à partir de la duedate, de la projection vélocité et de la confidence, surcharge du menu Export → Image (.png) qui capture la Timeline au format natif (via html2canvas) avec tous les overlays Momentum-Light visibles dessus, et variante d'export business-friendly (en Vue Business) qui ajoute une bande titre + légende des pastilles de statut au-dessus de la Timeline capturée.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
 // @run-at       document-idle
@@ -48,6 +48,16 @@
   const VIEW_MODE_BUSINESS = 'business';
   const VIEW_TOGGLE_CLASS = 'momentum-view-toggle';
   const OVERLAY_LANDING_MOD = 'momentum-progress--landing';
+  const OVERLAY_STATUS_DOT_CLASS = 'momentum-progress__status-dot';
+  // Business-view status thresholds (in days) for the ternary 🟢🟡🔴 pastille.
+  // Beyond OFF_TRACK_DRIFT_DAYS of projection-vs-duedate drift the Epic reads
+  // as Off Track; below ON_TRACK_DRIFT_DAYS it's still On Track; in between
+  // it's At Risk. Discovery Epics with a duedate inside DISCOVERY_HORIZON_DAYS
+  // are pushed to At Risk regardless of confidence (scope still uncertain).
+  const STATUS_OFF_TRACK_DRIFT_DAYS = 14;
+  const STATUS_DISCOVERY_HORIZON_DAYS = 42; // ~6 semaines
+  const STATUS_LOW_CONFIDENCE_HORIZON_DAYS = 30;
+  const SPRINT_LENGTH_DAYS_FALLBACK = 14;
 
   // ---------------------------------------------------------------------------
   // Macro-estimation (T-Shirt sizing) — each Epic-level size bucket is mapped
@@ -756,6 +766,10 @@
         id: s.id,
         name: s.name,
         state: s.state, // 'active' | 'future'
+        // Carried so the Business-view status pastille can compare the
+        // projected end date to the Epic's duedate. Falls back to startDate
+        // when JIRA hasn't set an endDate (rare on configured boards).
+        endDate: s.endDate || s.startDate || null,
       }));
 
       return { average, sprints: perSprint, boardId, openSprints: openLite };
@@ -1523,6 +1537,51 @@
         font-style: italic;
         color: rgba(255, 255, 255, 0.82);
       }
+      /* ---------------------------------------------------------------------
+       * Business status pastille (Vue Business only) — a 10×10 colored dot
+       * pinned to the left edge of the Epic bar that summarises the
+       * combined signals (duedate vs projection, confidence, status) into
+       * a feu tricolore for non-engineer readers.
+       *
+       * Painted with a solid background-color (no emoji) so html2canvas
+       * captures it identically across OS/font stacks. A thin white outline
+       * keeps the dot visible on dark, light, and washed-out bars alike.
+       * Positioned at left:6px, mirroring the T-Shirt badge on the right
+       * to balance the bar visually; the badge layout already pads the
+       * label, but we don't need extra label padding for a 10px dot.
+       * ------------------------------------------------------------------ */
+      .${OVERLAY_STATUS_DOT_CLASS} {
+        position: absolute;
+        top: 50%;
+        left: 6px;
+        transform: translateY(-50%);
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        box-shadow:
+          0 0 0 1.5px rgba(255, 255, 255, 0.95),
+          0 1px 2px rgba(9, 30, 66, 0.45);
+        z-index: 3;
+        pointer-events: none;
+      }
+      .${OVERLAY_CLASS}[data-status="on-track"] .${OVERLAY_STATUS_DOT_CLASS} {
+        background-color: #36B37E;
+      }
+      .${OVERLAY_CLASS}[data-status="at-risk"] .${OVERLAY_STATUS_DOT_CLASS} {
+        background-color: #FFAB00;
+      }
+      .${OVERLAY_CLASS}[data-status="off-track"] .${OVERLAY_STATUS_DOT_CLASS} {
+        background-color: #DE350B;
+      }
+      .${OVERLAY_CLASS}[data-status="delivered"] .${OVERLAY_STATUS_DOT_CLASS} {
+        background-color: #6B778C;
+      }
+      /* When the bar carries BOTH a T-Shirt badge and a status dot, push
+         the dot a little further right so the two don't overlap (T-Shirt
+         badge sits at left:6px with a min-width of 20px). */
+      .${OVERLAY_CLASS}[data-epic-size] .${OVERLAY_STATUS_DOT_CLASS} {
+        left: 32px;
+      }
 
       /* ---------------------------------------------------------------------
        * How-to menu — a small floating "?" button that opens a guided tour
@@ -1974,6 +2033,166 @@
       if (OUR_BAR_OPACITIES.has(bar.style.opacity)) bar.style.opacity = '';
     }
 
+    // Sprint-end projection: how many sprints away the macro budget is
+    // expected to be exhausted, given the team's average velocity. Returns
+    // null when we lack the inputs to project (no T-Shirt size, no velocity
+    // data yet, or no open sprints on the board).
+    //
+    // Shape: { sprintsAhead, target, overflow, projectedEndDate, average }
+    //   - sprintsAhead: 0 when the macro budget is already covered by real
+    //     child SP, otherwise ceil(remaining / average), min 1
+    //   - target: the open sprint object the work is expected to land in
+    //     (or the last open sprint when overflowing)
+    //   - overflow: true when sprintsAhead exceeds the planned open sprints
+    //   - projectedEndDate: a Date estimate of when work wraps (target.endDate
+    //     when within the planned window, otherwise today + sprintsAhead ×
+    //     fallback sprint length)
+    function computeProjection({ macroSP, done }) {
+      if (macroSP == null) return null;
+      const vctx = velocity.getCachedSnapshot();
+      if (!vctx || !(vctx.average > 0) || !vctx.openSprints?.length) return null;
+      const remaining = Math.max(0, macroSP - done);
+      const sprintsAhead = remaining === 0
+        ? 0
+        : Math.max(1, Math.ceil(remaining / vctx.average));
+      const overflow = sprintsAhead > vctx.openSprints.length;
+      const idx = sprintsAhead === 0
+        ? 0
+        : Math.min(sprintsAhead - 1, vctx.openSprints.length - 1);
+      const target = vctx.openSprints[idx] || null;
+      let projectedEndDate = null;
+      if (sprintsAhead === 0) {
+        projectedEndDate = new Date();
+      } else if (!overflow && target?.endDate) {
+        const d = new Date(target.endDate);
+        if (!Number.isNaN(d.getTime())) projectedEndDate = d;
+      }
+      if (!projectedEndDate) {
+        // Fallback for overflow OR missing endDate: extrapolate from today.
+        projectedEndDate = new Date(
+          Date.now() + sprintsAhead * SPRINT_LENGTH_DAYS_FALLBACK * 86400000,
+        );
+      }
+      return {
+        sprintsAhead,
+        target,
+        overflow,
+        projectedEndDate,
+        average: vctx.average,
+      };
+    }
+
+    // Format the projection as a human-readable tooltip line. Kept aligned
+    // with the wording used pre-extraction so the tooltip diff stays minimal.
+    function formatProjectionLine(projection) {
+      if (!projection) return null;
+      const { sprintsAhead, target, overflow, average } = projection;
+      if (sprintsAhead === 0) {
+        return 'Projection : budget macro déjà couvert par le chiffrage réel';
+      }
+      const plural = sprintsAhead > 1 ? 's' : '';
+      const avg = Math.round(average);
+      if (overflow) {
+        return `Fin estimée : au-delà du dernier sprint planifié (${sprintsAhead} sprint${plural} à ${avg} SP)`;
+      }
+      return `Fin estimée : ${target.name} (dans ${sprintsAhead} sprint${plural} à ${avg} SP)`;
+    }
+
+    // Business-view ternary status — a feu tricolore (🟢🟡🔴) computed from
+    // the signals already available on the bar:
+    //   - `delivered` when the Epic itself is in the "done" status category
+    //   - `off-track` when the duedate is past, or when the projection
+    //     overshoots the duedate by more than STATUS_OFF_TRACK_DRIFT_DAYS,
+    //     or when low-confidence work is due within a month
+    //   - `at-risk` when the projection overshoots the duedate by less,
+    //     when confidence is medium, or when a Discovery Epic has a duedate
+    //     inside STATUS_DISCOVERY_HORIZON_DAYS
+    //   - `on-track` otherwise
+    // Returns { status, reason } where `reason` is a short FR phrase used
+    // as the headline of the Business tooltip.
+    function computeBusinessStatus({ duedate, projection, confidence, statusCategory }) {
+      if (statusCategory === 'done') {
+        return { status: 'delivered', reason: 'Livré' };
+      }
+      const due = duedate ? new Date(duedate) : null;
+      const dueValid = due && !Number.isNaN(due.getTime());
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const dueLong = dueValid ? formatDueDate(duedate, 'long') : null;
+      const projDate = projection?.projectedEndDate || null;
+      const projLong = projDate
+        ? new Intl.DateTimeFormat('fr-FR', { day: 'numeric', month: 'long', year: 'numeric' }).format(projDate)
+        : null;
+
+      // Hard rule 1 — duedate already past and not delivered.
+      if (dueValid && due.getTime() < today.getTime()) {
+        return {
+          status: 'off-track',
+          reason: `Date d'atterrissage dépassée (${dueLong})`,
+        };
+      }
+      // Drift between projection and duedate (in days; negative = projection
+      // earlier than duedate, positive = projection later).
+      let driftDays = null;
+      if (dueValid && projDate) {
+        driftDays = Math.round((projDate.getTime() - due.getTime()) / 86400000);
+      }
+      if (driftDays != null && driftDays > STATUS_OFF_TRACK_DRIFT_DAYS) {
+        return {
+          status: 'off-track',
+          reason: `Fin estimée ${projLong}, due ${dueLong} (+${driftDays} j)`,
+        };
+      }
+      // Low confidence inside a 30-day delivery window — risky enough to
+      // surface as red even without a projection overshoot.
+      const horizonDaysLowConf = dueValid
+        ? Math.round((due.getTime() - today.getTime()) / 86400000)
+        : null;
+      if (
+        confidence < 40
+        && horizonDaysLowConf != null
+        && horizonDaysLowConf <= STATUS_LOW_CONFIDENCE_HORIZON_DAYS
+      ) {
+        return {
+          status: 'off-track',
+          reason: `Fiabilité faible (${Math.round(confidence)}%) à ${horizonDaysLowConf} j de l'échéance`,
+        };
+      }
+      // At-risk band: small projection overshoot, medium confidence, or
+      // Discovery work close to its duedate.
+      if (driftDays != null && driftDays > 0) {
+        return {
+          status: 'at-risk',
+          reason: `Fin estimée ${projLong}, due ${dueLong} (+${driftDays} j)`,
+        };
+      }
+      if (confidence < 70 && confidence >= 40) {
+        return {
+          status: 'at-risk',
+          reason: `Fiabilité à confirmer (${Math.round(confidence)}%)`,
+        };
+      }
+      const isDiscovery = statusCategory === 'new';
+      if (
+        isDiscovery
+        && dueValid
+        && (due.getTime() - today.getTime()) / 86400000 < STATUS_DISCOVERY_HORIZON_DAYS
+      ) {
+        return {
+          status: 'at-risk',
+          reason: `Cadrage en cours, atterrissage prévu ${dueLong}`,
+        };
+      }
+      // Default — no red flag detected. If we have neither a duedate nor a
+      // projection, fall back to a neutral "no status" so the pastille
+      // stays off the bar (no false reassurance).
+      if (!dueValid && !projDate) return { status: 'unknown', reason: null };
+      const reasonOk = dueValid
+        ? `Atterrissage ${dueLong} — projection alignée`
+        : 'Projection alignée';
+      return { status: 'on-track', reason: reasonOk };
+    }
+
     function applyProgress(
       bar,
       { done, total, epicKey, childStats, confidence, statusCategory, tshirtSize, view, dueDate },
@@ -2103,28 +2322,47 @@
 
       // --- Sprint-end projection ----------------------------------------
       // Best-effort synchronous read of the cached velocity snapshot.
-      // When it isn't ready yet we just omit the projection line — the
-      // next mutation cycle will fill it in once velocity.get() resolves.
-      let projectionLine = null;
-      if (macroSP != null) {
-        const vctx = velocity.getCachedSnapshot();
-        if (vctx && vctx.average > 0 && vctx.openSprints?.length) {
-          const remaining = Math.max(0, macroSP - done);
-          const sprintsAhead = remaining === 0
-            ? 0
-            : Math.max(1, Math.ceil(remaining / vctx.average));
-          if (sprintsAhead === 0) {
-            projectionLine = 'Projection : budget macro déjà couvert par le chiffrage réel';
-          } else {
-            const idx = Math.min(sprintsAhead - 1, vctx.openSprints.length - 1);
-            const target = vctx.openSprints[idx];
-            const overflow = sprintsAhead > vctx.openSprints.length;
-            const plural = sprintsAhead > 1 ? 's' : '';
-            projectionLine = overflow
-              ? `Fin estimée : au-delà du dernier sprint planifié (${sprintsAhead} sprint${plural} à ${Math.round(vctx.average)} SP)`
-              : `Fin estimée : ${target.name} (dans ${sprintsAhead} sprint${plural} à ${Math.round(vctx.average)} SP)`;
-          }
+      // When it isn't ready yet `computeProjection` returns null and we just
+      // omit the projection line — the next mutation cycle will fill it in
+      // once velocity.get() resolves.
+      const projection = computeProjection({ macroSP, done });
+      const projectionLine = formatProjectionLine(projection);
+
+      // --- Business status pastille -------------------------------------
+      // Only computed in Business view — the PM tooltip already has the
+      // raw signals (SP breakdown, confidence %) and doesn't need a feu
+      // tricolore on top.
+      let businessStatus = null;
+      if (isBusiness) {
+        businessStatus = computeBusinessStatus({
+          duedate: dueDate,
+          projection,
+          confidence: conf,
+          statusCategory,
+        });
+        if (businessStatus.status && businessStatus.status !== 'unknown') {
+          overlay.dataset.status = businessStatus.status;
+        } else {
+          delete overlay.dataset.status;
         }
+        let dot = overlay.querySelector(`.${OVERLAY_STATUS_DOT_CLASS}`);
+        const showDot = businessStatus.status && businessStatus.status !== 'unknown';
+        if (showDot) {
+          if (!dot) {
+            dot = document.createElement('span');
+            dot.className = OVERLAY_STATUS_DOT_CLASS;
+            // Place inside the overlay so it sits above the fill but
+            // below the label's z-index — the CSS positions it absolutely
+            // at the start of the bar.
+            overlay.appendChild(dot);
+          }
+        } else if (dot) {
+          dot.remove();
+        }
+      } else {
+        delete overlay.dataset.status;
+        const stale = overlay.querySelector(`.${OVERLAY_STATUS_DOT_CLASS}`);
+        if (stale) stale.remove();
       }
 
       // Tooltip text — the interceptor (installed at bootstrap) will rewrite
@@ -2150,15 +2388,28 @@
         else if (drift === 'over') driftTag = ' · dépassement 🔴';
         tshirtLine = `Macro-estimé ${tshirtSize} (~${macroSP} SP)${driftTag}`;
       }
-      // Tooltip header: Business view leads with the landing date (the
-      // stakeholder payload) and keeps chiffrage as a secondary line so
-      // PM context is still one hover away.
+      // Tooltip header: Business view leads with the ternary status (when
+      // computable) then the landing date — both stakeholder payloads —
+      // and keeps chiffrage as a secondary line so PM context is still
+      // one hover away.
       const pmHeader = `${epicKey} — ${done} / ${total} SP (${pct.toFixed(0)}%)`;
       const landingLine = dueDate
         ? `Atterrissage : ${landingLong}`
         : 'Aucune date d\'atterrissage définie';
+      const STATUS_LABEL = {
+        'on-track': 'On Track 🟢',
+        'at-risk': 'At Risk 🟡',
+        'off-track': 'Off Track 🔴',
+        delivered: 'Livré ✓',
+      };
+      const statusLine = isBusiness && businessStatus && businessStatus.status !== 'unknown'
+        ? (businessStatus.reason
+            ? `Statut : ${STATUS_LABEL[businessStatus.status] || businessStatus.status} — ${businessStatus.reason}`
+            : `Statut : ${STATUS_LABEL[businessStatus.status] || businessStatus.status}`)
+        : null;
       const tooltipLines = isBusiness
         ? [
+            statusLine,
             `${epicKey} — ${landingLine}`,
             pmHeader,
             tshirtLine,
@@ -3516,6 +3767,116 @@
       };
     }
 
+    // Format the period shown on the Business export title band. Defaults
+    // to the current quarter (e.g. "T2 2026") — readable enough for a
+    // pilotage committee without inferring a precise window from the
+    // timeline (which would require parsing JIRA's date headers, fragile).
+    function formatExportPeriod() {
+      const today = new Date();
+      const quarter = Math.floor(today.getMonth() / 3) + 1;
+      return `T${quarter} ${today.getFullYear()}`;
+    }
+
+    // Build a transient off-screen wrapper carrying the title band + legend
+    // for the Business export, capture it with html2canvas at the same
+    // scale as the timeline so the two canvases composite pixel-perfectly,
+    // then clean up. Returns the captured canvas (caller composes it on
+    // top of the timeline canvas) — no permanent DOM mutation.
+    async function captureBusinessHeader(targetWidth, scale) {
+      const wrapper = document.createElement('div');
+      wrapper.id = 'momentum-export-business-header';
+      wrapper.style.cssText = [
+        'position: fixed',
+        'left: -99999px',
+        'top: 0',
+        `width: ${targetWidth}px`,
+        'background: #FFFFFF',
+        'box-sizing: border-box',
+        'padding: 24px 32px',
+        'font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+        'color: #172B4D',
+        'border-bottom: 1px solid #DFE1E6',
+      ].join(';');
+
+      const title = document.createElement('div');
+      title.textContent = `Roadmap Produit — ${formatExportPeriod()}`;
+      title.style.cssText = 'font-size: 22px; font-weight: 600; margin-bottom: 14px;';
+
+      const legend = document.createElement('div');
+      legend.style.cssText = 'display: flex; flex-wrap: wrap; gap: 18px 24px; font-size: 12px; line-height: 1.4;';
+
+      const items = [
+        { color: '#36B37E', label: 'On Track — atterrissage tenu' },
+        { color: '#FFAB00', label: 'At Risk — dérive ≤ 2 semaines ou fiabilité à confirmer' },
+        { color: '#DE350B', label: 'Off Track — dérive > 2 semaines ou date dépassée' },
+        { color: '#6B778C', label: 'Livré' },
+        { color: null, label: 'Rayures diagonales : cadrage en cours (Discovery)' },
+      ];
+      for (const it of items) {
+        const row = document.createElement('div');
+        row.style.cssText = 'display: flex; align-items: center; gap: 8px;';
+        const dot = document.createElement('span');
+        if (it.color) {
+          dot.style.cssText = [
+            'display: inline-block',
+            'width: 10px',
+            'height: 10px',
+            'border-radius: 50%',
+            `background: ${it.color}`,
+            'box-shadow: 0 0 0 1.5px rgba(255,255,255,0.95), 0 1px 2px rgba(9,30,66,0.45)',
+          ].join(';');
+        } else {
+          // Discovery hatch swatch — diagonal stripes on a pale background.
+          dot.style.cssText = [
+            'display: inline-block',
+            'width: 18px',
+            'height: 10px',
+            'border-radius: 2px',
+            'background: repeating-linear-gradient(45deg, rgba(9,30,66,0.18) 0 2px, rgba(255,255,255,0.0) 2px 5px), #C1C7D0',
+            'box-shadow: 0 0 0 1px rgba(9,30,66,0.18)',
+          ].join(';');
+        }
+        row.appendChild(dot);
+        const text = document.createElement('span');
+        text.textContent = it.label;
+        row.appendChild(text);
+        legend.appendChild(row);
+      }
+
+      wrapper.appendChild(title);
+      wrapper.appendChild(legend);
+      document.body.appendChild(wrapper);
+      try {
+        return await window.html2canvas(wrapper, {
+          backgroundColor: '#FFFFFF',
+          useCORS: true,
+          allowTaint: false,
+          logging: false,
+          scale,
+        });
+      } finally {
+        wrapper.remove();
+      }
+    }
+
+    // Vertically composite headerCanvas above timelineCanvas onto a new
+    // canvas. Width = max of the two (in case of width mismatch the timeline
+    // is centered horizontally so the header always reaches both edges).
+    function compositeBusinessExport(headerCanvas, timelineCanvas) {
+      const width = Math.max(headerCanvas.width, timelineCanvas.width);
+      const height = headerCanvas.height + timelineCanvas.height;
+      const out = document.createElement('canvas');
+      out.width = width;
+      out.height = height;
+      const ctx = out.getContext('2d');
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fillRect(0, 0, width, height);
+      ctx.drawImage(headerCanvas, 0, 0);
+      const tlOffsetX = Math.max(0, Math.floor((width - timelineCanvas.width) / 2));
+      ctx.drawImage(timelineCanvas, tlOffsetX, headerCanvas.height);
+      return out;
+    }
+
     async function runExport() {
       const toast = showToast('Momentum-Light — préparation de l\'export…');
       try {
@@ -3527,6 +3888,7 @@
           );
         }
         const root = findCaptureRoot();
+        const isBusiness = viewMode.get() === VIEW_MODE_BUSINESS;
         // Give Jira a couple of rAF ticks to settle (pending paint from
         // hover states, menu close animations, etc.) before we snapshot.
         await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
@@ -3548,8 +3910,21 @@
           suppressor.remove();
         }
 
+        let finalCanvas = canvas;
+        if (isBusiness) {
+          toast.update('Momentum-Light — composition de l\'en-tête business…');
+          const headerCanvas = await captureBusinessHeader(
+            Math.max(root.offsetWidth, 720),
+            html2canvasOpts().scale,
+          );
+          finalCanvas = compositeBusinessExport(headerCanvas, canvas);
+        }
+
         const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-        downloadCanvas(canvas, `momentum-timeline-${stamp}.png`);
+        const filename = isBusiness
+          ? `momentum-roadmap-business-${stamp}.png`
+          : `momentum-timeline-${stamp}.png`;
+        downloadCanvas(finalCanvas, filename);
         toast.update('Momentum-Light — export prêt ✓');
         setTimeout(() => toast.hide(), 1400);
         log('exportPng: done');
