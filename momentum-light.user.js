@@ -1257,12 +1257,23 @@
       .${OVERLAY_FILL_CLASS} {
         height: 100%;
         width: 0%;
-        /* Darken the bar's own color instead of overlaying a fixed hue.
-           A 30%-opaque black multiplied over the bar produces a shaded version
-           of the bar color — orange stays orange, blue stays blue, etc. */
-        background-color: rgba(0, 0, 0, 0.30);
-        mix-blend-mode: multiply;
         transition: width 200ms ease-out;
+      }
+      /* Epic variant — the fill represents the REMAINING portion (not the
+         done portion) as a translucent white wash pinned to the right
+         edge of the overlay. That way the DONE area keeps the bar's
+         native color (or the Business status tint) at full saturation,
+         while the remaining area is visually lightened. Readers get an
+         immediate "most of the work is done → most of the bar is vivid"
+         signal without the older "done is darkened" effect that made
+         advanced Epics look muddy.
+         The width is set in JS to (100% - done%); when total = 0 the
+         JS sends 0% so we don't double-wash an empty bar. */
+      .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD}) .${OVERLAY_FILL_CLASS} {
+        position: absolute;
+        top: 0;
+        right: 0;
+        background-color: rgba(255, 255, 255, 0.45);
       }
       .${OVERLAY_LABEL_CLASS} {
         position: absolute;
@@ -2417,7 +2428,11 @@
         return;
       }
       const pct = total > 0 ? Math.max(0, Math.min(100, (done / total) * 100)) : 0;
-      const pctStr = `${pct.toFixed(1)}%`;
+      // Fill represents the REMAINING portion (pinned to the right of the
+      // bar, translucent white). 0% when we have no scope to compare
+      // against — we don't want a fully-washed bar just because the
+      // Epic has no children yet.
+      const remainingPctStr = total > 0 ? `${(100 - pct).toFixed(1)}%` : '0%';
       // No T-Shirt sizing → the chiffrage-based confidence is
       // inflatable at will (you could read "100 %" on a 3-SP Epic
       // whose real scope is 80). Force conf to 0 so the bar naturally
@@ -2476,7 +2491,7 @@
       applyBarConfidence(bar, tier);
       const fill = overlay.querySelector(`.${OVERLAY_FILL_CLASS}`);
       const label = overlay.querySelector(`.${OVERLAY_LABEL_CLASS}`);
-      if (fill) fill.style.width = pctStr;
+      if (fill) fill.style.width = remainingPctStr;
 
       // --- Macro-estimation (T-Shirt size) ------------------------------
       // The macro budget (in SP) comes from the TSHIRT_SIZE_SP table at
