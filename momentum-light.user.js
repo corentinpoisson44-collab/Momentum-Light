@@ -37,6 +37,7 @@
   const VELOCITY_BANNER_ID = 'momentum-velocity-banner';
   const CONFIDENCE_LEGEND_CLASS = 'momentum-confidence-legend';
   const SIZE_LEGEND_CLASS = 'momentum-size-legend';
+  const STATUS_LEGEND_CLASS = 'momentum-status-legend';
   const HOWTO_BUTTON_ID = 'momentum-howto-button';
   const HOWTO_OVERLAY_ID = 'momentum-howto-overlay';
   const HOWTO_SEEN_KEY = 'momentum-light::howto-seen';
@@ -1673,6 +1674,52 @@
         box-sizing: border-box;
       }
 
+      /* Status legend (Vue Business) — decodes the bar tints driven by
+         data-status on the Epic overlay. Same pill treatment as the
+         confidence + size chips. Hidden by default; the body[data-
+         momentum-view] selector below toggles it on in Business view
+         only. */
+      .${STATUS_LEGEND_CLASS} {
+        display: none;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 10px;
+        border-radius: 14px;
+        background: #F4F5F7;
+        color: #42526E;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        font-size: 11px;
+        line-height: 1.3;
+        user-select: none;
+        white-space: nowrap;
+        pointer-events: auto;
+        box-shadow: 0 1px 2px rgba(9, 30, 66, 0.12);
+      }
+      body[data-momentum-view="business"] .${STATUS_LEGEND_CLASS} {
+        display: inline-flex;
+      }
+      .${STATUS_LEGEND_CLASS}__title {
+        font-weight: 600;
+        color: #172B4D;
+      }
+      .${STATUS_LEGEND_CLASS}__item {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+      }
+      .${STATUS_LEGEND_CLASS}__swatch {
+        display: inline-block;
+        width: 16px;
+        height: 10px;
+        border-radius: 2px;
+        box-shadow: inset 0 0 0 1px rgba(9, 30, 66, 0.40);
+      }
+      .${STATUS_LEGEND_CLASS}__swatch[data-status="on-track"] { background-color: #36B37E; }
+      .${STATUS_LEGEND_CLASS}__swatch[data-status="at-risk"] { background-color: #FFAB00; }
+      .${STATUS_LEGEND_CLASS}__swatch[data-status="off-track"] { background-color: #DE350B; }
+      .${STATUS_LEGEND_CLASS}__swatch[data-status="delivered"] { background-color: #6B778C; }
+      .${STATUS_LEGEND_CLASS}__swatch[data-status="unsized"] { background-color: #42526E; }
+
       /* ---------------------------------------------------------------------
        * View toggle — segmented "Vue PM / Vue Business" chip that lives in
        * the sticky velocity banner alongside the legend chips. Switches
@@ -1758,7 +1805,10 @@
        * inset:0 + overflow:hidden, so it covers the host bar area
        * including rounded corners). The native JIRA widgets — link-icon,
        * warning triangles, edge link-dots — are siblings rendered AFTER
-       * the overlay in the DOM, so they still paint on top unaffected.
+       * the overlay in the DOM. Atlaskit renders the link-icon
+       * statically in some layouts, so the status tint would cover it;
+       * we explicitly lift it with a z-index rule further down so the
+       * dependency anchor stays visible in Business view.
        *
        * The .momentum-progress__fill child keeps its mix-blend-mode
        * multiply so the progress area reads as a darker shade of the
@@ -1786,6 +1836,16 @@
          remains visible on top of the gray. */
       .${OVERLAY_CLASS}[data-status="unsized"] {
         background-color: #42526E;
+      }
+      /* Keep JIRA's native dependency link-icon visible above the
+         Business status tint. Scoped to Business view so PM-view
+         rendering (where the overlay has no solid tint) is left
+         untouched. Uses position: relative without offsets to create a
+         stacking context — safe on top of whatever positioning JIRA
+         applies internally, no visual shift. */
+      body[data-momentum-view="business"] [data-testid*="link-icon"] {
+        position: relative;
+        z-index: 5;
       }
 
       /* ---------------------------------------------------------------------
@@ -3137,6 +3197,41 @@
       return legend;
     }
 
+    function buildStatusLegend() {
+      // Reference-only chip exposed in the Business view — decodes the
+      // five bar tints driven by `data-status` on the Epic overlay.
+      // Colors mirror the CSS rules on .momentum-progress[data-status=…]
+      // exactly, so the legend is a pixel-perfect reference.
+      const legend = document.createElement('span');
+      legend.className = STATUS_LEGEND_CLASS;
+      legend.title =
+        'Statut d\'atterrissage de l\'Epic (Vue Business) — combine la\n' +
+        'duedate, la projection vélocité et la fiabilité :\n' +
+        '  • On Track : atterrissage tenu\n' +
+        '  • At Risk : dérive ≤ 2 semaines ou fiabilité à confirmer\n' +
+        '  • Off Track : dérive > 2 semaines ou duedate dépassée\n' +
+        '  • Livré : Epic en catégorie Done\n' +
+        '  • Sans sizing : Epic sans T-Shirt size (scope à chiffrer)';
+      const items = [
+        { status: 'on-track', label: 'On Track' },
+        { status: 'at-risk', label: 'At Risk' },
+        { status: 'off-track', label: 'Off Track' },
+        { status: 'delivered', label: 'Livré' },
+        { status: 'unsized', label: 'Sans sizing' },
+      ];
+      const itemsHtml = items
+        .map(
+          (it) =>
+            `<span class="${STATUS_LEGEND_CLASS}__item">` +
+              `<span class="${STATUS_LEGEND_CLASS}__swatch" data-status="${it.status}"></span>${it.label}` +
+            `</span>`,
+        )
+        .join('');
+      legend.innerHTML =
+        `<span class="${STATUS_LEGEND_CLASS}__title">Statut Epic :</span>${itemsHtml}`;
+      return legend;
+    }
+
     function buildViewToggle() {
       // Single toggle button: clicking anywhere on the chip swaps modes.
       // A <button> root makes keyboard activation (Enter/Space) free and
@@ -3190,6 +3285,10 @@
       wrapper.dataset.anchor = mode;
       wrapper.appendChild(buildSizeLegend());
       wrapper.appendChild(buildLegend());
+      // Status legend (Business view only) — hidden by CSS in Vue PM via
+      // body[data-momentum-view]. Always mounted so the ordering in the
+      // banner stays stable across toggles (no remount flicker).
+      wrapper.appendChild(buildStatusLegend());
       wrapper.appendChild(buildViewToggle());
       const chip = document.createElement('span');
       chip.className = 'momentum-velocity-banner__chip';
