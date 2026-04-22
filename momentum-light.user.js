@@ -1343,6 +1343,22 @@
           rgba(255, 255, 255, 0.22) 9px
         );
       }
+      /* Absent-sizing signal — dashed outline around the overlay drawn via
+         a ::before pseudo-element (outline CSS would get clipped by the
+         ancestor's overflow:hidden on narrow bars, and box-shadow can't
+         render dashed). Reuses the ::before slot that the wash rules use
+         for low/medium; the selectors are mutually exclusive since a
+         single bar only ever carries one tier at a time. */
+      .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="absent"]::before {
+        content: '';
+        position: absolute;
+        inset: 0;
+        pointer-events: none;
+        border-radius: inherit;
+        border: 1.5px dashed rgba(9, 30, 66, 0.55);
+        box-sizing: border-box;
+        z-index: 0;
+      }
       /* T-Shirt size badge — intentionally discreet. A low-contrast pill on
          the LEFT edge of the Epic bar shows the macro-estimate bucket
          (XS|S|M|L|XL). No per-size palette and no drift ring: the
@@ -1561,6 +1577,15 @@
          the swatch stays readable under the heavy wash. */
       .${CONFIDENCE_LEGEND_CLASS}__swatch[data-tier="low"] {
         box-shadow: inset 0 0 0 1px rgba(9, 30, 66, 0.35);
+      }
+      /* Absent-sizing swatch — neutral gray with the same dashed outline
+         used on timeline Epic bars that carry no T-Shirt size. Omits the
+         purple base color so readers never mistake it for "a purple epic
+         with a dashed border". */
+      .${CONFIDENCE_LEGEND_CLASS}__swatch[data-tier="absent"] {
+        background-color: #F4F5F7;
+        border: 1.5px dashed rgba(9, 30, 66, 0.55);
+        box-sizing: border-box;
       }
       /* Hatch overlay — only on swatches explicitly flagged as Discovery,
          mirroring the [data-discovery] gate on timeline Epic bars. */
@@ -2152,7 +2177,15 @@
     // Confidence tiers drive the opacity / hatch treatment applied to the
     // epic bar: low-confidence epics read as "uncertain" at a glance via
     // diagonal stripes + a faded host bar, without requiring a tooltip hover.
-    function confidenceTier(confidence) {
+    //
+    // Extra tier: 'absent' — an Epic with no T-Shirt sizing has no macro
+    // scope estimate at all, so the chiffrage-based confidence score is
+    // meaningless (you could be "100% done" on 3 SP while the true scope
+    // is 80). We surface this as its own tier rather than lying with a
+    // high / medium / low label, and visually flag it with a dashed
+    // outline instead of the usual wash/hatch.
+    function confidenceTier(confidence, tshirtSize) {
+      if (!tshirtSize) return 'absent';
       if (!(confidence >= 0)) return 'high'; // treat NaN/undefined as neutral
       if (confidence < 40) return 'low';
       if (confidence < 70) return 'medium';
@@ -2259,12 +2292,21 @@
     //     when confidence is medium, or when a Discovery Epic has a duedate
     //     inside STATUS_DISCOVERY_HORIZON_DAYS
     //   - `on-track` otherwise
+    //
+    // When the Epic has no T-Shirt sizing (`tshirtSize` absent), the
+    // chiffrage-based confidence score is meaningless — we skip the
+    // confidence-based rules and fall back to `unknown` if no
+    // date-based red flag fires. The dashed-outline signal on the bar
+    // already calls out the missing scope, no need to also paint a
+    // misleading tint.
+    //
     // Returns { status, reason } where `reason` is a short FR phrase used
     // as the headline of the Business tooltip.
-    function computeBusinessStatus({ duedate, projection, confidence, statusCategory }) {
+    function computeBusinessStatus({ duedate, projection, confidence, statusCategory, tshirtSize }) {
       if (statusCategory === 'done') {
         return { status: 'delivered', reason: 'Livré' };
       }
+      const hasSizing = Boolean(tshirtSize);
       const due = duedate ? new Date(duedate) : null;
       const dueValid = due && !Number.isNaN(due.getTime());
       const today = new Date();
@@ -2275,7 +2317,8 @@
         ? new Intl.DateTimeFormat('fr-FR', { day: 'numeric', month: 'long', year: 'numeric' }).format(projDate)
         : null;
 
-      // Hard rule 1 — duedate already past and not delivered.
+      // Hard rule 1 — duedate already past and not delivered. Independent
+      // of sizing; date is a fact.
       if (dueValid && due.getTime() < today.getTime()) {
         return {
           status: 'off-track',
@@ -2283,7 +2326,8 @@
         };
       }
       // Drift between projection and duedate (in days; negative = projection
-      // earlier than duedate, positive = projection later).
+      // earlier than duedate, positive = projection later). Projection
+      // itself is null without sizing, so this rule naturally no-ops.
       let driftDays = null;
       if (dueValid && projDate) {
         driftDays = Math.round((projDate.getTime() - due.getTime()) / 86400000);
@@ -2295,12 +2339,14 @@
         };
       }
       // Low confidence inside a 30-day delivery window — risky enough to
-      // surface as red even without a projection overshoot.
+      // surface as red even without a projection overshoot. Gated on
+      // sizing: unsized Epics have no measurable confidence.
       const horizonDaysLowConf = dueValid
         ? Math.round((due.getTime() - today.getTime()) / 86400000)
         : null;
       if (
-        confidence < 40
+        hasSizing
+        && confidence < 40
         && horizonDaysLowConf != null
         && horizonDaysLowConf <= STATUS_LOW_CONFIDENCE_HORIZON_DAYS
       ) {
@@ -2310,14 +2356,15 @@
         };
       }
       // At-risk band: small projection overshoot, medium confidence, or
-      // Discovery work close to its duedate.
+      // Discovery work close to its duedate. Confidence-based rule gated
+      // on sizing for the same reason as above.
       if (driftDays != null && driftDays > 0) {
         return {
           status: 'at-risk',
           reason: `Fin estimée ${projLong}, due ${dueLong} (+${driftDays} j)`,
         };
       }
-      if (confidence < 70 && confidence >= 40) {
+      if (hasSizing && confidence < 70 && confidence >= 40) {
         return {
           status: 'at-risk',
           reason: `Fiabilité à confirmer (${Math.round(confidence)}%)`,
@@ -2334,9 +2381,18 @@
           reason: `Cadrage en cours, atterrissage prévu ${dueLong}`,
         };
       }
-      // Default — no red flag detected. If we have neither a duedate nor a
-      // projection, fall back to a neutral "no status" so the pastille
-      // stays off the bar (no false reassurance).
+      // No sizing → we can't honestly claim "on track" just because no
+      // date-based red flag fired. Surface as unknown; the dashed outline
+      // on the bar tells the reader why (no macro scope defined).
+      if (!hasSizing) {
+        return {
+          status: 'unknown',
+          reason: 'Epic sans T-Shirt sizing — fiabilité non mesurable',
+        };
+      }
+      // Default — no red flag detected. If we have neither a duedate nor
+      // a projection, fall back to a neutral "no status" so no tint
+      // paints on the bar (no false reassurance).
       if (!dueValid && !projDate) return { status: 'unknown', reason: null };
       const reasonOk = dueValid
         ? `Atterrissage ${dueLong} — projection alignée`
@@ -2368,7 +2424,7 @@
       const pct = total > 0 ? Math.max(0, Math.min(100, (done / total) * 100)) : 0;
       const pctStr = `${pct.toFixed(1)}%`;
       const conf = Number.isFinite(confidence) ? confidence : 0;
-      const tier = confidenceTier(conf);
+      const tier = confidenceTier(conf, tshirtSize);
       // Two independent signals drive the Epic bar appearance:
       //   • wash (opacity) — applies to EVERY low/medium-confidence Epic
       //     regardless of status, so a risky Epic already in progress
@@ -2377,9 +2433,12 @@
       //     when the Epic is still in Discovery (statusCategory 'new').
       //     This makes not-yet-started Epics pop as "scope work
       //     pending", without cluttering bars for work in flight.
-      // High-confidence Epics get neither treatment.
-      const showWash = tier !== 'high';
-      const isDiscovery = isOpen;
+      // High-confidence Epics get neither treatment. Absent-sizing
+      // Epics get their own dashed-outline signal (handled purely via
+      // [data-confidence="absent"] in the CSS, no wash / no hatch —
+      // confidence can't be measured without a macro budget).
+      const showWash = tier === 'low' || tier === 'medium';
+      const isDiscovery = isOpen && tier !== 'absent';
       const showHatch = showWash && isDiscovery;
 
       const overlay = ensureOverlay(bar);
@@ -2402,7 +2461,10 @@
         delete overlay.dataset.hasDate;
         delete overlay.dataset.hasLinkIcon;
       }
-      if (showWash) {
+      // data-confidence drives the CSS wash (low/medium) AND the dashed
+      // outline (absent). `high` gets no attribute — the bar reads as
+      // "normal" without extra treatment.
+      if (showWash || tier === 'absent') {
         overlay.dataset.confidence = tier;
       } else {
         delete overlay.dataset.confidence;
@@ -2491,6 +2553,7 @@
           projection,
           confidence: conf,
           statusCategory,
+          tshirtSize,
         });
         if (businessStatus.status && businessStatus.status !== 'unknown') {
           overlay.dataset.status = businessStatus.status;
@@ -2508,7 +2571,9 @@
       // hatch — a high-confidence Open Epic is still in Discovery even
       // though the hatch is suppressed.
       const tierLabel = isDiscovery ? `${tier} · Discovery` : tier;
-      const confidenceLine = `Confiance : ${conf.toFixed(0)}% (${tierLabel})`;
+      const confidenceLine = tier === 'absent'
+        ? 'Fiabilité : non mesurable (Epic sans T-Shirt sizing)'
+        : `Confiance : ${conf.toFixed(0)}% (${tierLabel})`;
       const breakdownParts = [];
       if (stats.done) breakdownParts.push(`${stats.done} done`);
       if (stats.inProgress) breakdownParts.push(`${stats.inProgress} en cours`);
@@ -2972,21 +3037,28 @@
     }
 
     function buildLegend() {
-      // Reference-only chip — mirrors the three confidence tier visuals
-      // (wash + hatch for low/medium, plain for high) so readers can
-      // decode an Epic bar at a glance. The "(Open)" qualifier calls
-      // out that the hatch only appears while the Epic is in discovery.
+      // Reference-only chip — mirrors the four confidence tier visuals
+      // (wash + hatch for low/medium, plain for high, dashed outline for
+      // absent sizing) so readers can decode an Epic bar at a glance.
+      // The "Discovery" swatch calls out that the hatch only appears on
+      // Epics still in scoping (statusCategory 'new') AND sized.
       const legend = document.createElement('span');
       legend.className = CONFIDENCE_LEGEND_CLASS;
       legend.title =
-        'Opacité selon l\'indice de confiance (tous les Epics) :\n' +
-        '  • faible  (< 40 %)\n' +
-        '  • moyenne (40-70 %)\n' +
+        'Fiabilité de la projection (calculée sur les tickets enfants) :\n' +
         '  • haute   (≥ 70 %)\n' +
+        '  • moyenne (40-70 %)\n' +
+        '  • faible  (< 40 %)\n' +
+        '  • absente — Epic sans T-Shirt sizing, pas de macro-budget donc la\n' +
+        '    confiance ne peut pas être mesurée (cadre en pointillés)\n' +
         '\n' +
-        'Hachurage en supplément sur les Epics en statut Open (Discovery).';
+        'Hachurage en supplément sur les Epics en statut Open (Discovery, scope\n' +
+        'encore à préciser) quand un sizing est présent.';
       legend.innerHTML =
-        `<span class="${CONFIDENCE_LEGEND_CLASS}__title">Confiance Epic :</span>` +
+        `<span class="${CONFIDENCE_LEGEND_CLASS}__title">Fiabilité Epic :</span>` +
+        `<span class="${CONFIDENCE_LEGEND_CLASS}__item">` +
+          `<span class="${CONFIDENCE_LEGEND_CLASS}__swatch" data-tier="absent"></span>Sans taille` +
+        `</span>` +
         `<span class="${CONFIDENCE_LEGEND_CLASS}__item">` +
           `<span class="${CONFIDENCE_LEGEND_CLASS}__swatch" data-tier="low" data-discovery></span>Discovery` +
         `</span>` +
