@@ -2,7 +2,7 @@
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
 // @version      0.9.0
-// @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne, macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, menu « How-to » guidé qui surligne chaque feature au premier lancement, toggle « Vue PM / Vue Business » qui remplace les overlays de chiffrage par la date d'atterrissage (duedate) de chaque Epic, pastille de statut ternaire 🟢🟡🔴 (On Track / At Risk / Off Track) en Vue Business calculée à partir de la duedate, de la projection vélocité et de la confidence, surcharge du menu Export → Image (.png) qui capture la Timeline au format natif (via html2canvas) avec tous les overlays Momentum-Light visibles dessus, et variante d'export business-friendly (en Vue Business) qui ajoute une bande titre + légende des pastilles de statut au-dessus de la Timeline capturée.
+// @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne, macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, menu « How-to » guidé qui surligne chaque feature au premier lancement, toggle « Vue PM / Vue Business » qui remplace les overlays de chiffrage par la date d'atterrissage (duedate) de chaque Epic, recoloration ternaire 🟢🟡🔴 (On Track / At Risk / Off Track / Livré) de chaque barre d'Epic en Vue Business calculée à partir de la duedate, de la projection vélocité et de la confidence, surcharge du menu Export → Image (.png) qui capture la Timeline au format natif (via html2canvas) avec tous les overlays Momentum-Light visibles dessus, et variante d'export business-friendly (en Vue Business) qui ajoute une bande titre + légende des couleurs de statut au-dessus de la Timeline capturée.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
 // @run-at       document-idle
@@ -48,8 +48,7 @@
   const VIEW_MODE_BUSINESS = 'business';
   const VIEW_TOGGLE_CLASS = 'momentum-view-toggle';
   const OVERLAY_LANDING_MOD = 'momentum-progress--landing';
-  const OVERLAY_STATUS_DOT_CLASS = 'momentum-progress__status-dot';
-  // Business-view status thresholds (in days) for the ternary 🟢🟡🔴 pastille.
+  // Business-view status thresholds (in days) for the ternary 🟢🟡🔴 tint.
   // Beyond OFF_TRACK_DRIFT_DAYS of projection-vs-duedate drift the Epic reads
   // as Off Track; below ON_TRACK_DRIFT_DAYS it's still On Track; in between
   // it's At Risk. Discovery Epics with a duedate inside DISCOVERY_HORIZON_DAYS
@@ -1538,49 +1537,34 @@
         color: rgba(255, 255, 255, 0.82);
       }
       /* ---------------------------------------------------------------------
-       * Business status pastille (Vue Business only) — a 10×10 colored dot
-       * pinned to the left edge of the Epic bar that summarises the
-       * combined signals (duedate vs projection, confidence, status) into
-       * a feu tricolore for non-engineer readers.
+       * Business status tint (Vue Business only) — recolours the whole Epic
+       * bar with the feu tricolore status (On Track / At Risk / Off Track /
+       * Livré) so non-engineer readers grasp delivery health at a glance
+       * without relying on the small T-Shirt badge or the confidence wash.
        *
-       * Painted with a solid background-color (no emoji) so html2canvas
-       * captures it identically across OS/font stacks. A thin white outline
-       * keeps the dot visible on dark, light, and washed-out bars alike.
-       * Positioned at left:6px, mirroring the T-Shirt badge on the right
-       * to balance the bar visually; the badge layout already pads the
-       * label, but we don't need extra label padding for a 10px dot.
+       * Painted as a solid background on the overlay itself (which has
+       * inset:0 + overflow:hidden, so it covers the host bar area
+       * including rounded corners). The native JIRA widgets — link-icon,
+       * warning triangles, edge link-dots — are siblings rendered AFTER
+       * the overlay in the DOM, so they still paint on top unaffected.
+       *
+       * The .momentum-progress__fill child keeps its mix-blend-mode
+       * multiply so the progress area reads as a darker shade of the
+       * status color (done work pops, remaining work fades). Confidence
+       * wash (::before) and Discovery hatch (::after) keep layering on
+       * top as before.
        * ------------------------------------------------------------------ */
-      .${OVERLAY_STATUS_DOT_CLASS} {
-        position: absolute;
-        top: 50%;
-        left: 6px;
-        transform: translateY(-50%);
-        width: 10px;
-        height: 10px;
-        border-radius: 50%;
-        box-shadow:
-          0 0 0 1.5px rgba(255, 255, 255, 0.95),
-          0 1px 2px rgba(9, 30, 66, 0.45);
-        z-index: 3;
-        pointer-events: none;
-      }
-      .${OVERLAY_CLASS}[data-status="on-track"] .${OVERLAY_STATUS_DOT_CLASS} {
+      .${OVERLAY_CLASS}[data-status="on-track"] {
         background-color: #36B37E;
       }
-      .${OVERLAY_CLASS}[data-status="at-risk"] .${OVERLAY_STATUS_DOT_CLASS} {
+      .${OVERLAY_CLASS}[data-status="at-risk"] {
         background-color: #FFAB00;
       }
-      .${OVERLAY_CLASS}[data-status="off-track"] .${OVERLAY_STATUS_DOT_CLASS} {
+      .${OVERLAY_CLASS}[data-status="off-track"] {
         background-color: #DE350B;
       }
-      .${OVERLAY_CLASS}[data-status="delivered"] .${OVERLAY_STATUS_DOT_CLASS} {
+      .${OVERLAY_CLASS}[data-status="delivered"] {
         background-color: #6B778C;
-      }
-      /* When the bar carries BOTH a T-Shirt badge and a status dot, push
-         the dot a little further right so the two don't overlap (T-Shirt
-         badge sits at left:6px with a min-width of 20px). */
-      .${OVERLAY_CLASS}[data-epic-size] .${OVERLAY_STATUS_DOT_CLASS} {
-        left: 32px;
       }
 
       /* ---------------------------------------------------------------------
@@ -2328,10 +2312,11 @@
       const projection = computeProjection({ macroSP, done });
       const projectionLine = formatProjectionLine(projection);
 
-      // --- Business status pastille -------------------------------------
+      // --- Business status tint -----------------------------------------
       // Only computed in Business view — the PM tooltip already has the
       // raw signals (SP breakdown, confidence %) and doesn't need a feu
-      // tricolore on top.
+      // tricolore recolouring the bar. The tint is driven purely by the
+      // `data-status` attribute on the overlay (see the CSS block).
       let businessStatus = null;
       if (isBusiness) {
         businessStatus = computeBusinessStatus({
@@ -2345,24 +2330,8 @@
         } else {
           delete overlay.dataset.status;
         }
-        let dot = overlay.querySelector(`.${OVERLAY_STATUS_DOT_CLASS}`);
-        const showDot = businessStatus.status && businessStatus.status !== 'unknown';
-        if (showDot) {
-          if (!dot) {
-            dot = document.createElement('span');
-            dot.className = OVERLAY_STATUS_DOT_CLASS;
-            // Place inside the overlay so it sits above the fill but
-            // below the label's z-index — the CSS positions it absolutely
-            // at the start of the bar.
-            overlay.appendChild(dot);
-          }
-        } else if (dot) {
-          dot.remove();
-        }
       } else {
         delete overlay.dataset.status;
-        const stale = overlay.querySelector(`.${OVERLAY_STATUS_DOT_CLASS}`);
-        if (stale) stale.remove();
       }
 
       // Tooltip text — the interceptor (installed at bootstrap) will rewrite
