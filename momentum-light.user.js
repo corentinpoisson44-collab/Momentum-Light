@@ -1344,11 +1344,19 @@
       .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="low"]::before {
         background-color: rgba(255, 255, 255, 0.60);
       }
-      /* Low-confidence bars are heavily washed (60% white) so they risk
-         disappearing into the timeline background. A 1px inset border
-         frames the bar so it stays readable as a distinct shape. */
+      /* Washed bars (low and medium confidence) combined with the fill-
+         remaining wash on the right can lose their outline against the
+         timeline background. A 1px inset border frames the bar so the
+         zone stays readable as a distinct shape, regardless of how
+         little of the native color remains visible.
+         Low tier gets a stronger border because it's the one with the
+         60 % white wash; medium's 30 % wash is less aggressive but
+         still benefits from a light frame. */
       .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="low"] {
-        box-shadow: inset 0 0 0 1px rgba(9, 30, 66, 0.35);
+        box-shadow: inset 0 0 0 1px rgba(9, 30, 66, 0.45);
+      }
+      .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="medium"] {
+        box-shadow: inset 0 0 0 1px rgba(9, 30, 66, 0.30);
       }
       .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="medium"][data-discovery]::after,
       .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="low"][data-discovery]::after {
@@ -1580,10 +1588,13 @@
       .${CONFIDENCE_LEGEND_CLASS}__swatch[data-tier="low"]::before {
         background-color: rgba(255, 255, 255, 0.60);
       }
-      /* Mirror the inset border we paint on low-confidence timeline bars so
-         the swatch stays readable under the heavy wash. */
+      /* Mirror the inset border we paint on washed timeline bars so the
+         swatches stay readable under the wash (same alpha values). */
       .${CONFIDENCE_LEGEND_CLASS}__swatch[data-tier="low"] {
-        box-shadow: inset 0 0 0 1px rgba(9, 30, 66, 0.35);
+        box-shadow: inset 0 0 0 1px rgba(9, 30, 66, 0.45);
+      }
+      .${CONFIDENCE_LEGEND_CLASS}__swatch[data-tier="medium"] {
+        box-shadow: inset 0 0 0 1px rgba(9, 30, 66, 0.30);
       }
       /* Hatch overlay — only on swatches explicitly flagged as Discovery,
          mirroring the [data-discovery] gate on timeline Epic bars. */
