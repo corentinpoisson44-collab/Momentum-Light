@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.8.0
-// @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne, macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, menu « How-to » guidé qui surligne chaque feature au premier lancement, toggle « Vue PM / Vue Business » qui remplace les overlays de chiffrage par la date d'atterrissage (duedate) de chaque Epic, et surcharge du menu Export → Image (.png) qui capture la Timeline au format natif (via html2canvas) avec tous les overlays Momentum-Light visibles dessus.
+// @version      0.9.0
+// @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne, macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, menu « How-to » guidé qui surligne chaque feature au premier lancement, toggle « Vue PM / Vue Business » qui remplace les overlays de chiffrage par la date d'atterrissage (duedate) de chaque Epic, recoloration ternaire 🟢🟡🔴 (On Track / At Risk / Off Track / Livré) de chaque barre d'Epic en Vue Business calculée à partir de la duedate, de la projection vélocité et de la confidence, surcharge du menu Export → Image (.png) qui capture la Timeline au format natif (via html2canvas) avec tous les overlays Momentum-Light visibles dessus, et variante d'export business-friendly (en Vue Business) qui ajoute une bande titre + légende des couleurs de statut au-dessus de la Timeline capturée.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
 // @run-at       document-idle
@@ -37,6 +37,7 @@
   const VELOCITY_BANNER_ID = 'momentum-velocity-banner';
   const CONFIDENCE_LEGEND_CLASS = 'momentum-confidence-legend';
   const SIZE_LEGEND_CLASS = 'momentum-size-legend';
+  const STATUS_LEGEND_CLASS = 'momentum-status-legend';
   const HOWTO_BUTTON_ID = 'momentum-howto-button';
   const HOWTO_OVERLAY_ID = 'momentum-howto-overlay';
   const HOWTO_SEEN_KEY = 'momentum-light::howto-seen';
@@ -48,6 +49,15 @@
   const VIEW_MODE_BUSINESS = 'business';
   const VIEW_TOGGLE_CLASS = 'momentum-view-toggle';
   const OVERLAY_LANDING_MOD = 'momentum-progress--landing';
+  // Business-view status thresholds (in days) for the ternary 🟢🟡🔴 tint.
+  // Beyond OFF_TRACK_DRIFT_DAYS of projection-vs-duedate drift the Epic reads
+  // as Off Track; below ON_TRACK_DRIFT_DAYS it's still On Track; in between
+  // it's At Risk. Discovery Epics with a duedate inside DISCOVERY_HORIZON_DAYS
+  // are pushed to At Risk regardless of confidence (scope still uncertain).
+  const STATUS_OFF_TRACK_DRIFT_DAYS = 14;
+  const STATUS_DISCOVERY_HORIZON_DAYS = 42; // ~6 semaines
+  const STATUS_LOW_CONFIDENCE_HORIZON_DAYS = 30;
+  const SPRINT_LENGTH_DAYS_FALLBACK = 14;
 
   // ---------------------------------------------------------------------------
   // Macro-estimation (T-Shirt sizing) — each Epic-level size bucket is mapped
@@ -383,6 +393,169 @@
   }
 
   // ---------------------------------------------------------------------------
+  // Status classification — bridges the gap between JIRA's three
+  // statusCategory keys ('new', 'indeterminate', 'done') and the way teams
+  // actually label their workflow. Admins routinely leave custom statuses
+  // like "Ready for UAT", "In Review", "Merged to prod" mapped to the
+  // "To Do" category, which wrecks confidence math that trusts JIRA's
+  // categorisation blindly (children look like todo when they're really
+  // in flight, pulling confidence scores artificially down).
+  //
+  // Two-layer override:
+  //   1. Default regex patterns (FR + EN) that spot obvious mid-flight or
+  //      delivered states in the status NAME and reclassify accordingly.
+  //   2. User-defined overrides via localStorage for anything the
+  //      patterns miss — shape:
+  //        localStorage.setItem(
+  //          'momentum-light::status-overrides',
+  //          JSON.stringify({
+  //            'EN RECETTE CLIENT': 'indeterminate',
+  //            'MEP EFFECTUÉE': 'done',
+  //          }),
+  //        )
+  //      Keys are matched case-insensitively against the trimmed status
+  //      name; values must be 'new' | 'indeterminate' | 'done'.
+  //
+  // Conservative guardrail: only statuses whose JIRA category is 'new'
+  // are rewritten by the regex layer. If JIRA already says 'indeterminate'
+  // or 'done', we trust it — second-guessing correctly-categorised work
+  // is how we'd introduce new bugs. User overrides DO override any
+  // category (they are explicit intent).
+  // ---------------------------------------------------------------------------
+
+  const STATUS_OVERRIDE_STORAGE_KEY = 'momentum-light::status-overrides';
+
+  // `new` → `indeterminate`: work is in motion, just waiting on a gate
+  // or hand-off. Covers EN + FR spellings.
+  //
+  // Conservative guardrail: patterns like "Ready for X" / "Awaiting X" /
+  // "Pending X" only reclassify when X is an explicitly post-dev stage
+  // (UAT, QA, review, merge, release, deploy, validation, recette…).
+  // That avoids the false positive of treating "Ready for Development" /
+  // "Ready for Grooming" / "Awaiting Planning" as in-progress, when
+  // those are actually to-do states — work hasn't started yet. When in
+  // doubt we leave the JIRA category alone; the admin can add an
+  // explicit entry via the localStorage override map.
+  const POSTDEV_GATE_EN = 'uat|qa|review|test(?:ing)?|staging|pre[-\\s]?prod(?:uction)?|prod(?:uction)?|release|deploy(?:ment)?|merge|validation|sign[-\\s]?off|approval';
+  const POSTDEV_GATE_FR = 'uat|qa|review|revue|test|staging|recette|validation|d[eé]ploiement|production|mep|mise\\s+en\\s+prod|signature|approbation';
+  const STATUS_INPROGRESS_PATTERNS = [
+    new RegExp(`\\bready\\s+(?:for|to)\\s+(?:${POSTDEV_GATE_EN})\\b`, 'i'),
+    new RegExp(`\\bpr[eê]t\\s+(?:pour|à)\\s+(?:${POSTDEV_GATE_FR})\\b`, 'i'),
+    /\bunder\s+review\b/i,                                // "Under review"
+    /\bin\s+(review|qa|uat|test(ing)?|staging|pre[-\s]?prod(uction)?|validation)\b/i,
+    /\ben\s+(review|revue|recette|test|validation|cours)\b/i,
+    /\bà\s+(v[eé]rifier|valider|tester|recetter)\b/i,
+    new RegExp(`\\bawaiting\\s+(?:${POSTDEV_GATE_EN})\\b`, 'i'),
+    new RegExp(`\\bpending\\s+(?:${POSTDEV_GATE_EN})\\b`, 'i'),
+    /\bto\s+(review|verify|validate|test)\b/i,
+    /\b(code\s+review|peer\s+review)\b/i,
+  ];
+
+  // `new` → `done`: effectively delivered (merged / deployed / released)
+  // even when the workflow still has post-release hand-offs before the
+  // ticket formally closes.
+  const STATUS_DONE_PATTERNS = [
+    /\bmerged\b/i,
+    /\bdeployed\b/i,
+    /\breleased\b/i,
+    /\blivr[eé]\b/i,
+    /\bmis\s+en\s+prod\b/i,
+    /\b(mep|prod)\s+(ok|effectu[eé]e?|done)\b/i,
+    /\b(in|en)\s+prod\b/i,
+  ];
+
+  // Cached parse of the localStorage override map. Keyed by the raw
+  // storage string so a user edit (same tab) still takes effect without
+  // reloading — the cache invalidates transparently when the raw string
+  // changes.
+  let _statusOverrideRaw = null;
+  let _statusOverrideParsed = {};
+
+  function readStatusOverrides() {
+    let raw = null;
+    try {
+      raw = localStorage.getItem(STATUS_OVERRIDE_STORAGE_KEY);
+    } catch (_) {
+      return {};
+    }
+    if (raw === _statusOverrideRaw) return _statusOverrideParsed;
+    _statusOverrideRaw = raw;
+    if (!raw) {
+      _statusOverrideParsed = {};
+      return _statusOverrideParsed;
+    }
+    try {
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object') {
+        _statusOverrideParsed = {};
+        return _statusOverrideParsed;
+      }
+      const out = {};
+      for (const [name, cat] of Object.entries(parsed)) {
+        if (typeof name !== 'string') continue;
+        if (cat !== 'new' && cat !== 'indeterminate' && cat !== 'done') continue;
+        out[name.trim().toUpperCase()] = cat;
+      }
+      _statusOverrideParsed = out;
+      return out;
+    } catch (_) {
+      // Malformed JSON shouldn't crash the whole plugin — ignore silently
+      // (debug-log once so the admin can diagnose if they're looking).
+      if (isDebug()) debug('status-overrides: invalid JSON, ignoring');
+      _statusOverrideParsed = {};
+      return _statusOverrideParsed;
+    }
+  }
+
+  // Debug-log at most once per unique (statusName, mapped) pair so a
+  // busy plan doesn't flood the console when the same custom status
+  // appears on dozens of tickets.
+  const _reclassifiedLogged = new Set();
+  function _logReclassify(statusName, from, to, reason) {
+    if (!isDebug()) return;
+    const key = `${statusName}|${to}|${reason}`;
+    if (_reclassifiedLogged.has(key)) return;
+    _reclassifiedLogged.add(key);
+    debug(`status reclassified (${reason}): "${statusName}" ${from || '—'} → ${to}`);
+  }
+
+  // Classify a ticket status into JIRA's three-bucket categorisation,
+  // redressing admin miscategorisations of custom workflow states.
+  // Returns 'new' | 'indeterminate' | 'done' | null.
+  function classifyStatus(statusName, rawCategory) {
+    const name = (statusName || '').trim();
+    const cat = rawCategory || null;
+    // 1. User-defined override — highest priority, flips any category.
+    if (name) {
+      const overrides = readStatusOverrides();
+      const key = name.toUpperCase();
+      if (overrides[key]) {
+        if (overrides[key] !== cat) _logReclassify(name, cat, overrides[key], 'override');
+        return overrides[key];
+      }
+    }
+    // 2. Trust JIRA when it says 'indeterminate' or 'done'. Only 'new'
+    //    is eligible for pattern-based rewriting.
+    if (cat !== 'new') return cat;
+    if (!name) return cat;
+    // 3. Done-ish patterns win over in-progress (a status named
+    //    "Merged - awaiting release" should read as done, not mid-flight).
+    for (const rx of STATUS_DONE_PATTERNS) {
+      if (rx.test(name)) {
+        _logReclassify(name, cat, 'done', 'pattern');
+        return 'done';
+      }
+    }
+    for (const rx of STATUS_INPROGRESS_PATTERNS) {
+      if (rx.test(name)) {
+        _logReclassify(name, cat, 'indeterminate', 'pattern');
+        return 'indeterminate';
+      }
+    }
+    return cat;
+  }
+
+  // ---------------------------------------------------------------------------
   // Multiple concurrent requests within a 50 ms window are coalesced into a
   // single `key in (...)` JQL query so expanding an Epic with 20 children
   // costs one API round-trip instead of 20.
@@ -428,7 +601,13 @@
           // statusCategory key ∈ {'new' (≈ Open/To Do/Discovery),
           // 'indeterminate' (≈ In Progress), 'done'}. Used downstream to
           // restrict the confidence hatch to Epics still in discovery.
-          const statusCategory = issue.fields?.status?.statusCategory?.key || null;
+          // Routed through classifyStatus so a custom Epic status like
+          // "Ready for release" that an admin left in the 'new' bucket
+          // still reads as in-flight.
+          const statusCategory = classifyStatus(
+            issue.fields?.status?.name,
+            issue.fields?.status?.statusCategory?.key,
+          ) || null;
           const tshirtSize = tshirtFieldId
             ? normalizeTshirtSize(issue.fields?.[tshirtFieldId])
             : null;
@@ -476,6 +655,16 @@
           pending.add(issueKey);
           if (!flushTimer) flushTimer = setTimeout(flush, FLUSH_DELAY_MS);
         });
+      },
+      // Drop the cached entry for a given issue. The next get() will
+      // trigger a fresh batch refetch — used by the API mutation
+      // interceptor to pick up duedate / status / T-Shirt / SP changes
+      // in real time instead of waiting the 60 s TTL.
+      invalidate(issueKey) {
+        cache.delete(issueKey);
+      },
+      invalidateAll() {
+        cache.clear();
       },
     };
   })();
@@ -536,10 +725,14 @@
         }
         countedChildren += 1;
         total += sp;
-        if (cat === 'done') {
+        // Let classifyStatus redress a 'new' category when the status
+        // name signals the ticket is actually in review / ready for
+        // UAT / merged / released (see top-of-file pattern list).
+        const effectiveCat = classifyStatus(statusName, cat);
+        if (effectiveCat === 'done') {
           done += sp;
           childStats.done += 1;
-        } else if (cat === 'indeterminate') {
+        } else if (effectiveCat === 'indeterminate') {
           childStats.inProgress += 1;
         } else {
           childStats.todo += 1;
@@ -576,6 +769,16 @@
         })();
         inflight.set(epicKey, promise);
         return promise;
+      },
+      // Drop the cached progress for a given Epic so the next get()
+      // pulls fresh child SP / status figures. Used by the mutation
+      // interceptor when a child ticket moves or changes status — the
+      // parent Epic's progress bar repaints in real time.
+      invalidate(epicKey) {
+        cache.delete(epicKey);
+      },
+      invalidateAll() {
+        cache.clear();
       },
     };
   })();
@@ -675,7 +878,10 @@
       for (const issue of data.issues || []) {
         const sp = Number(issue.fields?.[spFieldId]);
         if (!Number.isFinite(sp) || sp <= 0) continue;
-        const cat = issue.fields?.status?.statusCategory?.key;
+        const cat = classifyStatus(
+          issue.fields?.status?.name,
+          issue.fields?.status?.statusCategory?.key,
+        );
         if (cat === 'done') done += sp;
       }
       return done;
@@ -756,6 +962,10 @@
         id: s.id,
         name: s.name,
         state: s.state, // 'active' | 'future'
+        // Carried so the Business-view status pastille can compare the
+        // projected end date to the Epic's duedate. Falls back to startDate
+        // when JIRA hasn't set an endDate (rare on configured boards).
+        endDate: s.endDate || s.startDate || null,
       }));
 
       return { average, sprints: perSprint, boardId, openSprints: openLite };
@@ -869,7 +1079,10 @@
       for (const issue of data.issues || []) {
         const sp = Number(issue.fields?.[spFieldId]);
         if (!Number.isFinite(sp) || sp <= 0) continue;
-        const isDone = issue.fields?.status?.statusCategory?.key === 'done';
+        const isDone = classifyStatus(
+          issue.fields?.status?.name,
+          issue.fields?.status?.statusCategory?.key,
+        ) === 'done';
         const sprintsRaw = issue.fields?.[sprintFieldId];
         const sprintList = Array.isArray(sprintsRaw) ? sprintsRaw : [];
         const issueSprintIds = new Set();
@@ -1065,12 +1278,23 @@
       .${OVERLAY_FILL_CLASS} {
         height: 100%;
         width: 0%;
-        /* Darken the bar's own color instead of overlaying a fixed hue.
-           A 30%-opaque black multiplied over the bar produces a shaded version
-           of the bar color — orange stays orange, blue stays blue, etc. */
-        background-color: rgba(0, 0, 0, 0.30);
-        mix-blend-mode: multiply;
         transition: width 200ms ease-out;
+      }
+      /* Epic variant — the fill represents the REMAINING portion (not the
+         done portion) as a translucent white wash pinned to the right
+         edge of the overlay. That way the DONE area keeps the bar's
+         native color (or the Business status tint) at full saturation,
+         while the remaining area is visually lightened. Readers get an
+         immediate "most of the work is done → most of the bar is vivid"
+         signal without the older "done is darkened" effect that made
+         advanced Epics look muddy.
+         The width is set in JS to (100% - done%); when total = 0 the
+         JS sends 0% so we don't double-wash an empty bar. */
+      .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD}) .${OVERLAY_FILL_CLASS} {
+        position: absolute;
+        top: 0;
+        right: 0;
+        background-color: rgba(255, 255, 255, 0.45);
       }
       .${OVERLAY_LABEL_CLASS} {
         position: absolute;
@@ -1141,11 +1365,14 @@
       .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="low"]::before {
         background-color: rgba(255, 255, 255, 0.60);
       }
-      /* Low-confidence bars are heavily washed (60% white) so they risk
-         disappearing into the timeline background. A 1px inset border
-         frames the bar so it stays readable as a distinct shape. */
-      .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="low"] {
-        box-shadow: inset 0 0 0 1px rgba(9, 30, 66, 0.35);
+      /* Framing border — applied to EVERY Epic bar overlay (excluding
+         the ticket-estimate and sprint-fill variants, which have their
+         own language) with a single fixed alpha, so the bar zone stays
+         readable regardless of confidence tier. Washed bars benefit
+         the most but high-tier bars keep the same frame for visual
+         consistency across the timeline. */
+      .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD}) {
+        box-shadow: 0 0 1px 1px rgb(0 0 0 / 33%);
       }
       .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="medium"][data-discovery]::after,
       .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-confidence="low"][data-discovery]::after {
@@ -1364,6 +1591,10 @@
         /* Base color mirrors a typical JIRA epic bar (Atlaskit purple). */
         background-color: #6554C0;
         overflow: hidden;
+        /* Fixed framing border — matches the Epic bar box-shadow so the
+           legend reads as the reference it's meant to be. Same alpha on
+           every tier, no confidence-specific variation. */
+        box-shadow: inset 0 0 0 1px rgba(9, 30, 66, 0.40);
       }
       .${CONFIDENCE_LEGEND_CLASS}__swatch[data-tier="medium"]::before,
       .${CONFIDENCE_LEGEND_CLASS}__swatch[data-tier="low"]::before {
@@ -1376,11 +1607,6 @@
       }
       .${CONFIDENCE_LEGEND_CLASS}__swatch[data-tier="low"]::before {
         background-color: rgba(255, 255, 255, 0.60);
-      }
-      /* Mirror the inset border we paint on low-confidence timeline bars so
-         the swatch stays readable under the heavy wash. */
-      .${CONFIDENCE_LEGEND_CLASS}__swatch[data-tier="low"] {
-        box-shadow: inset 0 0 0 1px rgba(9, 30, 66, 0.35);
       }
       /* Hatch overlay — only on swatches explicitly flagged as Discovery,
          mirroring the [data-discovery] gate on timeline Epic bars. */
@@ -1447,6 +1673,52 @@
         letter-spacing: 0.04em;
         box-sizing: border-box;
       }
+
+      /* Status legend (Vue Business) — decodes the bar tints driven by
+         data-status on the Epic overlay. Same pill treatment as the
+         confidence + size chips. Hidden by default; the body[data-
+         momentum-view] selector below toggles it on in Business view
+         only. */
+      .${STATUS_LEGEND_CLASS} {
+        display: none;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 10px;
+        border-radius: 14px;
+        background: #F4F5F7;
+        color: #42526E;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        font-size: 11px;
+        line-height: 1.3;
+        user-select: none;
+        white-space: nowrap;
+        pointer-events: auto;
+        box-shadow: 0 1px 2px rgba(9, 30, 66, 0.12);
+      }
+      body[data-momentum-view="business"] .${STATUS_LEGEND_CLASS} {
+        display: inline-flex;
+      }
+      .${STATUS_LEGEND_CLASS}__title {
+        font-weight: 600;
+        color: #172B4D;
+      }
+      .${STATUS_LEGEND_CLASS}__item {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+      }
+      .${STATUS_LEGEND_CLASS}__swatch {
+        display: inline-block;
+        width: 16px;
+        height: 10px;
+        border-radius: 2px;
+        box-shadow: inset 0 0 0 1px rgba(9, 30, 66, 0.40);
+      }
+      .${STATUS_LEGEND_CLASS}__swatch[data-status="on-track"] { background-color: #36B37E; }
+      .${STATUS_LEGEND_CLASS}__swatch[data-status="at-risk"] { background-color: #FFAB00; }
+      .${STATUS_LEGEND_CLASS}__swatch[data-status="off-track"] { background-color: #DE350B; }
+      .${STATUS_LEGEND_CLASS}__swatch[data-status="delivered"] { background-color: #6B778C; }
+      .${STATUS_LEGEND_CLASS}__swatch[data-status="unsized"] { background-color: #42526E; }
 
       /* ---------------------------------------------------------------------
        * View toggle — segmented "Vue PM / Vue Business" chip that lives in
@@ -1522,6 +1794,58 @@
       .${OVERLAY_LANDING_MOD}[data-has-date="0"] .${OVERLAY_LABEL_CLASS} {
         font-style: italic;
         color: rgba(255, 255, 255, 0.82);
+      }
+      /* ---------------------------------------------------------------------
+       * Business status tint (Vue Business only) — recolours the whole Epic
+       * bar with the feu tricolore status (On Track / At Risk / Off Track /
+       * Livré) so non-engineer readers grasp delivery health at a glance
+       * without relying on the small T-Shirt badge or the confidence wash.
+       *
+       * Painted as a solid background on the overlay itself (which has
+       * inset:0 + overflow:hidden, so it covers the host bar area
+       * including rounded corners). The native JIRA widgets — link-icon,
+       * warning triangles, edge link-dots — are siblings rendered AFTER
+       * the overlay in the DOM. Atlaskit renders the link-icon
+       * statically in some layouts, so the status tint would cover it;
+       * we explicitly lift it with a z-index rule further down so the
+       * dependency anchor stays visible in Business view.
+       *
+       * The .momentum-progress__fill child keeps its mix-blend-mode
+       * multiply so the progress area reads as a darker shade of the
+       * status color (done work pops, remaining work fades). Confidence
+       * wash (::before) and Discovery hatch (::after) keep layering on
+       * top as before.
+       * ------------------------------------------------------------------ */
+      .${OVERLAY_CLASS}[data-status="on-track"] {
+        background-color: #36B37E;
+      }
+      .${OVERLAY_CLASS}[data-status="at-risk"] {
+        background-color: #FFAB00;
+      }
+      .${OVERLAY_CLASS}[data-status="off-track"] {
+        background-color: #DE350B;
+      }
+      .${OVERLAY_CLASS}[data-status="delivered"] {
+        background-color: #6B778C;
+      }
+      /* Unsized — Epic with no T-Shirt size. Darker gray than delivered
+         so the two grays are distinguishable at a glance (delivered =
+         neutral done; unsized = "scope to be chiffred, take the bar
+         with a grain of salt"). The fill's mix-blend-mode still
+         produces a darker shade for the done% area, so progression
+         remains visible on top of the gray. */
+      .${OVERLAY_CLASS}[data-status="unsized"] {
+        background-color: #42526E;
+      }
+      /* Keep JIRA's native dependency link-icon visible above the
+         Business status tint. Scoped to Business view so PM-view
+         rendering (where the overlay has no solid tint) is left
+         untouched. Uses position: relative without offsets to create a
+         stacking context — safe on top of whatever positioning JIRA
+         applies internally, no visual shift. */
+      body[data-momentum-view="business"] [data-testid*="link-icon"] {
+        position: relative;
+        z-index: 5;
       }
 
       /* ---------------------------------------------------------------------
@@ -1942,6 +2266,13 @@
     // Confidence tiers drive the opacity / hatch treatment applied to the
     // epic bar: low-confidence epics read as "uncertain" at a glance via
     // diagonal stripes + a faded host bar, without requiring a tooltip hover.
+    //
+    // An Epic without T-Shirt sizing has no macro-budget, so the
+    // chiffrage-based score is inflatable at will (you could read "100 %
+    // done" on 3 SP when the real scope is 80). We force conf = 0 at the
+    // call site in that case, which naturally lands on the `low` tier
+    // here — the PM wash + hatch signal reads as "this Epic is risky",
+    // the Business status computation separately forces red.
     function confidenceTier(confidence) {
       if (!(confidence >= 0)) return 'high'; // treat NaN/undefined as neutral
       if (confidence < 40) return 'low';
@@ -1974,6 +2305,189 @@
       if (OUR_BAR_OPACITIES.has(bar.style.opacity)) bar.style.opacity = '';
     }
 
+    // Sprint-end projection: how many sprints away the macro budget is
+    // expected to be exhausted, given the team's average velocity. Returns
+    // null when we lack the inputs to project (no T-Shirt size, no velocity
+    // data yet, or no open sprints on the board).
+    //
+    // Shape: { sprintsAhead, target, overflow, projectedEndDate, average }
+    //   - sprintsAhead: 0 when the macro budget is already covered by real
+    //     child SP, otherwise ceil(remaining / average), min 1
+    //   - target: the open sprint object the work is expected to land in
+    //     (or the last open sprint when overflowing)
+    //   - overflow: true when sprintsAhead exceeds the planned open sprints
+    //   - projectedEndDate: a Date estimate of when work wraps (target.endDate
+    //     when within the planned window, otherwise today + sprintsAhead ×
+    //     fallback sprint length)
+    function computeProjection({ macroSP, done }) {
+      if (macroSP == null) return null;
+      const vctx = velocity.getCachedSnapshot();
+      if (!vctx || !(vctx.average > 0) || !vctx.openSprints?.length) return null;
+      const remaining = Math.max(0, macroSP - done);
+      const sprintsAhead = remaining === 0
+        ? 0
+        : Math.max(1, Math.ceil(remaining / vctx.average));
+      const overflow = sprintsAhead > vctx.openSprints.length;
+      const idx = sprintsAhead === 0
+        ? 0
+        : Math.min(sprintsAhead - 1, vctx.openSprints.length - 1);
+      const target = vctx.openSprints[idx] || null;
+      let projectedEndDate = null;
+      if (sprintsAhead === 0) {
+        projectedEndDate = new Date();
+      } else if (!overflow && target?.endDate) {
+        const d = new Date(target.endDate);
+        if (!Number.isNaN(d.getTime())) projectedEndDate = d;
+      }
+      if (!projectedEndDate) {
+        // Fallback for overflow OR missing endDate: extrapolate from today.
+        projectedEndDate = new Date(
+          Date.now() + sprintsAhead * SPRINT_LENGTH_DAYS_FALLBACK * 86400000,
+        );
+      }
+      return {
+        sprintsAhead,
+        target,
+        overflow,
+        projectedEndDate,
+        average: vctx.average,
+      };
+    }
+
+    // Format the projection as a human-readable tooltip line. Kept aligned
+    // with the wording used pre-extraction so the tooltip diff stays minimal.
+    function formatProjectionLine(projection) {
+      if (!projection) return null;
+      const { sprintsAhead, target, overflow, average } = projection;
+      if (sprintsAhead === 0) {
+        return 'Projection : budget macro déjà couvert par le chiffrage réel';
+      }
+      const plural = sprintsAhead > 1 ? 's' : '';
+      const avg = Math.round(average);
+      if (overflow) {
+        return `Fin estimée : au-delà du dernier sprint planifié (${sprintsAhead} sprint${plural} à ${avg} SP)`;
+      }
+      return `Fin estimée : ${target.name} (dans ${sprintsAhead} sprint${plural} à ${avg} SP)`;
+    }
+
+    // Business-view ternary status — a feu tricolore (🟢🟡🔴) computed from
+    // the signals already available on the bar:
+    //   - `delivered` when the Epic itself is in the "done" status category
+    //   - `off-track` when the duedate is past, or when the projection
+    //     overshoots the duedate by more than STATUS_OFF_TRACK_DRIFT_DAYS,
+    //     or when low-confidence work is due within a month
+    //   - `at-risk` when the projection overshoots the duedate by less,
+    //     when confidence is medium, or when a Discovery Epic has a duedate
+    //     inside STATUS_DISCOVERY_HORIZON_DAYS
+    //   - `on-track` otherwise
+    //
+    // When the Epic has no T-Shirt sizing (`tshirtSize` absent), the
+    // chiffrage-based confidence score is meaningless — we skip the
+    // confidence-based rules and fall back to `unknown` if no
+    // date-based red flag fires. The dashed-outline signal on the bar
+    // already calls out the missing scope, no need to also paint a
+    // misleading tint.
+    //
+    // Returns { status, reason } where `reason` is a short FR phrase used
+    // as the headline of the Business tooltip.
+    function computeBusinessStatus({ duedate, projection, confidence, statusCategory, tshirtSize }) {
+      if (statusCategory === 'done') {
+        return { status: 'delivered', reason: 'Livré' };
+      }
+      const hasSizing = Boolean(tshirtSize);
+      const due = duedate ? new Date(duedate) : null;
+      const dueValid = due && !Number.isNaN(due.getTime());
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const dueLong = dueValid ? formatDueDate(duedate, 'long') : null;
+      const projDate = projection?.projectedEndDate || null;
+      const projLong = projDate
+        ? new Intl.DateTimeFormat('fr-FR', { day: 'numeric', month: 'long', year: 'numeric' }).format(projDate)
+        : null;
+
+      // Hard rule 1 — duedate already past and not delivered. Independent
+      // of sizing; date is a fact.
+      if (dueValid && due.getTime() < today.getTime()) {
+        return {
+          status: 'off-track',
+          reason: `Date d'atterrissage dépassée (${dueLong})`,
+        };
+      }
+      // Drift between projection and duedate (in days; negative = projection
+      // earlier than duedate, positive = projection later). Projection
+      // itself is null without sizing, so this rule naturally no-ops.
+      let driftDays = null;
+      if (dueValid && projDate) {
+        driftDays = Math.round((projDate.getTime() - due.getTime()) / 86400000);
+      }
+      if (driftDays != null && driftDays > STATUS_OFF_TRACK_DRIFT_DAYS) {
+        return {
+          status: 'off-track',
+          reason: `Fin estimée ${projLong}, due ${dueLong} (+${driftDays} j)`,
+        };
+      }
+      // Low confidence inside a 30-day delivery window — risky enough to
+      // surface as red even without a projection overshoot. Gated on
+      // sizing: unsized Epics have no measurable confidence.
+      const horizonDaysLowConf = dueValid
+        ? Math.round((due.getTime() - today.getTime()) / 86400000)
+        : null;
+      if (
+        hasSizing
+        && confidence < 40
+        && horizonDaysLowConf != null
+        && horizonDaysLowConf <= STATUS_LOW_CONFIDENCE_HORIZON_DAYS
+      ) {
+        return {
+          status: 'off-track',
+          reason: `Fiabilité faible (${Math.round(confidence)}%) à ${horizonDaysLowConf} j de l'échéance`,
+        };
+      }
+      // At-risk band: small projection overshoot, medium confidence, or
+      // Discovery work close to its duedate. Confidence-based rule gated
+      // on sizing for the same reason as above.
+      if (driftDays != null && driftDays > 0) {
+        return {
+          status: 'at-risk',
+          reason: `Fin estimée ${projLong}, due ${dueLong} (+${driftDays} j)`,
+        };
+      }
+      if (hasSizing && confidence < 70 && confidence >= 40) {
+        return {
+          status: 'at-risk',
+          reason: `Fiabilité à confirmer (${Math.round(confidence)}%)`,
+        };
+      }
+      const isDiscovery = statusCategory === 'new';
+      if (
+        isDiscovery
+        && dueValid
+        && (due.getTime() - today.getTime()) / 86400000 < STATUS_DISCOVERY_HORIZON_DAYS
+      ) {
+        return {
+          status: 'at-risk',
+          reason: `Cadrage en cours, atterrissage prévu ${dueLong}`,
+        };
+      }
+      // No sizing → show as `unsized` (dedicated gray tint) rather than
+      // on/at-risk/off: the chiffrage-based signals are all unreliable
+      // without a macro budget, and the thing to fix is to size it.
+      if (!hasSizing) {
+        return {
+          status: 'unsized',
+          reason: 'Epic sans T-Shirt sizing — scope à chiffrer',
+        };
+      }
+      // Default — no red flag detected. If we have neither a duedate nor
+      // a projection, fall back to a neutral "no status" so no tint
+      // paints on the bar (no false reassurance).
+      if (!dueValid && !projDate) return { status: 'unknown', reason: null };
+      const reasonOk = dueValid
+        ? `Atterrissage ${dueLong} — projection alignée`
+        : 'Projection alignée';
+      return { status: 'on-track', reason: reasonOk };
+    }
+
     function applyProgress(
       bar,
       { done, total, epicKey, childStats, confidence, statusCategory, tshirtSize, view, dueDate },
@@ -1996,8 +2510,19 @@
         return;
       }
       const pct = total > 0 ? Math.max(0, Math.min(100, (done / total) * 100)) : 0;
-      const pctStr = `${pct.toFixed(1)}%`;
-      const conf = Number.isFinite(confidence) ? confidence : 0;
+      // Fill represents the REMAINING portion (pinned to the right of the
+      // bar, translucent white). 0% when we have no scope to compare
+      // against — we don't want a fully-washed bar just because the
+      // Epic has no children yet.
+      const remainingPctStr = total > 0 ? `${(100 - pct).toFixed(1)}%` : '0%';
+      // No T-Shirt sizing → the chiffrage-based confidence is
+      // inflatable at will (you could read "100 %" on a 3-SP Epic
+      // whose real scope is 80). Force conf to 0 so the bar naturally
+      // falls into the `low` tier (wash + Discovery hatch in PM view).
+      // Business view layers a dedicated gray `unsized` tint on top
+      // (see computeBusinessStatus).
+      const rawConf = Number.isFinite(confidence) ? confidence : 0;
+      const conf = tshirtSize ? rawConf : 0;
       const tier = confidenceTier(conf);
       // Two independent signals drive the Epic bar appearance:
       //   • wash (opacity) — applies to EVERY low/medium-confidence Epic
@@ -2008,7 +2533,7 @@
       //     This makes not-yet-started Epics pop as "scope work
       //     pending", without cluttering bars for work in flight.
       // High-confidence Epics get neither treatment.
-      const showWash = tier !== 'high';
+      const showWash = tier === 'low' || tier === 'medium';
       const isDiscovery = isOpen;
       const showHatch = showWash && isDiscovery;
 
@@ -2032,6 +2557,9 @@
         delete overlay.dataset.hasDate;
         delete overlay.dataset.hasLinkIcon;
       }
+      // data-confidence drives the CSS wash (low/medium only). `high`
+      // gets no attribute — the bar reads as "normal" without extra
+      // treatment.
       if (showWash) {
         overlay.dataset.confidence = tier;
       } else {
@@ -2045,7 +2573,7 @@
       applyBarConfidence(bar, tier);
       const fill = overlay.querySelector(`.${OVERLAY_FILL_CLASS}`);
       const label = overlay.querySelector(`.${OVERLAY_LABEL_CLASS}`);
-      if (fill) fill.style.width = pctStr;
+      if (fill) fill.style.width = remainingPctStr;
 
       // --- Macro-estimation (T-Shirt size) ------------------------------
       // The macro budget (in SP) comes from the TSHIRT_SIZE_SP table at
@@ -2103,28 +2631,33 @@
 
       // --- Sprint-end projection ----------------------------------------
       // Best-effort synchronous read of the cached velocity snapshot.
-      // When it isn't ready yet we just omit the projection line — the
-      // next mutation cycle will fill it in once velocity.get() resolves.
-      let projectionLine = null;
-      if (macroSP != null) {
-        const vctx = velocity.getCachedSnapshot();
-        if (vctx && vctx.average > 0 && vctx.openSprints?.length) {
-          const remaining = Math.max(0, macroSP - done);
-          const sprintsAhead = remaining === 0
-            ? 0
-            : Math.max(1, Math.ceil(remaining / vctx.average));
-          if (sprintsAhead === 0) {
-            projectionLine = 'Projection : budget macro déjà couvert par le chiffrage réel';
-          } else {
-            const idx = Math.min(sprintsAhead - 1, vctx.openSprints.length - 1);
-            const target = vctx.openSprints[idx];
-            const overflow = sprintsAhead > vctx.openSprints.length;
-            const plural = sprintsAhead > 1 ? 's' : '';
-            projectionLine = overflow
-              ? `Fin estimée : au-delà du dernier sprint planifié (${sprintsAhead} sprint${plural} à ${Math.round(vctx.average)} SP)`
-              : `Fin estimée : ${target.name} (dans ${sprintsAhead} sprint${plural} à ${Math.round(vctx.average)} SP)`;
-          }
+      // When it isn't ready yet `computeProjection` returns null and we just
+      // omit the projection line — the next mutation cycle will fill it in
+      // once velocity.get() resolves.
+      const projection = computeProjection({ macroSP, done });
+      const projectionLine = formatProjectionLine(projection);
+
+      // --- Business status tint -----------------------------------------
+      // Only computed in Business view — the PM tooltip already has the
+      // raw signals (SP breakdown, confidence %) and doesn't need a feu
+      // tricolore recolouring the bar. The tint is driven purely by the
+      // `data-status` attribute on the overlay (see the CSS block).
+      let businessStatus = null;
+      if (isBusiness) {
+        businessStatus = computeBusinessStatus({
+          duedate: dueDate,
+          projection,
+          confidence: conf,
+          statusCategory,
+          tshirtSize,
+        });
+        if (businessStatus.status && businessStatus.status !== 'unknown') {
+          overlay.dataset.status = businessStatus.status;
+        } else {
+          delete overlay.dataset.status;
         }
+      } else {
+        delete overlay.dataset.status;
       }
 
       // Tooltip text — the interceptor (installed at bootstrap) will rewrite
@@ -2134,7 +2667,9 @@
       // hatch — a high-confidence Open Epic is still in Discovery even
       // though the hatch is suppressed.
       const tierLabel = isDiscovery ? `${tier} · Discovery` : tier;
-      const confidenceLine = `Confiance : ${conf.toFixed(0)}% (${tierLabel})`;
+      const confidenceLine = !tshirtSize
+        ? 'Confiance : 0 % — Epic sans T-Shirt sizing'
+        : `Confiance : ${conf.toFixed(0)}% (${tierLabel})`;
       const breakdownParts = [];
       if (stats.done) breakdownParts.push(`${stats.done} done`);
       if (stats.inProgress) breakdownParts.push(`${stats.inProgress} en cours`);
@@ -2150,15 +2685,29 @@
         else if (drift === 'over') driftTag = ' · dépassement 🔴';
         tshirtLine = `Macro-estimé ${tshirtSize} (~${macroSP} SP)${driftTag}`;
       }
-      // Tooltip header: Business view leads with the landing date (the
-      // stakeholder payload) and keeps chiffrage as a secondary line so
-      // PM context is still one hover away.
+      // Tooltip header: Business view leads with the ternary status (when
+      // computable) then the landing date — both stakeholder payloads —
+      // and keeps chiffrage as a secondary line so PM context is still
+      // one hover away.
       const pmHeader = `${epicKey} — ${done} / ${total} SP (${pct.toFixed(0)}%)`;
       const landingLine = dueDate
         ? `Atterrissage : ${landingLong}`
         : 'Aucune date d\'atterrissage définie';
+      const STATUS_LABEL = {
+        'on-track': 'On Track 🟢',
+        'at-risk': 'At Risk 🟡',
+        'off-track': 'Off Track 🔴',
+        delivered: 'Livré ✓',
+        unsized: 'Sans sizing ⚪',
+      };
+      const statusLine = isBusiness && businessStatus && businessStatus.status !== 'unknown'
+        ? (businessStatus.reason
+            ? `Statut : ${STATUS_LABEL[businessStatus.status] || businessStatus.status} — ${businessStatus.reason}`
+            : `Statut : ${STATUS_LABEL[businessStatus.status] || businessStatus.status}`)
+        : null;
       const tooltipLines = isBusiness
         ? [
+            statusLine,
             `${epicKey} — ${landingLine}`,
             pmHeader,
             tshirtLine,
@@ -2587,19 +3136,28 @@
     function buildLegend() {
       // Reference-only chip — mirrors the three confidence tier visuals
       // (wash + hatch for low/medium, plain for high) so readers can
-      // decode an Epic bar at a glance. The "(Open)" qualifier calls
-      // out that the hatch only appears while the Epic is in discovery.
+      // decode an Epic bar at a glance. The "Discovery" swatch calls
+      // out that the hatch only appears on Epics still in scoping
+      // (statusCategory 'new'). Epics without a T-Shirt sizing are
+      // forced to 0 % confidence → low tier + gray `unsized` tint in
+      // Business view (no dedicated swatch needed here; PM readers see
+      // them as heavily washed, Business readers see the gray bar).
       const legend = document.createElement('span');
       legend.className = CONFIDENCE_LEGEND_CLASS;
       legend.title =
-        'Opacité selon l\'indice de confiance (tous les Epics) :\n' +
-        '  • faible  (< 40 %)\n' +
-        '  • moyenne (40-70 %)\n' +
+        'Fiabilité de la projection (calculée sur les tickets enfants) :\n' +
         '  • haute   (≥ 70 %)\n' +
+        '  • moyenne (40-70 %)\n' +
+        '  • faible  (< 40 %)\n' +
         '\n' +
-        'Hachurage en supplément sur les Epics en statut Open (Discovery).';
+        'Hachurage en supplément sur les Epics en statut Open (Discovery,\n' +
+        'scope encore à préciser).\n' +
+        '\n' +
+        'Une Epic sans T-Shirt sizing est traitée comme fiabilité 0 %\n' +
+        '(confiance non mesurable sans macro-budget) — bar grise dédiée en\n' +
+        'Vue Business.';
       legend.innerHTML =
-        `<span class="${CONFIDENCE_LEGEND_CLASS}__title">Confiance Epic :</span>` +
+        `<span class="${CONFIDENCE_LEGEND_CLASS}__title">Fiabilité Epic :</span>` +
         `<span class="${CONFIDENCE_LEGEND_CLASS}__item">` +
           `<span class="${CONFIDENCE_LEGEND_CLASS}__swatch" data-tier="low" data-discovery></span>Discovery` +
         `</span>` +
@@ -2636,6 +3194,41 @@
         .join('');
       legend.innerHTML =
         `<span class="${SIZE_LEGEND_CLASS}__title">Taille Epic :</span>${items}`;
+      return legend;
+    }
+
+    function buildStatusLegend() {
+      // Reference-only chip exposed in the Business view — decodes the
+      // five bar tints driven by `data-status` on the Epic overlay.
+      // Colors mirror the CSS rules on .momentum-progress[data-status=…]
+      // exactly, so the legend is a pixel-perfect reference.
+      const legend = document.createElement('span');
+      legend.className = STATUS_LEGEND_CLASS;
+      legend.title =
+        'Statut d\'atterrissage de l\'Epic (Vue Business) — combine la\n' +
+        'duedate, la projection vélocité et la fiabilité :\n' +
+        '  • On Track : atterrissage tenu\n' +
+        '  • At Risk : dérive ≤ 2 semaines ou fiabilité à confirmer\n' +
+        '  • Off Track : dérive > 2 semaines ou duedate dépassée\n' +
+        '  • Livré : Epic en catégorie Done\n' +
+        '  • Sans sizing : Epic sans T-Shirt size (scope à chiffrer)';
+      const items = [
+        { status: 'on-track', label: 'On Track' },
+        { status: 'at-risk', label: 'At Risk' },
+        { status: 'off-track', label: 'Off Track' },
+        { status: 'delivered', label: 'Livré' },
+        { status: 'unsized', label: 'Sans sizing' },
+      ];
+      const itemsHtml = items
+        .map(
+          (it) =>
+            `<span class="${STATUS_LEGEND_CLASS}__item">` +
+              `<span class="${STATUS_LEGEND_CLASS}__swatch" data-status="${it.status}"></span>${it.label}` +
+            `</span>`,
+        )
+        .join('');
+      legend.innerHTML =
+        `<span class="${STATUS_LEGEND_CLASS}__title">Statut Epic :</span>${itemsHtml}`;
       return legend;
     }
 
@@ -2692,6 +3285,10 @@
       wrapper.dataset.anchor = mode;
       wrapper.appendChild(buildSizeLegend());
       wrapper.appendChild(buildLegend());
+      // Status legend (Business view only) — hidden by CSS in Vue PM via
+      // body[data-momentum-view]. Always mounted so the ordering in the
+      // banner stays stable across toggles (no remount flicker).
+      wrapper.appendChild(buildStatusLegend());
       wrapper.appendChild(buildViewToggle());
       const chip = document.createElement('span');
       chip.className = 'momentum-velocity-banner__chip';
@@ -3516,6 +4113,117 @@
       };
     }
 
+    // Format the period shown on the Business export title band. Defaults
+    // to the current quarter (e.g. "T2 2026") — readable enough for a
+    // pilotage committee without inferring a precise window from the
+    // timeline (which would require parsing JIRA's date headers, fragile).
+    function formatExportPeriod() {
+      const today = new Date();
+      const quarter = Math.floor(today.getMonth() / 3) + 1;
+      return `T${quarter} ${today.getFullYear()}`;
+    }
+
+    // Build a transient off-screen wrapper carrying the title band + legend
+    // for the Business export, capture it with html2canvas at the same
+    // scale as the timeline so the two canvases composite pixel-perfectly,
+    // then clean up. Returns the captured canvas (caller composes it on
+    // top of the timeline canvas) — no permanent DOM mutation.
+    async function captureBusinessHeader(targetWidth, scale) {
+      const wrapper = document.createElement('div');
+      wrapper.id = 'momentum-export-business-header';
+      wrapper.style.cssText = [
+        'position: fixed',
+        'left: -99999px',
+        'top: 0',
+        `width: ${targetWidth}px`,
+        'background: #FFFFFF',
+        'box-sizing: border-box',
+        'padding: 24px 32px',
+        'font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+        'color: #172B4D',
+        'border-bottom: 1px solid #DFE1E6',
+      ].join(';');
+
+      const title = document.createElement('div');
+      title.textContent = `Roadmap Produit — ${formatExportPeriod()}`;
+      title.style.cssText = 'font-size: 22px; font-weight: 600; margin-bottom: 14px;';
+
+      const legend = document.createElement('div');
+      legend.style.cssText = 'display: flex; flex-wrap: wrap; gap: 18px 24px; font-size: 12px; line-height: 1.4;';
+
+      const items = [
+        { color: '#36B37E', label: 'On Track — atterrissage tenu' },
+        { color: '#FFAB00', label: 'At Risk — dérive ≤ 2 semaines ou fiabilité à confirmer' },
+        { color: '#DE350B', label: 'Off Track — dérive > 2 semaines ou date dépassée' },
+        { color: '#6B778C', label: 'Livré' },
+        { color: '#42526E', label: 'Sans sizing — Epic à chiffrer (T-Shirt size manquante)' },
+        { color: null, label: 'Rayures diagonales : cadrage en cours (Discovery)' },
+      ];
+      for (const it of items) {
+        const row = document.createElement('div');
+        row.style.cssText = 'display: flex; align-items: center; gap: 8px;';
+        const dot = document.createElement('span');
+        if (it.color) {
+          dot.style.cssText = [
+            'display: inline-block',
+            'width: 10px',
+            'height: 10px',
+            'border-radius: 50%',
+            `background: ${it.color}`,
+            'box-shadow: 0 0 0 1.5px rgba(255,255,255,0.95), 0 1px 2px rgba(9,30,66,0.45)',
+          ].join(';');
+        } else {
+          // Discovery hatch swatch — diagonal stripes on a pale background.
+          dot.style.cssText = [
+            'display: inline-block',
+            'width: 18px',
+            'height: 10px',
+            'border-radius: 2px',
+            'background: repeating-linear-gradient(45deg, rgba(9,30,66,0.18) 0 2px, rgba(255,255,255,0.0) 2px 5px), #C1C7D0',
+            'box-shadow: 0 0 0 1px rgba(9,30,66,0.18)',
+          ].join(';');
+        }
+        row.appendChild(dot);
+        const text = document.createElement('span');
+        text.textContent = it.label;
+        row.appendChild(text);
+        legend.appendChild(row);
+      }
+
+      wrapper.appendChild(title);
+      wrapper.appendChild(legend);
+      document.body.appendChild(wrapper);
+      try {
+        return await window.html2canvas(wrapper, {
+          backgroundColor: '#FFFFFF',
+          useCORS: true,
+          allowTaint: false,
+          logging: false,
+          scale,
+        });
+      } finally {
+        wrapper.remove();
+      }
+    }
+
+    // Vertically composite headerCanvas above timelineCanvas onto a new
+    // canvas. Width = max of the two (in case of width mismatch the timeline
+    // is centered horizontally so the header always reaches both edges).
+    function compositeBusinessExport(headerCanvas, timelineCanvas) {
+      const width = Math.max(headerCanvas.width, timelineCanvas.width);
+      const height = headerCanvas.height + timelineCanvas.height;
+      const out = document.createElement('canvas');
+      out.width = width;
+      out.height = height;
+      const ctx = out.getContext('2d');
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fillRect(0, 0, width, height);
+      ctx.drawImage(headerCanvas, 0, 0);
+      const tlOffsetX = Math.max(0, Math.floor((width - timelineCanvas.width) / 2));
+      ctx.drawImage(timelineCanvas, tlOffsetX, headerCanvas.height);
+      return out;
+    }
+
     async function runExport() {
       const toast = showToast('Momentum-Light — préparation de l\'export…');
       try {
@@ -3527,6 +4235,7 @@
           );
         }
         const root = findCaptureRoot();
+        const isBusiness = viewMode.get() === VIEW_MODE_BUSINESS;
         // Give Jira a couple of rAF ticks to settle (pending paint from
         // hover states, menu close animations, etc.) before we snapshot.
         await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
@@ -3548,8 +4257,21 @@
           suppressor.remove();
         }
 
+        let finalCanvas = canvas;
+        if (isBusiness) {
+          toast.update('Momentum-Light — composition de l\'en-tête business…');
+          const headerCanvas = await captureBusinessHeader(
+            Math.max(root.offsetWidth, 720),
+            html2canvasOpts().scale,
+          );
+          finalCanvas = compositeBusinessExport(headerCanvas, canvas);
+        }
+
         const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-        downloadCanvas(canvas, `momentum-timeline-${stamp}.png`);
+        const filename = isBusiness
+          ? `momentum-roadmap-business-${stamp}.png`
+          : `momentum-timeline-${stamp}.png`;
+        downloadCanvas(finalCanvas, filename);
         toast.update('Momentum-Light — export prêt ✓');
         setTimeout(() => toast.hide(), 1400);
         log('exportPng: done');
@@ -4057,6 +4779,21 @@
       const sprintId = extractSprintId(url);
       if (sprintId) sprintCapacity.invalidate(sprintId);
       else sprintCapacity.invalidateAll();
+      // Drop the 60 s meta + progress caches so the repaint below reads
+      // post-mutation data instead of showing stale values until the TTL
+      // lapses. When the URL carries an explicit issue key we invalidate
+      // only that entry in issueMeta (the duedate / status / T-Shirt /
+      // SP that just changed) but clear epicProgress wholesale — the
+      // mutated issue could be the child of any Epic on the plan, and
+      // the parent→children map isn't cheap to resolve here.
+      const issueKey = extractIssueKey(url);
+      if (issueKey) {
+        issueMeta.invalidate(issueKey);
+        epicProgress.invalidateAll();
+      } else {
+        issueMeta.invalidateAll();
+        epicProgress.invalidateAll();
+      }
       if (onAfterInvalidate) {
         perfStamp('repaint scheduled (confirm-invalidate)');
         onAfterInvalidate();

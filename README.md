@@ -29,6 +29,8 @@ Les mises à jour sont poussées automatiquement (Tampermonkey vérifie le `@upd
 | 5 | **How-to Menu** — bouton flottant `?` qui lance une visite guidée surlignant chaque feature, étape par étape, avec boutons _Précédent_ / _Suivant_ / _Passer_. Auto-lancé au premier chargement d'une Timeline, puis accessible à tout moment via le bouton. | ✅ v0.4.0 |
 | 6 | **Export enrichi (.png)** — injecte une entrée `Image enrichie Momentum (.png)` dans le menu natif `… › Export` de la Timeline. Capture la Timeline visible à l'écran en conservant son format natif (via `html2canvas`) avec **tous les overlays Momentum-Light** (barres de progression sur les Epics, chiffrage SP, badges T-Shirt, confiance, chips de sprint colorés, bandeau vélocité). Racine de capture : `#sr-timeline` en priorité, fallback sur `[data-testid^="roadmap.timeline-table-kit"]` puis `[role="main"]`. Une seule passe sur la fenêtre courante — pour couvrir un plan qui déborde de l'écran, scrollez puis relancez l'export autant de fois que nécessaire. | ✅ v0.7.5 |
 | 7 | **Vue PM / Vue Business** — toggle segmenté dans le bandeau Momentum (en haut de la Timeline) qui bascule l'affichage des overlays d'Epic. La **Vue PM** garde le comportement historique (progression SP, chiffrage des tickets, badge T-Shirt, confiance). La **Vue Business** remplace chaque overlay d'Epic par sa **date d'atterrissage** (`duedate`) formatée en français, masque les overlays de tickets, et cache les légendes PM-only. Le choix est persisté dans `localStorage`. | ✅ v0.8.0 |
+| 8 | **Statut business 🟢🟡🔴** — en Vue Business, chaque barre d'Epic est recolorée selon son statut ternaire (`On Track` vert, `At Risk` orange, `Off Track` rouge, `Livré` gris). Calculé à partir de la `duedate`, de la projection de fin via la vélocité moyenne, de la confidence et de la status category — aucune nouvelle requête API. Le pourquoi du statut s'affiche dans la première ligne du tooltip (ex. `Statut : Off Track 🔴 — Fin estimée 15 juin 2026, due 30 mai 2026 (+16 j)`). | ✅ v0.9.0 |
+| 9 | **Export business-friendly (.png)** — en Vue Business, l'entrée `Image enrichie Momentum (.png)` produit une variante avec une bande titre `Roadmap Produit — T<n> <année>` et une légende des couleurs de statut composée au-dessus de la Timeline capturée. Le fichier est nommé `momentum-roadmap-business-<iso>.png`. En Vue PM, l'export reste strictement inchangé. | ✅ v0.9.0 |
 
 ### Configuration
 
@@ -36,6 +38,15 @@ Les mises à jour sont poussées automatiquement (Tampermonkey vérifie le `@upd
   ```js
   localStorage.setItem('momentum-light::velocity-board-id', '123')
   ```
+- **Statuts custom — reclassification** : certaines équipes définissent des statuts JIRA custom (`"Ready for UAT"`, `"En recette"`, `"MEP effectuée"`…) que l'admin laisse souvent dans la catégorie `"To Do"`. Momentum-Light détecte automatiquement les motifs les plus courants (FR + EN) pour redresser la classification et ne plus compter ces tickets comme non-démarrés dans le calcul de confiance / progression d'Epic. Pour les statuts que les patterns par défaut ne reconnaîtraient pas, un override explicite est possible via `localStorage` :
+  ```js
+  localStorage.setItem('momentum-light::status-overrides', JSON.stringify({
+    'EN RECETTE CLIENT': 'indeterminate',
+    'VALIDATION BUSINESS': 'indeterminate',
+    'MEP EFFECTUÉE': 'done',
+  }))
+  ```
+  Les clés sont matchées case-insensitive contre le nom trimé du statut ; les valeurs doivent être `'new'`, `'indeterminate'` ou `'done'`. Un override supplante tout (y compris une catégorie JIRA non-`new`). En mode debug (voir ci-dessous), chaque reclassification est loguée une fois pour faciliter la vérification.
 - **Debug** : `localStorage.setItem('momentum-light-debug', '1')` dans la console du navigateur.
 - **Relancer le guide How-to** : cliquez sur le bouton flottant `?` en bas à droite, ou exécutez `localStorage.removeItem('momentum-light::howto-seen')` puis rechargez la page pour forcer l'auto-lancement.
 
