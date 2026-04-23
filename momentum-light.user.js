@@ -2277,6 +2277,10 @@
       }
       .${SPRINT_STATS_CLASS}__weight {
         display: inline-flex;
+        /* The legend column is a column flexbox which stretches its
+         * children by default — force the toggle to shrink to its
+         * buttons' natural width instead of spanning the whole column. */
+        align-self: flex-start;
         border: 1px solid rgba(9, 30, 66, 0.14);
         border-radius: 3px;
         overflow: hidden;
