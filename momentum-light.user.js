@@ -4376,7 +4376,44 @@
       return statsOpenSprints.has(sprintId);
     }
 
-    return { ensureButton, togglePanel, refresh, removeAll, isOpen };
+    // True when the panel for this sprint is currently mounted in the
+    // live DOM. Used by `feature.onMutation` to decide whether the panel
+    // needs to be re-mounted (page reload, JIRA re-rendered the sprint
+    // container, …) without rebuilding it on every mutation pass —
+    // rebuilding while a `<select>` popup is open would close it.
+    function hasPanel(sprintId) {
+      const entry = mountedPanels.get(sprintId);
+      return !!(entry?.panel?.isConnected);
+    }
+
+    // Re-fetch composition (cache may be stale) and rebuild the content
+    // of every open panel. Called by the API mutation interceptor after
+    // a ticket move / edit so panels reflect the new state in real time.
+    async function refreshAllOpen() {
+      for (const [sprintId, entry] of [...mountedPanels]) {
+        if (!entry.panel?.isConnected) {
+          mountedPanels.delete(sprintId);
+          continue;
+        }
+        try {
+          const composition = await sprintComposition.get(sprintId);
+          if (!entry.panel.isConnected) continue;
+          buildPanelContent(entry.panel, composition, entry.sprintInfo);
+        } catch (e) {
+          warn('sprint-stats refreshAllOpen error:', e?.message || e);
+        }
+      }
+    }
+
+    return {
+      ensureButton,
+      togglePanel,
+      refresh,
+      removeAll,
+      isOpen,
+      hasPanel,
+      refreshAllOpen,
+    };
   })();
 
   // ---------------------------------------------------------------------------
@@ -5453,9 +5490,18 @@
           const info = backlogDom.extractSprintInfo(container);
           if (!info?.sprintId) continue;
           sprintStatsPanel.ensureButton(container, info);
-          if (sprintStatsPanel.isOpen(info.sprintId)) {
-            // Idempotent: panel mount is guarded, data fetch hits the 60 s
-            // cache so re-running on every mutation pass stays cheap.
+          // Critical: do NOT re-render the panel on every DOM mutation.
+          // JIRA fires DOM mutations on hover/focus, and rebuilding the
+          // panel destroys & recreates the <select>, which slams shut
+          // any open native popup. Only call refresh when the panel is
+          // marked open (localStorage) but NOT currently in the DOM —
+          // i.e. on first appearance, page reload, or after a React
+          // re-render dropped our nodes. The interceptor handles
+          // post-mutation refreshes via `refreshAllOpen()` instead.
+          if (
+            sprintStatsPanel.isOpen(info.sprintId) &&
+            !sprintStatsPanel.hasPanel(info.sprintId)
+          ) {
             sprintStatsPanel.refresh(container, info).catch((e) => {
               warn('sprint-stats refresh failed:', e?.message || e);
             });
@@ -5846,6 +5892,10 @@
       // sprint(s) were touched from the URL alone, so flush the whole map
       // — next panel read hits JQL once and re-caches for 60 s.
       sprintComposition.invalidateAll();
+      // Push the fresh numbers into any currently-open stats panel so
+      // the user sees the change in real time. Does nothing when no
+      // panel is open (zero allocation when the feature is unused).
+      sprintStatsPanel.refreshAllOpen();
       if (onAfterInvalidate) {
         perfStamp('repaint scheduled (confirm-invalidate)');
         onAfterInvalidate();
