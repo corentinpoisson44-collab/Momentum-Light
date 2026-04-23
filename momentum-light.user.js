@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.9.0
+// @version      0.10.0
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne, macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, menu « How-to » guidé qui surligne chaque feature au premier lancement, toggle « Vue PM / Vue Business » qui remplace les overlays de chiffrage par la date d'atterrissage (duedate) de chaque Epic, recoloration ternaire 🟢🟡🔴 (On Track / At Risk / Off Track / Livré) de chaque barre d'Epic en Vue Business calculée à partir de la duedate, de la projection vélocité et de la confidence, surcharge du menu Export → Image (.png) qui capture la Timeline au format natif (via html2canvas) avec tous les overlays Momentum-Light visibles dessus, et variante d'export business-friendly (en Vue Business) qui ajoute une bande titre + légende des couleurs de statut au-dessus de la Timeline capturée.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -48,6 +48,14 @@
   const VIEW_MODE_PM = 'pm';
   const VIEW_MODE_BUSINESS = 'business';
   const VIEW_TOGGLE_CLASS = 'momentum-view-toggle';
+  // Sprint stats (Backlog view) — user-tunable prefs + per-sprint "open"
+  // state so the panel stays expanded across re-renders / reloads.
+  const SPRINT_STATS_PREFS_KEY = 'momentum-light::stats-prefs';
+  const SPRINT_STATS_OPEN_KEY = 'momentum-light::stats-open-sprints';
+  const SPRINT_STATS_CLASS = 'momentum-sprint-stats';
+  const SPRINT_STATS_BUTTON_CLASS = 'momentum-sprint-stats__button';
+  const SPRINT_STATS_PANEL_CLASS = 'momentum-sprint-stats__panel';
+  const SPRINT_STATS_DIMENSIONS = ['type', 'status', 'assignee', 'epic', 'component'];
   const OVERLAY_LANDING_MOD = 'momentum-progress--landing';
   // Business-view status thresholds (in days) for the ternary 🟢🟡🔴 tint.
   // Beyond OFF_TRACK_DRIFT_DAYS of projection-vs-duedate drift the Epic reads
@@ -201,6 +209,109 @@
       return () => listeners.delete(cb);
     }
     return { get, set, onChange, syncBody };
+  })();
+
+  // ---------------------------------------------------------------------------
+  // statsPrefs — Backlog sprint-stats user preferences: weight mode
+  // (count vs story points) + the single active dimension to project
+  // onto the pie chart (type / status / assignee / epic / component).
+  // Persisted in localStorage. Panels subscribe via `onChange` so
+  // toggling the dropdown in one sprint updates all others in sync.
+  // ---------------------------------------------------------------------------
+  const statsPrefs = (() => {
+    const DEFAULT = { weight: 'count', dim: 'type' };
+    const listeners = new Set();
+
+    function read() {
+      try {
+        const raw = localStorage.getItem(SPRINT_STATS_PREFS_KEY);
+        if (!raw) return { ...DEFAULT };
+        const parsed = JSON.parse(raw);
+        const weight = parsed?.weight === 'sp' ? 'sp' : 'count';
+        // Migration: v0.10.0 stored `dims: [...]` (multi-select); v0.11+
+        // uses a single `dim`. Honor either, falling back to the first
+        // valid dim or the default.
+        let dim = null;
+        if (typeof parsed?.dim === 'string' &&
+            SPRINT_STATS_DIMENSIONS.includes(parsed.dim)) {
+          dim = parsed.dim;
+        } else if (Array.isArray(parsed?.dims)) {
+          dim = parsed.dims.find((d) => SPRINT_STATS_DIMENSIONS.includes(d)) || null;
+        }
+        return { weight, dim: dim || DEFAULT.dim };
+      } catch (_) {
+        return { ...DEFAULT };
+      }
+    }
+
+    let current = read();
+
+    function write() {
+      try {
+        localStorage.setItem(SPRINT_STATS_PREFS_KEY, JSON.stringify(current));
+      } catch (_) { /* private mode — best effort */ }
+    }
+
+    function notify() {
+      for (const cb of listeners) {
+        try { cb(current); } catch (e) { warn('statsPrefs listener error:', e?.message || e); }
+      }
+    }
+
+    return {
+      get() { return current; },
+      setWeight(w) {
+        const next = w === 'sp' ? 'sp' : 'count';
+        if (current.weight === next) return;
+        current = { ...current, weight: next };
+        write();
+        notify();
+      },
+      setDim(dim) {
+        if (!SPRINT_STATS_DIMENSIONS.includes(dim)) return;
+        if (current.dim === dim) return;
+        current = { ...current, dim };
+        write();
+        notify();
+      },
+      onChange(cb) {
+        listeners.add(cb);
+        return () => listeners.delete(cb);
+      },
+    };
+  })();
+
+  // ---------------------------------------------------------------------------
+  // statsOpenSprints — set of sprint ids whose stats panel is currently
+  // expanded. Persisted in localStorage so a React re-render (or page
+  // reload) keeps the same panels open, avoiding a jarring collapse.
+  // ---------------------------------------------------------------------------
+  const statsOpenSprints = (() => {
+    function read() {
+      try {
+        const raw = localStorage.getItem(SPRINT_STATS_OPEN_KEY);
+        if (!raw) return new Set();
+        const parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed)) return new Set();
+        return new Set(parsed.map(Number).filter((n) => Number.isFinite(n) && n > 0));
+      } catch (_) {
+        return new Set();
+      }
+    }
+
+    const current = read();
+
+    function write() {
+      try {
+        localStorage.setItem(SPRINT_STATS_OPEN_KEY, JSON.stringify([...current]));
+      } catch (_) { /* best effort */ }
+    }
+
+    return {
+      has(id) { return current.has(Number(id)); },
+      add(id) { current.add(Number(id)); write(); },
+      delete(id) { current.delete(Number(id)); write(); },
+    };
   })();
 
   // ---------------------------------------------------------------------------
@@ -1254,6 +1365,112 @@
   })();
 
   // ---------------------------------------------------------------------------
+  // sprintComposition — per-sprint breakdown of tickets (type / status /
+  // assignee / epic parent) fetched in one JQL call per sprint. Backlog
+  // stats feature consumes this; Timeline features don't, so fetching is
+  // lazy and only fires when a Backlog stats panel is opened.
+  //
+  // Cache: 60 s TTL (matches issueMeta / epicProgress) with an in-flight
+  // dedup so multiple panels opened on the same sprint coalesce.
+  // ---------------------------------------------------------------------------
+
+  const sprintComposition = (() => {
+    const TTL_MS = 60_000;
+    const cache = new Map(); // sprintId -> { expiresAt, value }
+    const inflight = new Map(); // sprintId -> Promise
+
+    async function fetchForSprint(sprintId) {
+      const spFieldId = await storyPointsField.resolve();
+      const data = await jiraApi.searchIssues(
+        `sprint = ${sprintId}`,
+        [
+          spFieldId,
+          'issuetype',
+          'status',
+          'assignee',
+          'parent',
+          'summary',
+          'components',
+        ],
+        500,
+      );
+      const issues = [];
+      for (const issue of data.issues || []) {
+        const rawSp = Number(issue.fields?.[spFieldId]);
+        const sp = Number.isFinite(rawSp) && rawSp > 0 ? rawSp : null;
+        const typeName = issue.fields?.issuetype?.name || 'Autre';
+        const statusName = issue.fields?.status?.name || '';
+        const statusCategory =
+          classifyStatus(
+            statusName,
+            issue.fields?.status?.statusCategory?.key,
+          ) || null;
+        const assignee = issue.fields?.assignee;
+        const assigneeId = assignee?.accountId || null;
+        const assigneeName = assignee?.displayName || null;
+        const parent = issue.fields?.parent;
+        const parentType = parent?.fields?.issuetype?.name || '';
+        // Only treat the parent as an Epic parent — Sub-task parents
+        // (stories hosting sub-tasks) would pollute the "Epic" pie.
+        const parentIsEpic =
+          !!parent && (/epic/i.test(parentType) || !parent?.fields?.issuetype);
+        const epicKey = parentIsEpic ? parent?.key || null : null;
+        const epicName = parentIsEpic
+          ? parent?.fields?.summary || parent?.key || null
+          : null;
+        // Components: 0..N entries per issue. We surface only `name`
+        // because that's the human-readable label users will recognise
+        // in the pie legend; the id isn't useful to them.
+        const rawComponents = issue.fields?.components;
+        const components = Array.isArray(rawComponents)
+          ? rawComponents
+              .map((c) => (c?.name || '').trim())
+              .filter(Boolean)
+          : [];
+        issues.push({
+          key: issue.key,
+          sp,
+          type: typeName,
+          status: statusName,
+          statusCategory,
+          assigneeId,
+          assigneeName,
+          epicKey,
+          epicName,
+          components,
+        });
+      }
+      return { issues };
+    }
+
+    function get(sprintId) {
+      const now = Date.now();
+      const hit = cache.get(sprintId);
+      if (hit && hit.expiresAt > now) return Promise.resolve(hit.value);
+      if (inflight.has(sprintId)) return inflight.get(sprintId);
+      const p = fetchForSprint(sprintId)
+        .then((value) => {
+          cache.set(sprintId, { expiresAt: Date.now() + TTL_MS, value });
+          return value;
+        })
+        .finally(() => inflight.delete(sprintId));
+      inflight.set(sprintId, p);
+      return p;
+    }
+
+    function invalidate(sprintId) {
+      const hit = cache.get(sprintId);
+      if (hit) hit.expiresAt = 0;
+    }
+
+    function invalidateAll() {
+      for (const entry of cache.values()) entry.expiresAt = 0;
+    }
+
+    return { get, invalidate, invalidateAll };
+  })();
+
+  // ---------------------------------------------------------------------------
   // styles — injected once
   // ---------------------------------------------------------------------------
 
@@ -1992,6 +2209,209 @@
         border-radius: 2px;
         font-size: 12px;
         color: #42526E;
+      }
+
+      /* ----------------------------------------------------------------
+       * Sprint composition stats (Backlog view)
+       * ---------------------------------------------------------------- */
+      .${SPRINT_STATS_BUTTON_CLASS} {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        margin-right: 8px;
+        padding: 4px 10px;
+        border: 1px solid rgba(9, 30, 66, 0.14);
+        border-radius: 3px;
+        background: rgba(255, 255, 255, 0.9);
+        color: #42526E;
+        font: inherit;
+        font-size: 12px;
+        font-weight: 500;
+        line-height: 1.4;
+        cursor: pointer;
+        transition: background 120ms ease-out, border-color 120ms ease-out;
+        white-space: nowrap;
+      }
+      .${SPRINT_STATS_BUTTON_CLASS}:hover {
+        background: rgba(9, 30, 66, 0.08);
+        border-color: rgba(9, 30, 66, 0.2);
+      }
+      .${SPRINT_STATS_BUTTON_CLASS}[aria-expanded="true"] {
+        background: #DEEBFF;
+        border-color: #B3D4FF;
+        color: #0052CC;
+      }
+
+      .${SPRINT_STATS_PANEL_CLASS} {
+        margin: 8px 0 4px;
+        padding: 12px 14px 14px;
+        background: #F4F5F7;
+        border: 1px solid rgba(9, 30, 66, 0.08);
+        border-radius: 4px;
+        font-size: 12px;
+        color: #172B4D;
+      }
+      .${SPRINT_STATS_PANEL_CLASS}[data-state="loading"] {
+        opacity: 0.7;
+      }
+      .${SPRINT_STATS_CLASS}__loading,
+      .${SPRINT_STATS_CLASS}__empty,
+      .${SPRINT_STATS_CLASS}__error {
+        padding: 12px 4px;
+        color: #5E6C84;
+        font-style: italic;
+      }
+      .${SPRINT_STATS_CLASS}__error {
+        color: #BF2600;
+        font-style: normal;
+      }
+
+      .${SPRINT_STATS_CLASS}__controls {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 12px 16px;
+        margin-bottom: 12px;
+        padding-bottom: 10px;
+        border-bottom: 1px solid rgba(9, 30, 66, 0.08);
+      }
+      .${SPRINT_STATS_CLASS}__weight {
+        display: inline-flex;
+        /* The legend column is a column flexbox which stretches its
+         * children by default — force the toggle to shrink to its
+         * buttons' natural width instead of spanning the whole column. */
+        align-self: flex-start;
+        border: 1px solid rgba(9, 30, 66, 0.14);
+        border-radius: 3px;
+        overflow: hidden;
+      }
+      .${SPRINT_STATS_CLASS}__weight-btn {
+        padding: 4px 10px;
+        border: 0;
+        background: #fff;
+        color: #42526E;
+        font: inherit;
+        font-size: 12px;
+        cursor: pointer;
+      }
+      .${SPRINT_STATS_CLASS}__weight-btn + .${SPRINT_STATS_CLASS}__weight-btn {
+        border-left: 1px solid rgba(9, 30, 66, 0.14);
+      }
+      .${SPRINT_STATS_CLASS}__weight-btn[data-active="1"] {
+        background: #0052CC;
+        color: #fff;
+      }
+      .${SPRINT_STATS_CLASS}__dim-select {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        color: #42526E;
+        font-size: 12px;
+      }
+      .${SPRINT_STATS_CLASS}__dim-select-label {
+        font-weight: 500;
+      }
+      .${SPRINT_STATS_CLASS}__dim-dropdown {
+        padding: 3px 8px;
+        border: 1px solid rgba(9, 30, 66, 0.14);
+        border-radius: 3px;
+        background: #fff;
+        font: inherit;
+        font-size: 12px;
+        color: #172B4D;
+        cursor: pointer;
+      }
+      .${SPRINT_STATS_CLASS}__dim-dropdown:focus {
+        outline: 2px solid #4C9AFF;
+        outline-offset: 1px;
+      }
+      .${SPRINT_STATS_CLASS}__counter {
+        margin-left: auto;
+        color: #5E6C84;
+        font-size: 12px;
+      }
+
+      .${SPRINT_STATS_CLASS}__grid {
+        display: block;
+      }
+      .${SPRINT_STATS_CLASS}__pie {
+        background: #fff;
+        border: 1px solid rgba(9, 30, 66, 0.08);
+        border-radius: 4px;
+        padding: 10px 12px 12px;
+      }
+      .${SPRINT_STATS_CLASS}__pie-hint {
+        margin-bottom: 6px;
+        color: #6B778C;
+        font-size: 11px;
+        font-style: italic;
+      }
+      .${SPRINT_STATS_CLASS}__pie-hint--footer {
+        margin: 8px 0 0;
+      }
+      .${SPRINT_STATS_CLASS}__pie-body {
+        display: flex;
+        gap: 12px;
+        align-items: center;
+      }
+      .${SPRINT_STATS_CLASS}__pie-svg {
+        flex: 0 0 auto;
+        width: 120px;
+        height: 120px;
+      }
+      .${SPRINT_STATS_CLASS}__pie-svg [data-slice-key] {
+        transition: opacity 120ms ease-out;
+        cursor: default;
+      }
+      .${SPRINT_STATS_CLASS}__pie-svg [data-slice-key].${SPRINT_STATS_CLASS}--dim {
+        opacity: 0.25;
+      }
+      .${SPRINT_STATS_CLASS}__legend-column {
+        flex: 1 1 0;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        min-width: 0;
+      }
+      .${SPRINT_STATS_CLASS}__legend {
+        flex: 0 1 auto;
+        margin: 0;
+        padding: 0;
+        list-style: none;
+        max-height: 140px;
+        overflow-y: auto;
+      }
+      .${SPRINT_STATS_CLASS}__legend-item {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 2px 0;
+        font-size: 12px;
+        color: #172B4D;
+        transition: opacity 120ms ease-out;
+      }
+      .${SPRINT_STATS_CLASS}__legend-item.${SPRINT_STATS_CLASS}--dim {
+        opacity: 0.35;
+      }
+      .${SPRINT_STATS_CLASS}__swatch {
+        flex: 0 0 10px;
+        width: 10px;
+        height: 10px;
+        border-radius: 2px;
+      }
+      .${SPRINT_STATS_CLASS}__legend-label {
+        /* Natural size so the value sits right after the label.
+         * Shrinks (with ellipsis) if the label would overflow the row. */
+        flex: 0 1 auto;
+        min-width: 0;
+        overflow: hidden;
+        white-space: nowrap;
+        text-overflow: ellipsis;
+      }
+      .${SPRINT_STATS_CLASS}__legend-value {
+        flex: 0 0 auto;
+        color: #5E6C84;
+        font-variant-numeric: tabular-nums;
       }
     `;
     document.head.appendChild(style);
@@ -3105,6 +3525,121 @@
   })();
 
   // ---------------------------------------------------------------------------
+  // backlogDom — detect sprint containers on the Backlog view and extract
+  // their sprint id / name / state. JIRA's modern Backlog uses precise
+  // testids that we can lock onto:
+  //   container :  data-testid="software-backlog.card-list.container.<id>"
+  //   actions   :  data-testid="…sprint-header.estimations-and-actions-container"
+  //   complete  :  data-testid="…sprint-header.complete-sprint-button"  (active sprint)
+  //   start     :  data-testid="…sprint-header.start-sprint-button"     (future)
+  //   accordion :  id="backlog-accordion-<id>"
+  // The "BACKLOG" pseudo-sprint at the bottom uses the literal id string
+  // "BACKLOG" and is intentionally skipped (no sprint id, no API call).
+  // ---------------------------------------------------------------------------
+
+  const backlogDom = (() => {
+    const CONTAINER_PREFIX = 'software-backlog.card-list.container.';
+    const SPRINT_ID_RE = /^software-backlog\.card-list\.container\.(\d+)$/;
+
+    function findSprintContainers(root) {
+      const out = [];
+      const candidates = root.querySelectorAll(
+        `[data-testid^="${CONTAINER_PREFIX}"]`,
+      );
+      for (const el of candidates) {
+        const t = el.getAttribute('data-testid') || '';
+        if (!SPRINT_ID_RE.test(t)) continue; // skip "container.BACKLOG"
+        out.push(el);
+      }
+      return out;
+    }
+
+    function extractSprintInfo(container) {
+      const t = container.getAttribute('data-testid') || '';
+      const m = t.match(SPRINT_ID_RE);
+      if (!m) return null;
+      const sprintId = Number(m[1]);
+      if (!Number.isFinite(sprintId) || sprintId <= 0) return null;
+      // The sprint name lives in the `<h2>` inside the header's left side.
+      const h2 = container.querySelector('h2');
+      const name =
+        (h2?.textContent || '').trim().slice(0, 80) || `Sprint ${sprintId}`;
+      // Only the ACTIVE sprint exposes a "Complete sprint" button — its
+      // mere presence (regardless of `disabled`) is a reliable signal.
+      const isActive = !!container.querySelector(
+        '[data-testid$="sprint-header.complete-sprint-button"]',
+      );
+      return { sprintId, name, isActive };
+    }
+
+    function findActionsHost(container) {
+      // Native actions row that holds Start/Complete sprint + the "…" menu.
+      // Best UX target — our button reads as a peer of the existing actions.
+      return container.querySelector(
+        '[data-testid$="sprint-header.estimations-and-actions-container"]',
+      );
+    }
+
+    function findAccordion(container) {
+      // The collapsible body holding the ticket list. Used to pick a
+      // panel insertion point: we drop the panel between the header and
+      // the accordion so it sits with the sprint summary, not the rows.
+      return container.querySelector(
+        '[data-testid="software-backlog.card-list.accordion"]',
+      );
+    }
+
+    let lastProbeAt = 0;
+    let loggedZeroOnce = false;
+    function probe(root) {
+      const now = Date.now();
+      if (now - lastProbeAt < 3_000) return;
+      lastProbeAt = now;
+      const hits = [];
+      root.querySelectorAll('[data-testid]').forEach((el) => {
+        if (hits.length >= 30) return;
+        const t = el.getAttribute('data-testid') || '';
+        if (
+          /software-backlog\.card-list/i.test(t) ||
+          /sprint-header/i.test(t)
+        ) {
+          hits.push({ testid: t, tag: el.tagName.toLowerCase() });
+        }
+      });
+      window.__MOMENTUM_BACKLOG_PROBE__ = {
+        timestamp: new Date().toISOString(),
+        sampleSprintTestids: hits,
+      };
+      if (!loggedZeroOnce) {
+        loggedZeroOnce = true;
+        warn(
+          `backlogDom: 0 sprint containers detected on the Backlog view. ` +
+            `Backlog-related testids found: ${hits.length}. ` +
+            `Full dump at window.__MOMENTUM_BACKLOG_PROBE__`,
+        );
+      } else if (isDebug()) {
+        warn(
+          `backlogDom probe — backlog-related testids: ${hits.length}. ` +
+            'Dump at window.__MOMENTUM_BACKLOG_PROBE__',
+        );
+      }
+    }
+
+    function resetZeroLog() {
+      loggedZeroOnce = false;
+    }
+
+    return {
+      findSprintContainers,
+      extractSprintInfo,
+      findActionsHost,
+      findAccordion,
+      probe,
+      resetZeroLog,
+    };
+  })();
+
+  // ---------------------------------------------------------------------------
   // velocityBanner — sticky chip rendered at the top of the plan's main
   // content region, showing the average velocity of the last N closed
   // sprints. Click the chip to refresh.
@@ -3369,6 +3904,600 @@
     }
 
     return { ensure, remove, update };
+  })();
+
+  // ---------------------------------------------------------------------------
+  // sprintStatsPanel — Backlog feature. For each sprint container detected
+  // by `backlogDom.findSprintContainers`, injects a "📊 Statistiques"
+  // button in the header that toggles a panel of SVG pie charts breaking
+  // down the sprint by user-selected dimensions (type / status / assignee
+  // / epic parent), weighted by ticket count or Story Points.
+  //
+  // All SVG rendering is hand-rolled (no Chart.js / no canvas) to keep the
+  // userscript a single dependency-free file.
+  // ---------------------------------------------------------------------------
+
+  const sprintStatsPanel = (() => {
+    // Dimension metadata.
+    //   keyOf(issue)  → string[] of bucket keys (one issue can land in
+    //                   multiple buckets when it has multiple values, eg
+    //                   components — `multi: true`).
+    //   labelOf(key)  → human-readable legend label.
+    //   multi         → if true, the "issues counted multiple times"
+    //                   hint is shown when at least one issue contributes
+    //                   to several buckets.
+    const DIMENSIONS = {
+      type: {
+        label: 'Par type',
+        keyOf: (i) => [i.type || 'Autre'],
+        labelOf: (k) => k,
+      },
+      status: {
+        label: 'Par statut',
+        keyOf: (i) => [
+          i.statusCategory === 'done'
+            ? 'done'
+            : i.statusCategory === 'indeterminate'
+              ? 'indeterminate'
+              : 'new',
+        ],
+        labelOf: (k) =>
+          k === 'done' ? 'Terminé' : k === 'indeterminate' ? 'En cours' : 'À faire',
+      },
+      assignee: {
+        label: 'Par assigné',
+        keyOf: (i) => [i.assigneeId || '__unassigned__'],
+        labelOf: (k, sample) =>
+          k === '__unassigned__' ? 'Non assigné' : sample?.assigneeName || 'Inconnu',
+      },
+      epic: {
+        label: 'Par Epic',
+        keyOf: (i) => [i.epicKey || '__no_epic__'],
+        labelOf: (k, sample) =>
+          k === '__no_epic__' ? 'Sans Epic' : sample?.epicName || k,
+      },
+      component: {
+        label: 'Par composant',
+        multi: true,
+        keyOf: (i) => {
+          if (!i.components || i.components.length === 0) return ['__no_component__'];
+          return i.components;
+        },
+        labelOf: (k) => (k === '__no_component__' ? 'Sans composant' : k),
+      },
+    };
+
+    function dimLabel(dim) {
+      return (
+        dim === 'type'
+          ? 'Type'
+          : dim === 'status'
+            ? 'Statut'
+            : dim === 'assignee'
+              ? 'Assigné'
+              : dim === 'epic'
+                ? 'Epic'
+                : 'Composant'
+      );
+    }
+
+    // Stable color for a slice: hash the key into a starting palette
+    // index (so the same assignee / type / epic keeps the same tint
+    // across pies when there's no collision), with linear probing to
+    // guarantee uniqueness within a single pie. Reserved keys keep
+    // their semantic colors: status categories get their canonical
+    // red/blue/green, and "no value" buckets (__unassigned__, …) get
+    // a shared neutral grey — duplicates of grey are fine because
+    // there's only one such bucket per dimension.
+    const STATUS_COLORS = {
+      done: '#36B37E', // green
+      indeterminate: '#0065FF', // blue
+      new: '#97A0AF', // grey
+    };
+    const FALLBACK_COLOR = '#C1C7D0';
+    // Curated categorical palette. 18 colors, hand-picked from the
+    // Atlassian Design System bold variants plus a few accents, ordered
+    // so adjacent indices contrast strongly (avoids look-alike slices
+    // when slices happen to land on consecutive palette entries).
+    const PALETTE = [
+      '#0052CC', // blue
+      '#FF8B00', // orange
+      '#00875A', // green
+      '#6554C0', // purple
+      '#DE350B', // red
+      '#00A3BF', // teal
+      '#FFAB00', // yellow
+      '#CD519D', // magenta
+      '#403294', // indigo
+      '#008DA6', // dark teal
+      '#FF5630', // coral
+      '#0747A6', // dark blue
+      '#36B37E', // light green
+      '#8777D9', // lavender
+      '#BF2600', // dark red
+      '#FFC400', // gold
+      '#5243AA', // deep purple
+      '#008F7A', // deep teal
+    ];
+    const RESERVED_KEYS = new Set([
+      '__unassigned__',
+      '__no_epic__',
+      '__unsized__',
+      '__no_component__',
+    ]);
+
+    function hashStartIndex(key) {
+      let h = 0;
+      const str = String(key);
+      for (let i = 0; i < str.length; i += 1) {
+        h = (h * 31 + str.charCodeAt(i)) | 0;
+      }
+      return ((h % PALETTE.length) + PALETTE.length) % PALETTE.length;
+    }
+
+    function pickColor(dim, key, used) {
+      if (dim === 'status' && STATUS_COLORS[key]) return STATUS_COLORS[key];
+      if (RESERVED_KEYS.has(key)) return FALLBACK_COLOR;
+      // Linear probe from a hash-based starting index. First unused
+      // palette entry wins. Keeps a key's color stable as long as no
+      // earlier slice in the same pie grabbed it first.
+      const start = hashStartIndex(key);
+      for (let k = 0; k < PALETTE.length; k += 1) {
+        const c = PALETTE[(start + k) % PALETTE.length];
+        if (!used.has(c)) return c;
+      }
+      // Palette exhausted (19+ distinct slices) — fall back to
+      // golden-angle HSL so additional slices are still visually
+      // distinct from each other.
+      const hue = (used.size * 137.508) % 360;
+      return `hsl(${hue}, 55%, 50%)`;
+    }
+
+    // Accumulate buckets for a single dimension. `weightOf(issue)` returns
+    // the contribution of one issue (1 for count mode, SP for SP mode).
+    // For multi-value dimensions (e.g. components), one issue's full
+    // weight is counted once into EACH of its bucket keys — so a story
+    // tagged with two components contributes its 5 SP twice. Returns
+    // `{ slices, multiCounted }` where `multiCounted` flags the case so
+    // we can surface the "issues counted multiple times" hint.
+    function buildBuckets(issues, dim, weightOf) {
+      const def = DIMENSIONS[dim];
+      const buckets = new Map();
+      let multiCounted = false;
+      for (const issue of issues) {
+        const w = weightOf(issue);
+        if (!(w > 0)) continue;
+        const keys = def.keyOf(issue) || [];
+        if (keys.length > 1) multiCounted = true;
+        for (const k of keys) {
+          if (!buckets.has(k)) {
+            buckets.set(k, {
+              key: k,
+              label: def.labelOf(k, issue),
+              value: 0,
+              color: null, // assigned below, after sort, to guarantee uniqueness
+              samples: 0,
+            });
+          }
+          const b = buckets.get(k);
+          b.value += w;
+          b.samples += 1;
+        }
+      }
+      const slices = [...buckets.values()].sort((a, b) => b.value - a.value);
+      // Assign colors AFTER sort so the largest slices get their
+      // preferred palette entries first. `pickColor` tracks used
+      // colors to guarantee no two slices share a tint within the
+      // same pie (reserved neutrals excepted — only one per dim).
+      const used = new Set();
+      for (const slice of slices) {
+        slice.color = pickColor(dim, slice.key, used);
+        // Track every assigned color, including reserved ones, so a
+        // later slice that hashes onto the same palette entry probes
+        // forward instead of duplicating.
+        used.add(slice.color);
+      }
+      return { slices, multiCounted };
+    }
+
+    // Build an SVG pie chart element for a given set of slices.
+    // Slices are expected already ordered. Returns a self-contained node.
+    function renderPie(slices, totalWeight) {
+      const svgNS = 'http://www.w3.org/2000/svg';
+      const svg = document.createElementNS(svgNS, 'svg');
+      svg.setAttribute('viewBox', '-1.05 -1.05 2.1 2.1');
+      svg.classList.add(`${SPRINT_STATS_CLASS}__pie-svg`);
+      svg.setAttribute('role', 'img');
+      if (!(totalWeight > 0) || slices.length === 0) {
+        const txt = document.createElementNS(svgNS, 'text');
+        txt.setAttribute('x', '0');
+        txt.setAttribute('y', '0.05');
+        txt.setAttribute('text-anchor', 'middle');
+        txt.setAttribute('font-size', '0.18');
+        txt.setAttribute('fill', '#6B778C');
+        txt.textContent = 'Aucune donnée';
+        svg.appendChild(txt);
+        return svg;
+      }
+      // Edge case: a single slice fills the whole circle. SVG can't draw a
+      // 360° arc in one path (start = end), so we emit a full <circle>.
+      if (slices.length === 1) {
+        const c = document.createElementNS(svgNS, 'circle');
+        c.setAttribute('cx', '0');
+        c.setAttribute('cy', '0');
+        c.setAttribute('r', '1');
+        c.setAttribute('fill', slices[0].color);
+        c.setAttribute('data-slice-key', slices[0].key);
+        svg.appendChild(c);
+        return svg;
+      }
+      let angle = -Math.PI / 2; // start at 12 o'clock
+      for (const slice of slices) {
+        const frac = slice.value / totalWeight;
+        const end = angle + frac * Math.PI * 2;
+        const x1 = Math.cos(angle);
+        const y1 = Math.sin(angle);
+        const x2 = Math.cos(end);
+        const y2 = Math.sin(end);
+        const largeArc = frac > 0.5 ? 1 : 0;
+        const path = document.createElementNS(svgNS, 'path');
+        path.setAttribute(
+          'd',
+          `M 0 0 L ${x1.toFixed(4)} ${y1.toFixed(4)} A 1 1 0 ${largeArc} 1 ${x2.toFixed(4)} ${y2.toFixed(4)} Z`,
+        );
+        path.setAttribute('fill', slice.color);
+        path.setAttribute('data-slice-key', slice.key);
+        svg.appendChild(path);
+        angle = end;
+      }
+      return svg;
+    }
+
+    // Build the legend for a pie: colored dot + label + "value (pct%)".
+    function renderLegend(slices, totalWeight, weightSuffix) {
+      const ul = document.createElement('ul');
+      ul.className = `${SPRINT_STATS_CLASS}__legend`;
+      for (const slice of slices) {
+        const li = document.createElement('li');
+        li.className = `${SPRINT_STATS_CLASS}__legend-item`;
+        li.dataset.sliceKey = slice.key;
+        const pct = totalWeight > 0 ? (slice.value / totalWeight) * 100 : 0;
+        // Format value: SP keep one decimal when fractional, counts are ints.
+        const displayValue =
+          Number.isInteger(slice.value)
+            ? String(slice.value)
+            : slice.value.toFixed(1).replace(/\.0$/, '');
+        li.innerHTML =
+          `<span class="${SPRINT_STATS_CLASS}__swatch" style="background:${slice.color}"></span>` +
+          `<span class="${SPRINT_STATS_CLASS}__legend-label"></span>` +
+          `<span class="${SPRINT_STATS_CLASS}__legend-value">${displayValue}${weightSuffix} · ${pct.toFixed(0)}%</span>`;
+        li.querySelector(`.${SPRINT_STATS_CLASS}__legend-label`).textContent = slice.label;
+        ul.appendChild(li);
+      }
+      return ul;
+    }
+
+    // Render a single pie block (title + pie + legend) for one dimension.
+    function renderPieBlock(dim, issues, weightMode) {
+      const weightOf = weightMode === 'sp'
+        ? (i) => (i.sp || 0)
+        : () => 1;
+      const weightSuffix = weightMode === 'sp' ? ' SP' : '';
+      const { slices, multiCounted } = buildBuckets(issues, dim, weightOf);
+      const total = slices.reduce((s, x) => s + x.value, 0);
+      const wrap = document.createElement('div');
+      wrap.className = `${SPRINT_STATS_CLASS}__pie`;
+      wrap.dataset.dim = dim;
+      if (multiCounted) {
+        const hint = document.createElement('div');
+        hint.className = `${SPRINT_STATS_CLASS}__pie-hint`;
+        hint.textContent =
+          'Certains tickets ont plusieurs valeurs et sont comptés dans chaque part — ' +
+          'le total des parts dépasse le nombre de tickets.';
+        wrap.appendChild(hint);
+      }
+      const body = document.createElement('div');
+      body.className = `${SPRINT_STATS_CLASS}__pie-body`;
+      body.appendChild(renderPie(slices, total));
+      // Right column: weight toggle on top of the legend so the user
+      // can pivot the pie (tickets ↔ SP) without hunting for the
+      // control in the top bar. Both controls live in the same visual
+      // group — reads as "this legend is weighted by <mode>".
+      const rightCol = document.createElement('div');
+      rightCol.className = `${SPRINT_STATS_CLASS}__legend-column`;
+      rightCol.appendChild(buildWeightToggle(weightMode));
+      rightCol.appendChild(renderLegend(slices, total, weightSuffix));
+      body.appendChild(rightCol);
+      wrap.appendChild(body);
+      // Unsized-ticket footnote goes BELOW the pie — it's a side note on
+      // why the SP totals don't match the ticket count, not a title.
+      if (weightMode === 'sp' && issues.some((i) => !i.sp)) {
+        const unsized = issues.filter((i) => !i.sp).length;
+        const hint = document.createElement('div');
+        hint.className = `${SPRINT_STATS_CLASS}__pie-hint ${SPRINT_STATS_CLASS}__pie-hint--footer`;
+        hint.textContent = `${unsized} ticket${unsized > 1 ? 's' : ''} sans SP ignoré${unsized > 1 ? 's' : ''}`;
+        wrap.appendChild(hint);
+      }
+      return wrap;
+    }
+
+    function buildWeightToggle(activeMode) {
+      const weightWrap = document.createElement('div');
+      weightWrap.className = `${SPRINT_STATS_CLASS}__weight`;
+      for (const [mode, label] of [['count', 'Tickets'], ['sp', 'SP']]) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = `${SPRINT_STATS_CLASS}__weight-btn`;
+        btn.textContent = label;
+        btn.dataset.weight = mode;
+        if (activeMode === mode) btn.dataset.active = '1';
+        btn.addEventListener('click', () => statsPrefs.setWeight(mode));
+        weightWrap.appendChild(btn);
+      }
+      return weightWrap;
+    }
+
+    // Build the full panel content. Re-called whenever prefs change or the
+    // underlying data mutates — never reused incrementally (simpler, the
+    // panel is tiny so DOM churn is cheap).
+    function buildPanelContent(panel, composition, sprintInfo) {
+      panel.innerHTML = '';
+      const prefs = statsPrefs.get();
+      const issues = composition?.issues || [];
+
+      const header = document.createElement('div');
+      header.className = `${SPRINT_STATS_CLASS}__controls`;
+
+      // Dimension dropdown: pick which field to project as a pie.
+      const dimWrap = document.createElement('label');
+      dimWrap.className = `${SPRINT_STATS_CLASS}__dim-select`;
+      const dimLabelEl = document.createElement('span');
+      dimLabelEl.className = `${SPRINT_STATS_CLASS}__dim-select-label`;
+      dimLabelEl.textContent = 'Champ :';
+      dimWrap.appendChild(dimLabelEl);
+      const select = document.createElement('select');
+      select.className = `${SPRINT_STATS_CLASS}__dim-dropdown`;
+      for (const dim of SPRINT_STATS_DIMENSIONS) {
+        const opt = document.createElement('option');
+        opt.value = dim;
+        opt.textContent = dimLabel(dim);
+        if (prefs.dim === dim) opt.selected = true;
+        select.appendChild(opt);
+      }
+      select.addEventListener('change', () => statsPrefs.setDim(select.value));
+      dimWrap.appendChild(select);
+      header.appendChild(dimWrap);
+
+      // Counter (N tickets · S SP).
+      const totalSp = issues.reduce((s, i) => s + (i.sp || 0), 0);
+      const counter = document.createElement('span');
+      counter.className = `${SPRINT_STATS_CLASS}__counter`;
+      counter.textContent = `${issues.length} ticket${issues.length > 1 ? 's' : ''} · ${Math.round(totalSp)} SP`;
+      header.appendChild(counter);
+
+      panel.appendChild(header);
+
+      if (issues.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = `${SPRINT_STATS_CLASS}__empty`;
+        empty.textContent = 'Aucun ticket dans ce sprint.';
+        panel.appendChild(empty);
+        return;
+      }
+
+      const grid = document.createElement('div');
+      grid.className = `${SPRINT_STATS_CLASS}__grid`;
+      grid.appendChild(renderPieBlock(prefs.dim, issues, prefs.weight));
+      panel.appendChild(grid);
+
+      // Hover cross-highlight: hovering a pie slice dims its siblings, and
+      // vice-versa on the legend rows. Single delegated listener keeps the
+      // panel lightweight.
+      panel.addEventListener('mouseover', (e) => {
+        const target = e.target.closest('[data-slice-key]');
+        if (!target) return;
+        const pie = target.closest(`.${SPRINT_STATS_CLASS}__pie`);
+        if (!pie) return;
+        const key = target.dataset.sliceKey;
+        pie.querySelectorAll('[data-slice-key]').forEach((n) => {
+          n.classList.toggle(
+            `${SPRINT_STATS_CLASS}--dim`,
+            n.dataset.sliceKey !== key,
+          );
+        });
+      });
+      panel.addEventListener('mouseout', (e) => {
+        const pie = e.target.closest(`.${SPRINT_STATS_CLASS}__pie`);
+        if (!pie) return;
+        pie.querySelectorAll('[data-slice-key]').forEach((n) => {
+          n.classList.remove(`${SPRINT_STATS_CLASS}--dim`);
+        });
+      });
+    }
+
+    // Panels currently mounted in the DOM — keyed by sprintId so we can
+    // reach them from the prefs-change listener without a full DOM scan.
+    const mountedPanels = new Map(); // sprintId -> { panel, sprintInfo, loading }
+
+    function ensureButton(container, info) {
+      if (!container || !info?.sprintId) return;
+      // Idempotent: bail early if our button is already mounted somewhere
+      // inside this container (handles re-renders that don't replace it).
+      const existing = container.querySelector(`.${SPRINT_STATS_BUTTON_CLASS}`);
+      if (existing) return existing;
+
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = SPRINT_STATS_BUTTON_CLASS;
+      btn.dataset.sprintId = String(info.sprintId);
+      btn.setAttribute(
+        'aria-expanded',
+        statsOpenSprints.has(info.sprintId) ? 'true' : 'false',
+      );
+      btn.innerHTML = '<span aria-hidden="true">📊</span> Statistiques';
+      btn.title = 'Afficher / masquer les statistiques de composition du sprint';
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        e.preventDefault();
+        togglePanel(container, info);
+      });
+      // Preferred host: the native actions row (Start/Complete sprint + …
+      // menu). Inserting at the head makes our button the first action,
+      // visually next to the estimation badges. Fallback: prepend to the
+      // sprint container so the button is always visible.
+      const actions = backlogDom.findActionsHost(container);
+      if (actions) {
+        actions.insertBefore(btn, actions.firstChild);
+      } else {
+        container.insertBefore(btn, container.firstChild);
+      }
+      return btn;
+    }
+
+    async function refresh(container, info) {
+      const panel = ensurePanel(container, info);
+      if (!panel) return;
+      panel.dataset.state = 'loading';
+      // Don't wipe the existing content — we want to show the previous
+      // pies while the fresh data loads, to avoid a visible flash.
+      if (!panel.firstChild) {
+        const placeholder = document.createElement('div');
+        placeholder.className = `${SPRINT_STATS_CLASS}__loading`;
+        placeholder.textContent = 'Chargement des statistiques…';
+        panel.appendChild(placeholder);
+      }
+      try {
+        const composition = await sprintComposition.get(info.sprintId);
+        // Panel may have been unmounted while we awaited.
+        if (!panel.isConnected) return;
+        buildPanelContent(panel, composition, info);
+        panel.dataset.state = 'ok';
+      } catch (e) {
+        warn(`sprint-stats: failed to load sprint ${info.sprintId}:`, e?.message || e);
+        if (!panel.isConnected) return;
+        panel.innerHTML = '';
+        const err = document.createElement('div');
+        err.className = `${SPRINT_STATS_CLASS}__error`;
+        err.textContent = 'Statistiques indisponibles. Réessayez plus tard.';
+        panel.appendChild(err);
+        panel.dataset.state = 'error';
+      }
+    }
+
+    function ensurePanel(container, info) {
+      if (!container || !info?.sprintId) return null;
+      let panel = container.querySelector(`.${SPRINT_STATS_PANEL_CLASS}`);
+      if (panel) {
+        mountedPanels.set(info.sprintId, { panel, sprintInfo: info });
+        return panel;
+      }
+      panel = document.createElement('div');
+      panel.className = SPRINT_STATS_PANEL_CLASS;
+      panel.dataset.sprintId = String(info.sprintId);
+      // Insert RIGHT BEFORE the accordion (issue list) so the panel
+      // visually sits with the sprint header summary, above the rows.
+      // Falls back to appending to the container if no accordion is
+      // present (defensive — should not happen on real JIRA backlogs).
+      const accordion = backlogDom.findAccordion(container);
+      if (accordion?.parentElement === container) {
+        container.insertBefore(panel, accordion);
+      } else {
+        container.appendChild(panel);
+      }
+      mountedPanels.set(info.sprintId, { panel, sprintInfo: info });
+      return panel;
+    }
+
+    function removePanel(container, info) {
+      const panel = container.querySelector(`.${SPRINT_STATS_PANEL_CLASS}`);
+      if (panel) panel.remove();
+      if (info?.sprintId) mountedPanels.delete(info.sprintId);
+    }
+
+    function togglePanel(container, info) {
+      const open = statsOpenSprints.has(info.sprintId);
+      const btn = container.querySelector(`.${SPRINT_STATS_BUTTON_CLASS}`);
+      if (open) {
+        statsOpenSprints.delete(info.sprintId);
+        removePanel(container, info);
+        if (btn) btn.setAttribute('aria-expanded', 'false');
+      } else {
+        statsOpenSprints.add(info.sprintId);
+        if (btn) btn.setAttribute('aria-expanded', 'true');
+        refresh(container, info);
+      }
+    }
+
+    function removeAll() {
+      document
+        .querySelectorAll(
+          `.${SPRINT_STATS_PANEL_CLASS}, .${SPRINT_STATS_BUTTON_CLASS}`,
+        )
+        .forEach((el) => el.remove());
+      mountedPanels.clear();
+    }
+
+    // When prefs change, every open panel needs to repaint — but we don't
+    // need to re-fetch the underlying composition. Refresh pulls from the
+    // 60 s cache on a hit, so this is cheap.
+    statsPrefs.onChange(() => {
+      for (const [sprintId, { panel, sprintInfo }] of mountedPanels) {
+        if (!panel.isConnected) {
+          mountedPanels.delete(sprintId);
+          continue;
+        }
+        sprintComposition
+          .get(sprintId)
+          .then((composition) => {
+            if (!panel.isConnected) return;
+            buildPanelContent(panel, composition, sprintInfo);
+          })
+          .catch((e) => warn('sprint-stats prefs-repaint error:', e?.message || e));
+      }
+    });
+
+    function isOpen(sprintId) {
+      return statsOpenSprints.has(sprintId);
+    }
+
+    // True when the panel for this sprint is currently mounted in the
+    // live DOM. Used by `feature.onMutation` to decide whether the panel
+    // needs to be re-mounted (page reload, JIRA re-rendered the sprint
+    // container, …) without rebuilding it on every mutation pass —
+    // rebuilding while a `<select>` popup is open would close it.
+    function hasPanel(sprintId) {
+      const entry = mountedPanels.get(sprintId);
+      return !!(entry?.panel?.isConnected);
+    }
+
+    // Re-fetch composition (cache may be stale) and rebuild the content
+    // of every open panel. Called by the API mutation interceptor after
+    // a ticket move / edit so panels reflect the new state in real time.
+    async function refreshAllOpen() {
+      for (const [sprintId, entry] of [...mountedPanels]) {
+        if (!entry.panel?.isConnected) {
+          mountedPanels.delete(sprintId);
+          continue;
+        }
+        try {
+          const composition = await sprintComposition.get(sprintId);
+          if (!entry.panel.isConnected) continue;
+          buildPanelContent(entry.panel, composition, entry.sprintInfo);
+        } catch (e) {
+          warn('sprint-stats refreshAllOpen error:', e?.message || e);
+        }
+      }
+    }
+
+    return {
+      ensureButton,
+      togglePanel,
+      refresh,
+      removeAll,
+      isOpen,
+      hasPanel,
+      refreshAllOpen,
+    };
   })();
 
   // ---------------------------------------------------------------------------
@@ -4295,6 +5424,11 @@
     return p.includes('/plans/') || p.includes('/timeline');
   };
 
+  // Backlog view (JIRA Software) — `/software/c/projects/<KEY>/boards/<N>/backlog`
+  // and `/jira/software/c/projects/<KEY>/backlog`. Kept intentionally loose
+  // (plain substring) so it picks up both classic and next-gen URL patterns.
+  const isBacklogLikePath = () => location.pathname.includes('/backlog');
+
   const features = [
     {
       id: 'timeline-bar-overlays',
@@ -4417,6 +5551,49 @@
       onInactive() {
         howto.end();
         howto.removeButton();
+      },
+    },
+    {
+      id: 'backlog-sprint-stats',
+      description:
+        'Backlog view — per-sprint "Statistiques" button that toggles a panel ' +
+        'of SVG pie charts breaking down the sprint by issue type, status, ' +
+        'assignee and epic parent (count- or SP-weighted).',
+      isActive: isBacklogLikePath,
+      onMutation(root) {
+        const containers = backlogDom.findSprintContainers(root);
+        heartbeat('backlog sprint containers found:', containers.length);
+        if (containers.length === 0) {
+          backlogDom.probe(root);
+          return;
+        }
+        // Containers found — re-arm the diagnostic so we warn again if
+        // navigation later lands us on a backlog where detection fails.
+        backlogDom.resetZeroLog();
+        for (const container of containers) {
+          const info = backlogDom.extractSprintInfo(container);
+          if (!info?.sprintId) continue;
+          sprintStatsPanel.ensureButton(container, info);
+          // Critical: do NOT re-render the panel on every DOM mutation.
+          // JIRA fires DOM mutations on hover/focus, and rebuilding the
+          // panel destroys & recreates the <select>, which slams shut
+          // any open native popup. Only call refresh when the panel is
+          // marked open (localStorage) but NOT currently in the DOM —
+          // i.e. on first appearance, page reload, or after a React
+          // re-render dropped our nodes. The interceptor handles
+          // post-mutation refreshes via `refreshAllOpen()` instead.
+          if (
+            sprintStatsPanel.isOpen(info.sprintId) &&
+            !sprintStatsPanel.hasPanel(info.sprintId)
+          ) {
+            sprintStatsPanel.refresh(container, info).catch((e) => {
+              warn('sprint-stats refresh failed:', e?.message || e);
+            });
+          }
+        }
+      },
+      onInactive() {
+        sprintStatsPanel.removeAll();
       },
     },
   ];
@@ -4794,6 +5971,15 @@
         issueMeta.invalidateAll();
         epicProgress.invalidateAll();
       }
+      // Backlog sprint-composition cache: a ticket move / edit could have
+      // changed its sprint, type, assignee or status. We don't know which
+      // sprint(s) were touched from the URL alone, so flush the whole map
+      // — next panel read hits JQL once and re-caches for 60 s.
+      sprintComposition.invalidateAll();
+      // Push the fresh numbers into any currently-open stats panel so
+      // the user sees the change in real time. Does nothing when no
+      // panel is open (zero allocation when the feature is unused).
+      sprintStatsPanel.refreshAllOpen();
       if (onAfterInvalidate) {
         perfStamp('repaint scheduled (confirm-invalidate)');
         onAfterInvalidate();
@@ -4970,7 +6156,7 @@
     // Initial pass (in case the timeline is already rendered at document-idle).
     runActiveFeatures();
     log(
-      'loaded — version 0.8.0',
+      'loaded — version 0.10.0',
       isDebug()
         ? '(debug on)'
         : '(debug off — enable with: localStorage.setItem(\'momentum-light-debug\', \'1\'))',
