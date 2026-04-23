@@ -55,7 +55,7 @@
   const SPRINT_STATS_CLASS = 'momentum-sprint-stats';
   const SPRINT_STATS_BUTTON_CLASS = 'momentum-sprint-stats__button';
   const SPRINT_STATS_PANEL_CLASS = 'momentum-sprint-stats__panel';
-  const SPRINT_STATS_DIMENSIONS = ['type', 'status', 'assignee', 'epic'];
+  const SPRINT_STATS_DIMENSIONS = ['type', 'status', 'assignee', 'epic', 'component'];
   const OVERLAY_LANDING_MOD = 'momentum-progress--landing';
   // Business-view status thresholds (in days) for the ternary 🟢🟡🔴 tint.
   // Beyond OFF_TRACK_DRIFT_DAYS of projection-vs-duedate drift the Epic reads
@@ -213,29 +213,34 @@
 
   // ---------------------------------------------------------------------------
   // statsPrefs — Backlog sprint-stats user preferences: weight mode
-  // (count vs story points) + enabled dimensions (type / status /
-  // assignee / epic). Persisted in localStorage. Panels subscribe via
-  // `onChange` so toggling a checkbox in one sprint updates all others.
+  // (count vs story points) + the single active dimension to project
+  // onto the pie chart (type / status / assignee / epic / component).
+  // Persisted in localStorage. Panels subscribe via `onChange` so
+  // toggling the dropdown in one sprint updates all others in sync.
   // ---------------------------------------------------------------------------
   const statsPrefs = (() => {
-    const DEFAULT = {
-      weight: 'count',
-      dims: [...SPRINT_STATS_DIMENSIONS],
-    };
+    const DEFAULT = { weight: 'count', dim: 'type' };
     const listeners = new Set();
 
     function read() {
       try {
         const raw = localStorage.getItem(SPRINT_STATS_PREFS_KEY);
-        if (!raw) return { ...DEFAULT, dims: [...DEFAULT.dims] };
+        if (!raw) return { ...DEFAULT };
         const parsed = JSON.parse(raw);
         const weight = parsed?.weight === 'sp' ? 'sp' : 'count';
-        const dims = Array.isArray(parsed?.dims)
-          ? parsed.dims.filter((d) => SPRINT_STATS_DIMENSIONS.includes(d))
-          : [...DEFAULT.dims];
-        return { weight, dims };
+        // Migration: v0.10.0 stored `dims: [...]` (multi-select); v0.11+
+        // uses a single `dim`. Honor either, falling back to the first
+        // valid dim or the default.
+        let dim = null;
+        if (typeof parsed?.dim === 'string' &&
+            SPRINT_STATS_DIMENSIONS.includes(parsed.dim)) {
+          dim = parsed.dim;
+        } else if (Array.isArray(parsed?.dims)) {
+          dim = parsed.dims.find((d) => SPRINT_STATS_DIMENSIONS.includes(d)) || null;
+        }
+        return { weight, dim: dim || DEFAULT.dim };
       } catch (_) {
-        return { ...DEFAULT, dims: [...DEFAULT.dims] };
+        return { ...DEFAULT };
       }
     }
 
@@ -247,6 +252,12 @@
       } catch (_) { /* private mode — best effort */ }
     }
 
+    function notify() {
+      for (const cb of listeners) {
+        try { cb(current); } catch (e) { warn('statsPrefs listener error:', e?.message || e); }
+      }
+    }
+
     return {
       get() { return current; },
       setWeight(w) {
@@ -254,19 +265,14 @@
         if (current.weight === next) return;
         current = { ...current, weight: next };
         write();
-        for (const cb of listeners) {
-          try { cb(current); } catch (e) { warn('statsPrefs listener error:', e?.message || e); }
-        }
+        notify();
       },
-      toggleDim(dim) {
+      setDim(dim) {
         if (!SPRINT_STATS_DIMENSIONS.includes(dim)) return;
-        const has = current.dims.includes(dim);
-        const dims = has ? current.dims.filter((d) => d !== dim) : [...current.dims, dim];
-        current = { ...current, dims };
+        if (current.dim === dim) return;
+        current = { ...current, dim };
         write();
-        for (const cb of listeners) {
-          try { cb(current); } catch (e) { warn('statsPrefs listener error:', e?.message || e); }
-        }
+        notify();
       },
       onChange(cb) {
         listeners.add(cb);
@@ -1377,7 +1383,15 @@
       const spFieldId = await storyPointsField.resolve();
       const data = await jiraApi.searchIssues(
         `sprint = ${sprintId}`,
-        [spFieldId, 'issuetype', 'status', 'assignee', 'parent', 'summary'],
+        [
+          spFieldId,
+          'issuetype',
+          'status',
+          'assignee',
+          'parent',
+          'summary',
+          'components',
+        ],
         500,
       );
       const issues = [];
@@ -1404,6 +1418,15 @@
         const epicName = parentIsEpic
           ? parent?.fields?.summary || parent?.key || null
           : null;
+        // Components: 0..N entries per issue. We surface only `name`
+        // because that's the human-readable label users will recognise
+        // in the pie legend; the id isn't useful to them.
+        const rawComponents = issue.fields?.components;
+        const components = Array.isArray(rawComponents)
+          ? rawComponents
+              .map((c) => (c?.name || '').trim())
+              .filter(Boolean)
+          : [];
         issues.push({
           key: issue.key,
           sp,
@@ -1414,6 +1437,7 @@
           assigneeName,
           epicKey,
           epicName,
+          components,
         });
       }
       return { issues };
@@ -2273,22 +2297,29 @@
         background: #0052CC;
         color: #fff;
       }
-      .${SPRINT_STATS_CLASS}__dims {
-        display: inline-flex;
-        flex-wrap: wrap;
-        gap: 4px 10px;
-      }
-      .${SPRINT_STATS_CLASS}__dim {
+      .${SPRINT_STATS_CLASS}__dim-select {
         display: inline-flex;
         align-items: center;
-        gap: 4px;
-        cursor: pointer;
-        user-select: none;
+        gap: 6px;
         color: #42526E;
+        font-size: 12px;
       }
-      .${SPRINT_STATS_CLASS}__dim input {
-        margin: 0;
+      .${SPRINT_STATS_CLASS}__dim-select-label {
+        font-weight: 500;
+      }
+      .${SPRINT_STATS_CLASS}__dim-dropdown {
+        padding: 3px 8px;
+        border: 1px solid rgba(9, 30, 66, 0.14);
+        border-radius: 3px;
+        background: #fff;
+        font: inherit;
+        font-size: 12px;
+        color: #172B4D;
         cursor: pointer;
+      }
+      .${SPRINT_STATS_CLASS}__dim-dropdown:focus {
+        outline: 2px solid #4C9AFF;
+        outline-offset: 1px;
       }
       .${SPRINT_STATS_CLASS}__counter {
         margin-left: auto;
@@ -2297,23 +2328,13 @@
       }
 
       .${SPRINT_STATS_CLASS}__grid {
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-        gap: 16px;
+        display: block;
       }
       .${SPRINT_STATS_CLASS}__pie {
         background: #fff;
         border: 1px solid rgba(9, 30, 66, 0.08);
         border-radius: 4px;
         padding: 10px 12px 12px;
-      }
-      .${SPRINT_STATS_CLASS}__pie-title {
-        margin: 0 0 2px;
-        font-size: 12px;
-        font-weight: 600;
-        color: #172B4D;
-        text-transform: uppercase;
-        letter-spacing: 0.04em;
       }
       .${SPRINT_STATS_CLASS}__pie-hint {
         margin-bottom: 6px;
@@ -3880,38 +3901,56 @@
   // ---------------------------------------------------------------------------
 
   const sprintStatsPanel = (() => {
-    // Dimension metadata: label + pickers that map an issue to its bucket.
+    // Dimension metadata.
+    //   keyOf(issue)  → string[] of bucket keys (one issue can land in
+    //                   multiple buckets when it has multiple values, eg
+    //                   components — `multi: true`).
+    //   labelOf(key)  → human-readable legend label.
+    //   multi         → if true, the "issues counted multiple times"
+    //                   hint is shown when at least one issue contributes
+    //                   to several buckets.
     const DIMENSIONS = {
       type: {
         label: 'Par type',
-        keyOf: (i) => i.type || 'Autre',
+        keyOf: (i) => [i.type || 'Autre'],
         labelOf: (k) => k,
       },
       status: {
         label: 'Par statut',
-        keyOf: (i) => {
-          if (i.statusCategory === 'done') return 'done';
-          if (i.statusCategory === 'indeterminate') return 'indeterminate';
-          return 'new';
-        },
+        keyOf: (i) => [
+          i.statusCategory === 'done'
+            ? 'done'
+            : i.statusCategory === 'indeterminate'
+              ? 'indeterminate'
+              : 'new',
+        ],
         labelOf: (k) =>
           k === 'done' ? 'Terminé' : k === 'indeterminate' ? 'En cours' : 'À faire',
       },
       assignee: {
         label: 'Par assigné',
-        keyOf: (i) => i.assigneeId || '__unassigned__',
+        keyOf: (i) => [i.assigneeId || '__unassigned__'],
         labelOf: (k, sample) =>
           k === '__unassigned__' ? 'Non assigné' : sample?.assigneeName || 'Inconnu',
       },
       epic: {
         label: 'Par Epic',
-        keyOf: (i) => i.epicKey || '__no_epic__',
+        keyOf: (i) => [i.epicKey || '__no_epic__'],
         labelOf: (k, sample) =>
           k === '__no_epic__' ? 'Sans Epic' : sample?.epicName || k,
       },
+      component: {
+        label: 'Par composant',
+        multi: true,
+        keyOf: (i) => {
+          if (!i.components || i.components.length === 0) return ['__no_component__'];
+          return i.components;
+        },
+        labelOf: (k) => (k === '__no_component__' ? 'Sans composant' : k),
+      },
     };
 
-    function dimCheckboxLabel(dim) {
+    function dimLabel(dim) {
       return (
         dim === 'type'
           ? 'Type'
@@ -3919,7 +3958,9 @@
             ? 'Statut'
             : dim === 'assignee'
               ? 'Assigné'
-              : 'Epic'
+              : dim === 'epic'
+                ? 'Epic'
+                : 'Composant'
       );
     }
 
@@ -3934,7 +3975,12 @@
     const FALLBACK_COLOR = '#C1C7D0';
     function colorFor(dim, key) {
       if (dim === 'status' && STATUS_COLORS[key]) return STATUS_COLORS[key];
-      if (key === '__unassigned__' || key === '__no_epic__' || key === '__unsized__') {
+      if (
+        key === '__unassigned__' ||
+        key === '__no_epic__' ||
+        key === '__unsized__' ||
+        key === '__no_component__'
+      ) {
         return FALLBACK_COLOR;
       }
       let h = 0;
@@ -3948,28 +3994,37 @@
 
     // Accumulate buckets for a single dimension. `weightOf(issue)` returns
     // the contribution of one issue (1 for count mode, SP for SP mode).
+    // For multi-value dimensions (e.g. components), one issue's full
+    // weight is counted once into EACH of its bucket keys — so a story
+    // tagged with two components contributes its 5 SP twice. Returns
+    // `{ slices, multiCounted }` where `multiCounted` flags the case so
+    // we can surface the "issues counted multiple times" hint.
     function buildBuckets(issues, dim, weightOf) {
       const def = DIMENSIONS[dim];
-      const buckets = new Map(); // key -> { label, value, color, samples[] }
+      const buckets = new Map();
+      let multiCounted = false;
       for (const issue of issues) {
         const w = weightOf(issue);
         if (!(w > 0)) continue;
-        const k = def.keyOf(issue);
-        if (!buckets.has(k)) {
-          buckets.set(k, {
-            key: k,
-            label: def.labelOf(k, issue),
-            value: 0,
-            color: colorFor(dim, k),
-            samples: 0,
-          });
+        const keys = def.keyOf(issue) || [];
+        if (keys.length > 1) multiCounted = true;
+        for (const k of keys) {
+          if (!buckets.has(k)) {
+            buckets.set(k, {
+              key: k,
+              label: def.labelOf(k, issue),
+              value: 0,
+              color: colorFor(dim, k),
+              samples: 0,
+            });
+          }
+          const b = buckets.get(k);
+          b.value += w;
+          b.samples += 1;
         }
-        const b = buckets.get(k);
-        b.value += w;
-        b.samples += 1;
       }
-      // Sort descending by value for stable legend ordering.
-      return [...buckets.values()].sort((a, b) => b.value - a.value);
+      const slices = [...buckets.values()].sort((a, b) => b.value - a.value);
+      return { slices, multiCounted };
     }
 
     // Build an SVG pie chart element for a given set of slices.
@@ -4055,20 +4110,24 @@
         ? (i) => (i.sp || 0)
         : () => 1;
       const weightSuffix = weightMode === 'sp' ? ' SP' : '';
-      const slices = buildBuckets(issues, dim, weightOf);
+      const { slices, multiCounted } = buildBuckets(issues, dim, weightOf);
       const total = slices.reduce((s, x) => s + x.value, 0);
       const wrap = document.createElement('div');
       wrap.className = `${SPRINT_STATS_CLASS}__pie`;
       wrap.dataset.dim = dim;
-      const title = document.createElement('h4');
-      title.className = `${SPRINT_STATS_CLASS}__pie-title`;
-      title.textContent = DIMENSIONS[dim].label;
-      wrap.appendChild(title);
       if (weightMode === 'sp' && issues.some((i) => !i.sp)) {
         const unsized = issues.filter((i) => !i.sp).length;
         const hint = document.createElement('div');
         hint.className = `${SPRINT_STATS_CLASS}__pie-hint`;
         hint.textContent = `${unsized} ticket${unsized > 1 ? 's' : ''} sans SP ignoré${unsized > 1 ? 's' : ''}`;
+        wrap.appendChild(hint);
+      }
+      if (multiCounted) {
+        const hint = document.createElement('div');
+        hint.className = `${SPRINT_STATS_CLASS}__pie-hint`;
+        hint.textContent =
+          'Certains tickets ont plusieurs valeurs et sont comptés dans chaque part — ' +
+          'le total des parts dépasse le nombre de tickets.';
         wrap.appendChild(hint);
       }
       const body = document.createElement('div');
@@ -4090,6 +4149,26 @@
       const header = document.createElement('div');
       header.className = `${SPRINT_STATS_CLASS}__controls`;
 
+      // Dimension dropdown: pick which field to project as a pie.
+      const dimWrap = document.createElement('label');
+      dimWrap.className = `${SPRINT_STATS_CLASS}__dim-select`;
+      const dimLabelEl = document.createElement('span');
+      dimLabelEl.className = `${SPRINT_STATS_CLASS}__dim-select-label`;
+      dimLabelEl.textContent = 'Champ :';
+      dimWrap.appendChild(dimLabelEl);
+      const select = document.createElement('select');
+      select.className = `${SPRINT_STATS_CLASS}__dim-dropdown`;
+      for (const dim of SPRINT_STATS_DIMENSIONS) {
+        const opt = document.createElement('option');
+        opt.value = dim;
+        opt.textContent = dimLabel(dim);
+        if (prefs.dim === dim) opt.selected = true;
+        select.appendChild(opt);
+      }
+      select.addEventListener('change', () => statsPrefs.setDim(select.value));
+      dimWrap.appendChild(select);
+      header.appendChild(dimWrap);
+
       // Weight toggle: segmented button Tickets / SP.
       const weightWrap = document.createElement('div');
       weightWrap.className = `${SPRINT_STATS_CLASS}__weight`;
@@ -4104,24 +4183,6 @@
         weightWrap.appendChild(btn);
       }
       header.appendChild(weightWrap);
-
-      // Dimension checkboxes.
-      const dimsWrap = document.createElement('div');
-      dimsWrap.className = `${SPRINT_STATS_CLASS}__dims`;
-      for (const dim of SPRINT_STATS_DIMENSIONS) {
-        const label = document.createElement('label');
-        label.className = `${SPRINT_STATS_CLASS}__dim`;
-        const cb = document.createElement('input');
-        cb.type = 'checkbox';
-        cb.checked = prefs.dims.includes(dim);
-        cb.addEventListener('change', () => statsPrefs.toggleDim(dim));
-        label.appendChild(cb);
-        const span = document.createElement('span');
-        span.textContent = dimCheckboxLabel(dim);
-        label.appendChild(span);
-        dimsWrap.appendChild(label);
-      }
-      header.appendChild(dimsWrap);
 
       // Counter (N tickets · S SP).
       const totalSp = issues.reduce((s, i) => s + (i.sp || 0), 0);
@@ -4139,19 +4200,10 @@
         panel.appendChild(empty);
         return;
       }
-      if (prefs.dims.length === 0) {
-        const empty = document.createElement('div');
-        empty.className = `${SPRINT_STATS_CLASS}__empty`;
-        empty.textContent = 'Sélectionnez au moins une dimension pour afficher un camembert.';
-        panel.appendChild(empty);
-        return;
-      }
 
       const grid = document.createElement('div');
       grid.className = `${SPRINT_STATS_CLASS}__grid`;
-      for (const dim of prefs.dims) {
-        grid.appendChild(renderPieBlock(dim, issues, prefs.weight));
-      }
+      grid.appendChild(renderPieBlock(prefs.dim, issues, prefs.weight));
       panel.appendChild(grid);
 
       // Hover cross-highlight: hovering a pie slice dims its siblings, and
