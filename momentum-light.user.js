@@ -2190,21 +2190,11 @@
       /* ----------------------------------------------------------------
        * Sprint composition stats (Backlog view)
        * ---------------------------------------------------------------- */
-      .momentum-sprint-stats__slot {
-        /* Prepended as the first child of each sprint container. Full
-         * width, sits above the JIRA sprint header without overlapping
-         * it. We keep the wrapper transparent so when it's empty (panel
-         * closed) the only visible artefact is the small button. */
-        display: block;
-        width: 100%;
-        padding: 6px 12px 0;
-        box-sizing: border-box;
-        background: transparent;
-      }
       .${SPRINT_STATS_BUTTON_CLASS} {
         display: inline-flex;
         align-items: center;
         gap: 6px;
+        margin-right: 8px;
         padding: 4px 10px;
         border: 1px solid rgba(9, 30, 66, 0.14);
         border-radius: 3px;
@@ -2216,6 +2206,7 @@
         line-height: 1.4;
         cursor: pointer;
         transition: background 120ms ease-out, border-color 120ms ease-out;
+        white-space: nowrap;
       }
       .${SPRINT_STATS_BUTTON_CLASS}:hover {
         background: rgba(9, 30, 66, 0.08);
@@ -3497,132 +3488,67 @@
 
   // ---------------------------------------------------------------------------
   // backlogDom — detect sprint containers on the Backlog view and extract
-  // their sprint id / name / state. JIRA rotates testid prefixes across
-  // releases (`software-backlog.card-list.id.sprint-N`,
-  // `sprint-backlog-panel.sprint-N`, `scope.sprint-N`, ...) so we do NOT
-  // rely on a fixed prefix. Strategy:
-  //   1. Scan every element that exposes ANY common data-* attribute
-  //      matching `sprint-<digits>`.
-  //   2. Group candidates by sprint id.
-  //   3. For each group, promote the OUTERMOST element (not contained by
-  //      any sibling candidate in the same group) — that's the sprint
-  //      block, everything else (issue rows, action buttons) is nested
-  //      inside it.
-  //   4. Filter out obvious non-containers by geometry (min 50px tall).
+  // their sprint id / name / state. JIRA's modern Backlog uses precise
+  // testids that we can lock onto:
+  //   container :  data-testid="software-backlog.card-list.container.<id>"
+  //   actions   :  data-testid="…sprint-header.estimations-and-actions-container"
+  //   complete  :  data-testid="…sprint-header.complete-sprint-button"  (active sprint)
+  //   start     :  data-testid="…sprint-header.start-sprint-button"     (future)
+  //   accordion :  id="backlog-accordion-<id>"
+  // The "BACKLOG" pseudo-sprint at the bottom uses the literal id string
+  // "BACKLOG" and is intentionally skipped (no sprint id, no API call).
   // ---------------------------------------------------------------------------
 
   const backlogDom = (() => {
-    const SPRINT_ID_FROM_TESTID = /sprint[-_](\d+)/i;
-    // Attributes we inspect for the sprint id marker. Atlassian uses a
-    // handful of variants across their design-system versions.
-    const SPRINT_ID_ATTRS = [
-      'data-testid',
-      'data-test-id',
-      'data-component-selector',
-      'data-rbd-droppable-id',
-      'id',
-    ];
-
-    function extractSprintIdFromAttrs(el) {
-      for (const attr of SPRINT_ID_ATTRS) {
-        const v = el.getAttribute(attr);
-        if (!v) continue;
-        const m = v.match(SPRINT_ID_FROM_TESTID);
-        if (m) return Number(m[1]);
-      }
-      return null;
-    }
-
-    function collectBySprintId(root) {
-      // One big attr selector rather than N queries — fewer DOM walks.
-      const selector = SPRINT_ID_ATTRS.map((a) => `[${a}*="sprint-"]`).join(',');
-      const hits = root.querySelectorAll(selector);
-      const bySprint = new Map(); // sprintId -> Set<Element>
-      for (const el of hits) {
-        const sid = extractSprintIdFromAttrs(el);
-        if (!Number.isFinite(sid) || sid <= 0) continue;
-        if (!bySprint.has(sid)) bySprint.set(sid, new Set());
-        bySprint.get(sid).add(el);
-      }
-      return bySprint;
-    }
-
-    function pickOutermost(els) {
-      // Of all candidates for a single sprint id, pick the one that is
-      // NOT a descendant of any other candidate AND has the largest
-      // rendered area — that's the full sprint block, not a badge
-      // or a nested action button.
-      const arr = [...els];
-      let best = null;
-      let bestArea = -1;
-      for (const el of arr) {
-        const contained = arr.some((other) => other !== el && other.contains(el));
-        if (contained) continue;
-        const r = el.getBoundingClientRect();
-        const area = r.width * r.height;
-        if (area > bestArea) {
-          best = el;
-          bestArea = area;
-        }
-      }
-      return best;
-    }
+    const CONTAINER_PREFIX = 'software-backlog.card-list.container.';
+    const SPRINT_ID_RE = /^software-backlog\.card-list\.container\.(\d+)$/;
 
     function findSprintContainers(root) {
-      const bySprint = collectBySprintId(root);
       const out = [];
-      for (const [, els] of bySprint) {
-        const el = pickOutermost(els);
-        if (!el) continue;
-        const r = el.getBoundingClientRect();
-        // 50px ≈ a single compact issue row; a sprint block is always
-        // taller (header + at least one row).
-        if (r.height < 50) continue;
+      const candidates = root.querySelectorAll(
+        `[data-testid^="${CONTAINER_PREFIX}"]`,
+      );
+      for (const el of candidates) {
+        const t = el.getAttribute('data-testid') || '';
+        if (!SPRINT_ID_RE.test(t)) continue; // skip "container.BACKLOG"
         out.push(el);
       }
       return out;
     }
 
     function extractSprintInfo(container) {
-      let sprintId = extractSprintIdFromAttrs(container);
-      if (!Number.isFinite(sprintId) || sprintId <= 0) {
-        // The outermost container we picked might itself not carry the
-        // sprint id attr (we promoted an ancestor). Scan a descendant.
-        const selector = SPRINT_ID_ATTRS.map((a) => `[${a}*="sprint-"]`).join(',');
-        const descendant = container.querySelector(selector);
-        if (descendant) sprintId = extractSprintIdFromAttrs(descendant);
-      }
+      const t = container.getAttribute('data-testid') || '';
+      const m = t.match(SPRINT_ID_RE);
+      if (!m) return null;
+      const sprintId = Number(m[1]);
       if (!Number.isFinite(sprintId) || sprintId <= 0) return null;
-      // Grab a display name from the header, falling back to the sprint id.
-      const header =
-        container.querySelector('[data-testid*="sprint-header"]') ||
-        container.querySelector('[data-test-id*="sprint-header"]') ||
-        container.querySelector('header') ||
-        container;
-      const headerText = (header.textContent || '').trim();
+      // The sprint name lives in the `<h2>` inside the header's left side.
+      const h2 = container.querySelector('h2');
       const name =
-        headerText.split('\n').map((s) => s.trim()).find(Boolean)?.slice(0, 80) ||
-        `Sprint ${sprintId}`;
-      // Active sprint has a "Complete sprint" / "Terminer le sprint" action;
-      // future sprints show "Start sprint" / "Démarrer le sprint". Best-effort.
-      const isActive = /terminer\s+le\s+sprint|complete\s+sprint/i.test(headerText);
+        (h2?.textContent || '').trim().slice(0, 80) || `Sprint ${sprintId}`;
+      // Only the ACTIVE sprint exposes a "Complete sprint" button — its
+      // mere presence (regardless of `disabled`) is a reliable signal.
+      const isActive = !!container.querySelector(
+        '[data-testid$="sprint-header.complete-sprint-button"]',
+      );
       return { sprintId, name, isActive };
     }
 
-    // Where to attach the button: we prepend a thin wrapper AT THE TOP of
-    // the sprint container so the button is visible regardless of JIRA's
-    // header DOM (which changes across releases and would be brittle to
-    // target specifically). The panel is inserted right after this
-    // wrapper so header actions stay above the ticket list.
-    const WRAPPER_CLASS = 'momentum-sprint-stats__slot';
+    function findActionsHost(container) {
+      // Native actions row that holds Start/Complete sprint + the "…" menu.
+      // Best UX target — our button reads as a peer of the existing actions.
+      return container.querySelector(
+        '[data-testid$="sprint-header.estimations-and-actions-container"]',
+      );
+    }
 
-    function ensureSlot(container) {
-      let slot = container.querySelector(`:scope > .${WRAPPER_CLASS}`);
-      if (slot) return slot;
-      slot = document.createElement('div');
-      slot.className = WRAPPER_CLASS;
-      container.insertBefore(slot, container.firstChild);
-      return slot;
+    function findAccordion(container) {
+      // The collapsible body holding the ticket list. Used to pick a
+      // panel insertion point: we drop the panel between the header and
+      // the accordion so it sits with the sprint summary, not the rows.
+      return container.querySelector(
+        '[data-testid="software-backlog.card-list.accordion"]',
+      );
     }
 
     let lastProbeAt = 0;
@@ -3632,13 +3558,13 @@
       if (now - lastProbeAt < 3_000) return;
       lastProbeAt = now;
       const hits = [];
-      root.querySelectorAll('[data-testid], [data-test-id]').forEach((el) => {
-        if (hits.length >= 40) return;
-        const t =
-          el.getAttribute('data-testid') ||
-          el.getAttribute('data-test-id') ||
-          '';
-        if (/sprint/i.test(t) && t.length < 200) {
+      root.querySelectorAll('[data-testid]').forEach((el) => {
+        if (hits.length >= 30) return;
+        const t = el.getAttribute('data-testid') || '';
+        if (
+          /software-backlog\.card-list/i.test(t) ||
+          /sprint-header/i.test(t)
+        ) {
           hits.push({ testid: t, tag: el.tagName.toLowerCase() });
         }
       });
@@ -3646,19 +3572,16 @@
         timestamp: new Date().toISOString(),
         sampleSprintTestids: hits,
       };
-      // Surface once at the WARN level (not behind the debug flag) so a
-      // user who installs the userscript immediately sees why the button
-      // didn't appear — without having to know about `localStorage.debug`.
       if (!loggedZeroOnce) {
         loggedZeroOnce = true;
         warn(
           `backlogDom: 0 sprint containers detected on the Backlog view. ` +
-            `Sample sprint-related testids found: ${hits.length}. ` +
+            `Backlog-related testids found: ${hits.length}. ` +
             `Full dump at window.__MOMENTUM_BACKLOG_PROBE__`,
         );
       } else if (isDebug()) {
         warn(
-          `backlogDom probe — sprint-related testids: ${hits.length}. ` +
+          `backlogDom probe — backlog-related testids: ${hits.length}. ` +
             'Dump at window.__MOMENTUM_BACKLOG_PROBE__',
         );
       }
@@ -3671,7 +3594,8 @@
     return {
       findSprintContainers,
       extractSprintInfo,
-      ensureSlot,
+      findActionsHost,
+      findAccordion,
       probe,
       resetZeroLog,
     };
@@ -4261,14 +4185,19 @@
 
     function ensureButton(container, info) {
       if (!container || !info?.sprintId) return;
-      const slot = backlogDom.ensureSlot(container);
-      let btn = slot.querySelector(`:scope > .${SPRINT_STATS_BUTTON_CLASS}`);
-      if (btn) return btn;
-      btn = document.createElement('button');
+      // Idempotent: bail early if our button is already mounted somewhere
+      // inside this container (handles re-renders that don't replace it).
+      const existing = container.querySelector(`.${SPRINT_STATS_BUTTON_CLASS}`);
+      if (existing) return existing;
+
+      const btn = document.createElement('button');
       btn.type = 'button';
       btn.className = SPRINT_STATS_BUTTON_CLASS;
       btn.dataset.sprintId = String(info.sprintId);
-      btn.setAttribute('aria-expanded', statsOpenSprints.has(info.sprintId) ? 'true' : 'false');
+      btn.setAttribute(
+        'aria-expanded',
+        statsOpenSprints.has(info.sprintId) ? 'true' : 'false',
+      );
       btn.innerHTML = '<span aria-hidden="true">📊</span> Statistiques';
       btn.title = 'Afficher / masquer les statistiques de composition du sprint';
       btn.addEventListener('click', (e) => {
@@ -4276,11 +4205,16 @@
         e.preventDefault();
         togglePanel(container, info);
       });
-      // Place the button as the first child of the dedicated slot, which
-      // is itself prepended at the top of the sprint container by
-      // `backlogDom.ensureSlot`. This guarantees visibility regardless of
-      // how JIRA structures the header internally.
-      slot.insertBefore(btn, slot.firstChild);
+      // Preferred host: the native actions row (Start/Complete sprint + …
+      // menu). Inserting at the head makes our button the first action,
+      // visually next to the estimation badges. Fallback: prepend to the
+      // sprint container so the button is always visible.
+      const actions = backlogDom.findActionsHost(container);
+      if (actions) {
+        actions.insertBefore(btn, actions.firstChild);
+      } else {
+        container.insertBefore(btn, container.firstChild);
+      }
       return btn;
     }
 
@@ -4316,8 +4250,7 @@
 
     function ensurePanel(container, info) {
       if (!container || !info?.sprintId) return null;
-      const slot = backlogDom.ensureSlot(container);
-      let panel = slot.querySelector(`:scope > .${SPRINT_STATS_PANEL_CLASS}`);
+      let panel = container.querySelector(`.${SPRINT_STATS_PANEL_CLASS}`);
       if (panel) {
         mountedPanels.set(info.sprintId, { panel, sprintInfo: info });
         return panel;
@@ -4325,9 +4258,16 @@
       panel = document.createElement('div');
       panel.className = SPRINT_STATS_PANEL_CLASS;
       panel.dataset.sprintId = String(info.sprintId);
-      // Append to the dedicated slot (below the button), so both are
-      // in the sprint container's first row — fully visible.
-      slot.appendChild(panel);
+      // Insert RIGHT BEFORE the accordion (issue list) so the panel
+      // visually sits with the sprint header summary, above the rows.
+      // Falls back to appending to the container if no accordion is
+      // present (defensive — should not happen on real JIRA backlogs).
+      const accordion = backlogDom.findAccordion(container);
+      if (accordion?.parentElement === container) {
+        container.insertBefore(panel, accordion);
+      } else {
+        container.appendChild(panel);
+      }
       mountedPanels.set(info.sprintId, { panel, sprintInfo: info });
       return panel;
     }
@@ -4355,7 +4295,7 @@
     function removeAll() {
       document
         .querySelectorAll(
-          `.${SPRINT_STATS_PANEL_CLASS}, .${SPRINT_STATS_BUTTON_CLASS}, .momentum-sprint-stats__slot`,
+          `.${SPRINT_STATS_PANEL_CLASS}, .${SPRINT_STATS_BUTTON_CLASS}`,
         )
         .forEach((el) => el.remove());
       mountedPanels.clear();
