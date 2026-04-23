@@ -2359,8 +2359,15 @@
       .${SPRINT_STATS_CLASS}__pie-svg [data-slice-key].${SPRINT_STATS_CLASS}--dim {
         opacity: 0.25;
       }
-      .${SPRINT_STATS_CLASS}__legend {
+      .${SPRINT_STATS_CLASS}__legend-column {
         flex: 1 1 0;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        min-width: 0;
+      }
+      .${SPRINT_STATS_CLASS}__legend {
+        flex: 0 1 auto;
         margin: 0;
         padding: 0;
         list-style: none;
@@ -4133,9 +4140,33 @@
       const body = document.createElement('div');
       body.className = `${SPRINT_STATS_CLASS}__pie-body`;
       body.appendChild(renderPie(slices, total));
-      body.appendChild(renderLegend(slices, total, weightSuffix));
+      // Right column: weight toggle on top of the legend so the user
+      // can pivot the pie (tickets ↔ SP) without hunting for the
+      // control in the top bar. Both controls live in the same visual
+      // group — reads as "this legend is weighted by <mode>".
+      const rightCol = document.createElement('div');
+      rightCol.className = `${SPRINT_STATS_CLASS}__legend-column`;
+      rightCol.appendChild(buildWeightToggle(weightMode));
+      rightCol.appendChild(renderLegend(slices, total, weightSuffix));
+      body.appendChild(rightCol);
       wrap.appendChild(body);
       return wrap;
+    }
+
+    function buildWeightToggle(activeMode) {
+      const weightWrap = document.createElement('div');
+      weightWrap.className = `${SPRINT_STATS_CLASS}__weight`;
+      for (const [mode, label] of [['count', 'Tickets'], ['sp', 'SP']]) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = `${SPRINT_STATS_CLASS}__weight-btn`;
+        btn.textContent = label;
+        btn.dataset.weight = mode;
+        if (activeMode === mode) btn.dataset.active = '1';
+        btn.addEventListener('click', () => statsPrefs.setWeight(mode));
+        weightWrap.appendChild(btn);
+      }
+      return weightWrap;
     }
 
     // Build the full panel content. Re-called whenever prefs change or the
@@ -4168,21 +4199,6 @@
       select.addEventListener('change', () => statsPrefs.setDim(select.value));
       dimWrap.appendChild(select);
       header.appendChild(dimWrap);
-
-      // Weight toggle: segmented button Tickets / SP.
-      const weightWrap = document.createElement('div');
-      weightWrap.className = `${SPRINT_STATS_CLASS}__weight`;
-      for (const [mode, label] of [['count', 'Tickets'], ['sp', 'SP']]) {
-        const btn = document.createElement('button');
-        btn.type = 'button';
-        btn.className = `${SPRINT_STATS_CLASS}__weight-btn`;
-        btn.textContent = label;
-        btn.dataset.weight = mode;
-        if (prefs.weight === mode) btn.dataset.active = '1';
-        btn.addEventListener('click', () => statsPrefs.setWeight(mode));
-        weightWrap.appendChild(btn);
-      }
-      header.appendChild(weightWrap);
 
       // Counter (N tickets · S SP).
       const totalSp = issues.reduce((s, i) => s + (i.sp || 0), 0);
