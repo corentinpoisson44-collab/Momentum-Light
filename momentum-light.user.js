@@ -3977,32 +3977,76 @@
       );
     }
 
-    // Stable color for a slice: hash the key into a hue so the same
-    // assignee / type / epic keeps the same tint across pies and sprints.
-    // Fixed-key statuses use explicit colors to stay readable.
+    // Stable color for a slice: hash the key into a starting palette
+    // index (so the same assignee / type / epic keeps the same tint
+    // across pies when there's no collision), with linear probing to
+    // guarantee uniqueness within a single pie. Reserved keys keep
+    // their semantic colors: status categories get their canonical
+    // red/blue/green, and "no value" buckets (__unassigned__, …) get
+    // a shared neutral grey — duplicates of grey are fine because
+    // there's only one such bucket per dimension.
     const STATUS_COLORS = {
       done: '#36B37E', // green
       indeterminate: '#0065FF', // blue
       new: '#97A0AF', // grey
     };
     const FALLBACK_COLOR = '#C1C7D0';
-    function colorFor(dim, key) {
-      if (dim === 'status' && STATUS_COLORS[key]) return STATUS_COLORS[key];
-      if (
-        key === '__unassigned__' ||
-        key === '__no_epic__' ||
-        key === '__unsized__' ||
-        key === '__no_component__'
-      ) {
-        return FALLBACK_COLOR;
-      }
+    // Curated categorical palette. 18 colors, hand-picked from the
+    // Atlassian Design System bold variants plus a few accents, ordered
+    // so adjacent indices contrast strongly (avoids look-alike slices
+    // when slices happen to land on consecutive palette entries).
+    const PALETTE = [
+      '#0052CC', // blue
+      '#FF8B00', // orange
+      '#00875A', // green
+      '#6554C0', // purple
+      '#DE350B', // red
+      '#00A3BF', // teal
+      '#FFAB00', // yellow
+      '#CD519D', // magenta
+      '#403294', // indigo
+      '#008DA6', // dark teal
+      '#FF5630', // coral
+      '#0747A6', // dark blue
+      '#36B37E', // light green
+      '#8777D9', // lavender
+      '#BF2600', // dark red
+      '#FFC400', // gold
+      '#5243AA', // deep purple
+      '#008F7A', // deep teal
+    ];
+    const RESERVED_KEYS = new Set([
+      '__unassigned__',
+      '__no_epic__',
+      '__unsized__',
+      '__no_component__',
+    ]);
+
+    function hashStartIndex(key) {
       let h = 0;
       const str = String(key);
       for (let i = 0; i < str.length; i += 1) {
         h = (h * 31 + str.charCodeAt(i)) | 0;
       }
-      const hue = ((h % 360) + 360) % 360;
-      return `hsl(${hue}, 60%, 55%)`;
+      return ((h % PALETTE.length) + PALETTE.length) % PALETTE.length;
+    }
+
+    function pickColor(dim, key, used) {
+      if (dim === 'status' && STATUS_COLORS[key]) return STATUS_COLORS[key];
+      if (RESERVED_KEYS.has(key)) return FALLBACK_COLOR;
+      // Linear probe from a hash-based starting index. First unused
+      // palette entry wins. Keeps a key's color stable as long as no
+      // earlier slice in the same pie grabbed it first.
+      const start = hashStartIndex(key);
+      for (let k = 0; k < PALETTE.length; k += 1) {
+        const c = PALETTE[(start + k) % PALETTE.length];
+        if (!used.has(c)) return c;
+      }
+      // Palette exhausted (19+ distinct slices) — fall back to
+      // golden-angle HSL so additional slices are still visually
+      // distinct from each other.
+      const hue = (used.size * 137.508) % 360;
+      return `hsl(${hue}, 55%, 50%)`;
     }
 
     // Accumulate buckets for a single dimension. `weightOf(issue)` returns
@@ -4027,7 +4071,7 @@
               key: k,
               label: def.labelOf(k, issue),
               value: 0,
-              color: colorFor(dim, k),
+              color: null, // assigned below, after sort, to guarantee uniqueness
               samples: 0,
             });
           }
@@ -4037,6 +4081,18 @@
         }
       }
       const slices = [...buckets.values()].sort((a, b) => b.value - a.value);
+      // Assign colors AFTER sort so the largest slices get their
+      // preferred palette entries first. `pickColor` tracks used
+      // colors to guarantee no two slices share a tint within the
+      // same pie (reserved neutrals excepted — only one per dim).
+      const used = new Set();
+      for (const slice of slices) {
+        slice.color = pickColor(dim, slice.key, used);
+        // Track every assigned color, including reserved ones, so a
+        // later slice that hashes onto the same palette entry probes
+        // forward instead of duplicating.
+        used.add(slice.color);
+      }
       return { slices, multiCounted };
     }
 
