@@ -2342,6 +2342,9 @@
         font-size: 11px;
         font-style: italic;
       }
+      .${SPRINT_STATS_CLASS}__pie-hint--footer {
+        margin: 8px 0 0;
+      }
       .${SPRINT_STATS_CLASS}__pie-body {
         display: flex;
         gap: 12px;
@@ -4125,13 +4128,6 @@
       const wrap = document.createElement('div');
       wrap.className = `${SPRINT_STATS_CLASS}__pie`;
       wrap.dataset.dim = dim;
-      if (weightMode === 'sp' && issues.some((i) => !i.sp)) {
-        const unsized = issues.filter((i) => !i.sp).length;
-        const hint = document.createElement('div');
-        hint.className = `${SPRINT_STATS_CLASS}__pie-hint`;
-        hint.textContent = `${unsized} ticket${unsized > 1 ? 's' : ''} sans SP ignoré${unsized > 1 ? 's' : ''}`;
-        wrap.appendChild(hint);
-      }
       if (multiCounted) {
         const hint = document.createElement('div');
         hint.className = `${SPRINT_STATS_CLASS}__pie-hint`;
@@ -4153,6 +4149,15 @@
       rightCol.appendChild(renderLegend(slices, total, weightSuffix));
       body.appendChild(rightCol);
       wrap.appendChild(body);
+      // Unsized-ticket footnote goes BELOW the pie — it's a side note on
+      // why the SP totals don't match the ticket count, not a title.
+      if (weightMode === 'sp' && issues.some((i) => !i.sp)) {
+        const unsized = issues.filter((i) => !i.sp).length;
+        const hint = document.createElement('div');
+        hint.className = `${SPRINT_STATS_CLASS}__pie-hint ${SPRINT_STATS_CLASS}__pie-hint--footer`;
+        hint.textContent = `${unsized} ticket${unsized > 1 ? 's' : ''} sans SP ignoré${unsized > 1 ? 's' : ''}`;
+        wrap.appendChild(hint);
+      }
       return wrap;
     }
 
