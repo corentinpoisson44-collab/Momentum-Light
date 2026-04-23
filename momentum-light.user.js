@@ -2393,7 +2393,10 @@
         border-radius: 2px;
       }
       .${SPRINT_STATS_CLASS}__legend-label {
-        flex: 1 1 0;
+        /* Natural size so the value sits right after the label.
+         * Shrinks (with ellipsis) if the label would overflow the row. */
+        flex: 0 1 auto;
+        min-width: 0;
         overflow: hidden;
         white-space: nowrap;
         text-overflow: ellipsis;
