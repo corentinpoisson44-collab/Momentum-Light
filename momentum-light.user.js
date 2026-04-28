@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.11.1
+// @version      0.11.2
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne, macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, menu « How-to » guidé qui surligne chaque feature au premier lancement, toggle « Vue PM / Vue Business » qui remplace les overlays de chiffrage par la date d'atterrissage (duedate) de chaque Epic, recoloration ternaire 🟢🟡🔴 (On Track / At Risk / Off Track / Livré) de chaque barre d'Epic en Vue Business calculée à partir de la duedate, de la projection vélocité et de la confidence, surcharge du menu Export → Image (.png) qui capture la Timeline au format natif (via html2canvas) avec tous les overlays Momentum-Light visibles dessus, et variante d'export business-friendly (en Vue Business) qui ajoute une bande titre + légende des couleurs de statut au-dessus de la Timeline capturée.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -3372,7 +3372,30 @@
       }
     }
 
-    return { findBars, decorateBar, probeCandidates, extractIssueKey };
+    // Walk every visible list-side key cell to enumerate the rows in their
+    // current rank order (top-to-bottom). Captures EVERY row, including
+    // those whose chart side has no bar (Epics without a start date / due
+    // date), so callers can place them explicitly instead of silently
+    // dropping them. Returns [{ key, topPx }], dedup'd on key.
+    function findRowKeys(root) {
+      const cells = (root || document.body).querySelectorAll(KEY_CELL_SELECTOR);
+      const rows = [];
+      const seen = new Set();
+      for (const cell of cells) {
+        const text = (cell.textContent || '').trim();
+        const m = text.match(ISSUE_KEY_REGEX);
+        if (!m) continue;
+        const key = m[1];
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const rect = cell.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        rows.push({ key, topPx: rect.top });
+      }
+      return rows;
+    }
+
+    return { findBars, decorateBar, probeCandidates, extractIssueKey, findRowKeys };
   })();
 
   // ---------------------------------------------------------------------------
@@ -4172,34 +4195,41 @@
       return readSnapshot() !== null;
     }
 
-    // Walk every visible bar, dedup by issue key, keep only the Epics, and
-    // record both axes:
-    //   - `leftPx`  = bar's chart-side x → proxy for the start date the
-    //                 user reads on the axis
-    //   - `topPx`   = bar's y → the row's current rank position (rows are
-    //                 stacked top-to-bottom in rank order)
+    // Enumerate rows from the LIST side (every Epic has a key cell, even
+    // when the chart side has no bar because the Epic is unscheduled), then
+    // map chart-side bars onto those rows by issue key. Records:
+    //   - `topPx`  = row's current y → preserves rank order top-to-bottom
+    //   - `leftPx` = bar's chart-side x → proxy for the start date the user
+    //                reads on the axis. `null` when the Epic has no bar
+    //                (no start date / no schedule), which the caller uses
+    //                to push the Epic to the bottom of the sorted list.
     // We piggy-back on `issueMeta` to filter to Epics so the rank batch
     // doesn't try to reorder Stories/Sub-tasks the user happens to have
     // expanded under an Epic — they'd land on the same rank field but
     // would be re-shuffled by Plans on the next render.
     async function collectEpics() {
+      const rows = timelineDom.findRowKeys(document.body);
       const bars = timelineDom.findBars(document.body);
-      const seen = new Set();
-      const candidates = [];
+      const barLeftByKey = new Map();
       for (const bar of bars) {
         const key = timelineDom.extractIssueKey(bar);
-        if (!key || seen.has(key)) continue;
-        seen.add(key);
+        if (!key || barLeftByKey.has(key)) continue;
         const rect = bar.getBoundingClientRect();
         if (rect.width === 0 || rect.height === 0) continue;
-        candidates.push({ key, leftPx: rect.left, topPx: rect.top });
+        barLeftByKey.set(key, rect.left);
       }
       const metas = await Promise.all(
-        candidates.map((c) => issueMeta.get(c.key).catch(() => null)),
+        rows.map((r) => issueMeta.get(r.key).catch(() => null)),
       );
       const epics = [];
-      for (let i = 0; i < candidates.length; i += 1) {
-        if (metas[i]?.isEpic) epics.push(candidates[i]);
+      for (let i = 0; i < rows.length; i += 1) {
+        if (!metas[i]?.isEpic) continue;
+        const r = rows[i];
+        epics.push({
+          key: r.key,
+          topPx: r.topPx,
+          leftPx: barLeftByKey.has(r.key) ? barLeftByKey.get(r.key) : null,
+        });
       }
       return epics;
     }
@@ -4228,6 +4258,13 @@
       }
       const originalOrder = [...epics].sort((a, b) => a.topPx - b.topPx).map((e) => e.key);
       const targetOrder = [...epics].sort((a, b) => {
+        const aHas = a.leftPx != null;
+        const bHas = b.leftPx != null;
+        // Epics without a chart bar (unscheduled — no start date) sink to
+        // the bottom. Among them we preserve the current top-to-bottom
+        // order so reverting and re-sorting gives a stable result.
+        if (aHas !== bHas) return aHas ? -1 : 1;
+        if (!aHas) return a.topPx - b.topPx;
         if (a.leftPx !== b.leftPx) return a.leftPx - b.leftPx;
         // Stable tie-breaker on key so two Epics that share a start
         // pixel don't oscillate between calls.
@@ -6475,7 +6512,7 @@
     // Initial pass (in case the timeline is already rendered at document-idle).
     runActiveFeatures();
     log(
-      'loaded — version 0.11.1',
+      'loaded — version 0.11.2',
       isDebug()
         ? '(debug on)'
         : '(debug off — enable with: localStorage.setItem(\'momentum-light-debug\', \'1\'))',
