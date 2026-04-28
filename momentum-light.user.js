@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.10.0
+// @version      0.11.0
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne, macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, menu « How-to » guidé qui surligne chaque feature au premier lancement, toggle « Vue PM / Vue Business » qui remplace les overlays de chiffrage par la date d'atterrissage (duedate) de chaque Epic, recoloration ternaire 🟢🟡🔴 (On Track / At Risk / Off Track / Livré) de chaque barre d'Epic en Vue Business calculée à partir de la duedate, de la projection vélocité et de la confidence, surcharge du menu Export → Image (.png) qui capture la Timeline au format natif (via html2canvas) avec tous les overlays Momentum-Light visibles dessus, et variante d'export business-friendly (en Vue Business) qui ajoute une bande titre + légende des couleurs de statut au-dessus de la Timeline capturée.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -48,6 +48,13 @@
   const VIEW_MODE_PM = 'pm';
   const VIEW_MODE_BUSINESS = 'business';
   const VIEW_TOGGLE_CLASS = 'momentum-view-toggle';
+  // Timeline sort — one-click reorder of the visible Epics by their visual
+  // start date (the bar's left edge on the chart axis). The previous order
+  // is snapshotted to localStorage so the same button can revert the
+  // operation; the snapshot survives navigation and reload until the user
+  // clicks revert (or sorts again, which overwrites it).
+  const TIMELINE_SORT_BUTTON_CLASS = 'momentum-timeline-sort';
+  const TIMELINE_SORT_SNAPSHOT_KEY = 'momentum-light::timeline-sort-snapshot';
   // Sprint stats (Backlog view) — user-tunable prefs + per-sprint "open"
   // state so the panel stays expanded across re-renders / reloads.
   const SPRINT_STATS_PREFS_KEY = 'momentum-light::stats-prefs';
@@ -170,6 +177,44 @@
     const t = perfNow() - lastPerfMarkAt;
     if (t > PERF_WINDOW_MS) return; // stale mark → skip silently
     console.log(LOG_PREFIX, `[t=${Math.round(t)}] ${reason}`);
+  }
+
+  // ---------------------------------------------------------------------------
+  // showToast — fixed top-of-viewport status banner used by long-running
+  // user-triggered actions (export, timeline sort) to surface progress and
+  // outcome. Returns { update, hide } so callers can repaint the same node
+  // instead of stacking toasts. The id is shared with `exportPng`'s
+  // capture-chrome filter so a transient toast never leaks into a PNG export.
+  // ---------------------------------------------------------------------------
+  function showToast(text) {
+    const toast = document.createElement('div');
+    toast.id = 'momentum-export-toast';
+    toast.textContent = text;
+    Object.assign(toast.style, {
+      position: 'fixed',
+      top: '20px',
+      left: '50%',
+      transform: 'translateX(-50%)',
+      padding: '10px 18px',
+      background: 'rgba(9, 30, 66, 0.88)',
+      color: '#FFFFFF',
+      borderRadius: '6px',
+      fontSize: '13px',
+      fontWeight: '500',
+      fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+      zIndex: '99999',
+      boxShadow: '0 4px 12px rgba(0,0,0,0.18)',
+      pointerEvents: 'none',
+      transition: 'opacity 200ms ease-out',
+    });
+    document.body.appendChild(toast);
+    return {
+      update(t) { toast.textContent = t; },
+      hide() {
+        toast.style.opacity = '0';
+        setTimeout(() => toast.remove(), 250);
+      },
+    };
   }
 
   // ---------------------------------------------------------------------------
@@ -350,6 +395,45 @@
         body: { jql, fields, maxResults },
       });
       return data;
+    },
+
+    // Rank a single issue immediately after another via the Agile rank API.
+    // Body shape: { issues: [..], rankAfterIssue: KEY }. The endpoint replies
+    // 204 No Content on success or 207 Multi-Status when some entries fail —
+    // we accept both, surface the per-entry error if 207 contains failures,
+    // and don't go through `request()` because that wrapper unconditionally
+    // expects a JSON body.
+    async rankAfter(issueKey, afterIssueKey) {
+      const res = await fetch('/rest/agile/1.0/issue/rank', {
+        method: 'PUT',
+        credentials: 'same-origin',
+        headers: {
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+          'X-Atlassian-Token': 'no-check',
+        },
+        body: JSON.stringify({
+          issues: [issueKey],
+          rankAfterIssue: afterIssueKey,
+        }),
+      });
+      if (!res.ok && res.status !== 207) {
+        throw new Error(
+          `JIRA rank ${issueKey} after ${afterIssueKey} → HTTP ${res.status}`,
+        );
+      }
+      if (res.status === 207) {
+        let body = null;
+        try { body = await res.json(); } catch (_) { /* ignored */ }
+        const entries = body?.entries || [];
+        const failure = entries.find((e) => e?.status >= 400);
+        if (failure) {
+          throw new Error(
+            `JIRA rank multi-status: ${failure.issueId || issueKey} → HTTP ${failure.status} ` +
+              (failure.errors?.join(', ') || ''),
+          );
+        }
+      }
     },
   };
 
@@ -1978,6 +2062,52 @@
         background: #FFFFFF;
         color: #0052CC;
         box-shadow: 0 1px 2px rgba(9, 30, 66, 0.12);
+      }
+      /* ---------------------------------------------------------------------
+       * Timeline sort button — single-state action chip in the velocity
+       * banner that reorders visible Epics by their visual start date
+       * (the bar's left-edge pixel position). Once the user has applied a
+       * sort, the same button enters [data-mode="revert"] (blue tint) and
+       * the next click restores the snapshotted pre-sort order. While the
+       * rank API is in flight we paint the chip with cursor: progress so
+       * multiple clicks don't fire overlapping batches.
+       * ------------------------------------------------------------------ */
+      .${TIMELINE_SORT_BUTTON_CLASS} {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        padding: 4px 10px;
+        border: none;
+        border-radius: 14px;
+        background: #DFE1E6;
+        color: #42526E;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        font-size: 11px;
+        font-weight: 600;
+        line-height: 1.2;
+        cursor: pointer;
+        pointer-events: auto;
+        user-select: none;
+        white-space: nowrap;
+        box-shadow: 0 1px 2px rgba(9, 30, 66, 0.12);
+      }
+      .${TIMELINE_SORT_BUTTON_CLASS}:hover {
+        background: #C1C7D0;
+      }
+      .${TIMELINE_SORT_BUTTON_CLASS}:focus-visible {
+        outline: 2px solid #4C9AFF;
+        outline-offset: 2px;
+      }
+      .${TIMELINE_SORT_BUTTON_CLASS}[data-mode="revert"] {
+        background: #DEEBFF;
+        color: #0052CC;
+      }
+      .${TIMELINE_SORT_BUTTON_CLASS}[data-mode="revert"]:hover {
+        background: #B3D4FF;
+      }
+      .${TIMELINE_SORT_BUTTON_CLASS}[data-busy="1"] {
+        opacity: 0.6;
+        cursor: progress;
       }
       /* ---------------------------------------------------------------------
        * Landing-date variant (Business view) — the Epic bar keeps every
@@ -3814,6 +3944,92 @@
       return wrapper;
     }
 
+    function buildSortByStartDateButton() {
+      // One button, two states. Idle: "Trier par date de début" — clicking
+      // ranks the visible Epics by their bar's left-edge pixel and stores
+      // the previous order as a localStorage snapshot. Snapshotted: same
+      // button reads "Restaurer l'ordre" (blue tint) and clicking
+      // re-applies the saved order via the same rank API.
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = TIMELINE_SORT_BUTTON_CLASS;
+
+      const SORT_LABEL = '↕ Classer par date de début';
+      const REVERT_LABEL = '↩ Restaurer l\'ordre des Epics';
+      const SORT_TITLE =
+        'Réordonne les Epics visibles dans l\'ordre de leur date de début ' +
+        '(position de la barre sur l\'axe). Met à jour le champ de classement ' +
+        'JIRA — comme un drag & drop manuel.\n' +
+        'L\'ordre actuel est sauvegardé : un second clic restaurera l\'agencement précédent.';
+      const REVERT_TITLE =
+        'Restaure l\'ordre des Epics tel qu\'il était juste avant le ' +
+        'classement par date de début.';
+
+      function sync() {
+        if (btn.dataset.busy === '1') return; // don't clobber in-flight label
+        const snap = timelineSort.hasSnapshot();
+        btn.dataset.mode = snap ? 'revert' : 'sort';
+        btn.textContent = snap ? REVERT_LABEL : SORT_LABEL;
+        btn.title = snap ? REVERT_TITLE : SORT_TITLE;
+      }
+
+      async function run() {
+        if (btn.dataset.busy === '1') return;
+        const isRevert = timelineSort.hasSnapshot();
+        btn.dataset.busy = '1';
+        btn.textContent = isRevert
+          ? '↩ Restauration en cours…'
+          : '↕ Classement en cours…';
+        const toast = showToast(
+          isRevert
+            ? 'Momentum-Light — restauration de l\'ordre des Epics…'
+            : 'Momentum-Light — classement des Epics par date de début…',
+        );
+        const onProgress = (done, total) => {
+          toast.update(
+            isRevert
+              ? `Momentum-Light — restauration ${done}/${total}…`
+              : `Momentum-Light — classement ${done}/${total}…`,
+          );
+        };
+        try {
+          const result = isRevert
+            ? await timelineSort.revert(onProgress)
+            : await timelineSort.sortByStartDate(onProgress);
+          if (result?.skipped) {
+            toast.update('Momentum-Light — déjà classé par date de début ✓');
+          } else if (isRevert) {
+            toast.update(
+              `Momentum-Light — ordre restauré (${result.count} Epics) ↩`,
+            );
+          } else {
+            toast.update(
+              `Momentum-Light — ${result.count} Epics classés par date de début ✓`,
+            );
+          }
+          setTimeout(() => toast.hide(), 1800);
+        } catch (e) {
+          warn('timeline sort failed:', e?.message || e);
+          toast.update(
+            `Momentum-Light — échec : ${e?.message || 'voir console'}`,
+          );
+          setTimeout(() => toast.hide(), 3200);
+        } finally {
+          delete btn.dataset.busy;
+          sync();
+        }
+      }
+
+      btn.addEventListener('click', run);
+      sync();
+      // Re-sync on every velocity update tick — cheap, and lets the chip
+      // pick up an external snapshot change (e.g. user manually cleared
+      // localStorage from DevTools, or sorted from a sibling tab).
+      return { el: btn, sync };
+    }
+
+    let sortBtnRef = null;
+
     function build(mode) {
       const wrapper = document.createElement('div');
       wrapper.id = VELOCITY_BANNER_ID;
@@ -3825,6 +4041,8 @@
       // banner stays stable across toggles (no remount flicker).
       wrapper.appendChild(buildStatusLegend());
       wrapper.appendChild(buildViewToggle());
+      sortBtnRef = buildSortByStartDateButton();
+      wrapper.appendChild(sortBtnRef.el);
       const chip = document.createElement('span');
       chip.className = 'momentum-velocity-banner__chip';
       chip.title = 'Cliquez pour rafraîchir';
@@ -3872,6 +4090,10 @@
     async function update() {
       const el = ensure();
       if (!el || updating) return;
+      // Re-sync the sort button on every tick so a snapshot change made
+      // from another tab (or manually wiped from DevTools) flips the chip
+      // back to its idle state without forcing a banner remount.
+      try { sortBtnRef?.sync(); } catch (_) { /* */ }
       updating = true;
       try {
         const { average, sprints } = await velocity.get();
@@ -3904,6 +4126,135 @@
     }
 
     return { ensure, remove, update };
+  })();
+
+  // ---------------------------------------------------------------------------
+  // timelineSort — one-shot reorder of the visible Epics by their visual
+  // start date. Drag-to-rank in JIRA Plans writes the global "rank" field;
+  // we do the same via PUT /rest/agile/1.0/issue/rank, chaining
+  // `rankAfterIssue` calls so each Epic ends up immediately after the
+  // previous one in the target order. The previous order is snapshotted to
+  // localStorage so a second click on the same button reverts the change.
+  //
+  // "Start date" here is the bar's left-edge pixel on the chart — that's
+  // the date the user actually sees in the timeline, regardless of whether
+  // their instance stores it under a custom field. No API round-trip
+  // needed to compute the sort key.
+  // ---------------------------------------------------------------------------
+
+  const timelineSort = (() => {
+    function readSnapshot() {
+      try {
+        const raw = localStorage.getItem(TIMELINE_SORT_SNAPSHOT_KEY);
+        if (!raw) return null;
+        const parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed?.keys) || parsed.keys.length < 2) return null;
+        return parsed;
+      } catch (_) {
+        return null;
+      }
+    }
+
+    function writeSnapshot(keys) {
+      try {
+        localStorage.setItem(
+          TIMELINE_SORT_SNAPSHOT_KEY,
+          JSON.stringify({ keys, at: Date.now() }),
+        );
+      } catch (_) { /* private mode — best effort */ }
+    }
+
+    function clearSnapshot() {
+      try { localStorage.removeItem(TIMELINE_SORT_SNAPSHOT_KEY); } catch (_) { /* */ }
+    }
+
+    function hasSnapshot() {
+      return readSnapshot() !== null;
+    }
+
+    // Walk every visible bar, dedup by issue key, keep only the Epics, and
+    // record both axes:
+    //   - `leftPx`  = bar's chart-side x → proxy for the start date the
+    //                 user reads on the axis
+    //   - `topPx`   = bar's y → the row's current rank position (rows are
+    //                 stacked top-to-bottom in rank order)
+    // We piggy-back on `issueMeta` to filter to Epics so the rank batch
+    // doesn't try to reorder Stories/Sub-tasks the user happens to have
+    // expanded under an Epic — they'd land on the same rank field but
+    // would be re-shuffled by Plans on the next render.
+    async function collectEpics() {
+      const bars = timelineDom.findBars(document.body);
+      const seen = new Set();
+      const candidates = [];
+      for (const bar of bars) {
+        const key = timelineDom.extractIssueKey(bar);
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+        const rect = bar.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        candidates.push({ key, leftPx: rect.left, topPx: rect.top });
+      }
+      const metas = await Promise.all(
+        candidates.map((c) => issueMeta.get(c.key).catch(() => null)),
+      );
+      const epics = [];
+      for (let i = 0; i < candidates.length; i += 1) {
+        if (metas[i]?.isEpic) epics.push(candidates[i]);
+      }
+      return epics;
+    }
+
+    // Apply a target order by chaining `rankAfterIssue`: at step i the
+    // prefix [0..i-1] is already correct, so positioning issues[i]
+    // immediately after issues[i-1] grows the sorted prefix by one.
+    // Sequential to avoid racing concurrent rank writes against each
+    // other inside JIRA's Lexorank engine.
+    async function applyOrder(orderedKeys, onProgress) {
+      for (let i = 1; i < orderedKeys.length; i += 1) {
+        await jiraApi.rankAfter(orderedKeys[i], orderedKeys[i - 1]);
+        if (onProgress) onProgress(i, orderedKeys.length - 1);
+      }
+    }
+
+    async function sortByStartDate(onProgress) {
+      const epics = await collectEpics();
+      if (epics.length < 2) {
+        const reason = epics.length === 0
+          ? 'Aucune Epic détectée sur la timeline visible'
+          : 'Une seule Epic visible — rien à réordonner';
+        const err = new Error(reason);
+        err.code = 'NOT_ENOUGH_EPICS';
+        throw err;
+      }
+      const originalOrder = [...epics].sort((a, b) => a.topPx - b.topPx).map((e) => e.key);
+      const targetOrder = [...epics].sort((a, b) => {
+        if (a.leftPx !== b.leftPx) return a.leftPx - b.leftPx;
+        // Stable tie-breaker on key so two Epics that share a start
+        // pixel don't oscillate between calls.
+        return a.key.localeCompare(b.key);
+      }).map((e) => e.key);
+      const alreadySorted = originalOrder.every((k, i) => k === targetOrder[i]);
+      if (alreadySorted) {
+        return { skipped: true, count: epics.length };
+      }
+      writeSnapshot(originalOrder);
+      await applyOrder(targetOrder, onProgress);
+      return { count: epics.length };
+    }
+
+    async function revert(onProgress) {
+      const snap = readSnapshot();
+      if (!snap) {
+        const err = new Error('Aucun ordre précédent à restaurer');
+        err.code = 'NO_SNAPSHOT';
+        throw err;
+      }
+      await applyOrder(snap.keys, onProgress);
+      clearSnapshot();
+      return { count: snap.keys.length };
+    }
+
+    return { sortByStartDate, revert, hasSnapshot };
   })();
 
   // ---------------------------------------------------------------------------
@@ -5047,41 +5398,9 @@
     }
 
     // ------------------------------------------------------------------
-    // Loading toast — html2canvas takes a couple of seconds on large
-    // plans, so we surface progress so the user doesn't wonder whether
-    // their click registered.
+    // Loading toast — `showToast` is now a module-scope helper (see top of
+    // file) so the timeline-sort feature can reuse the same look & feel.
     // ------------------------------------------------------------------
-
-    function showToast(text) {
-      const toast = document.createElement('div');
-      toast.id = 'momentum-export-toast';
-      toast.textContent = text;
-      Object.assign(toast.style, {
-        position: 'fixed',
-        top: '20px',
-        left: '50%',
-        transform: 'translateX(-50%)',
-        padding: '10px 18px',
-        background: 'rgba(9, 30, 66, 0.88)',
-        color: '#FFFFFF',
-        borderRadius: '6px',
-        fontSize: '13px',
-        fontWeight: '500',
-        fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
-        zIndex: '99999',
-        boxShadow: '0 4px 12px rgba(0,0,0,0.18)',
-        pointerEvents: 'none',
-        transition: 'opacity 200ms ease-out',
-      });
-      document.body.appendChild(toast);
-      return {
-        update(t) { toast.textContent = t; },
-        hide() {
-          toast.style.opacity = '0';
-          setTimeout(() => toast.remove(), 250);
-        },
-      };
-    }
 
     function downloadCanvas(canvas, filename) {
       canvas.toBlob((blob) => {
@@ -6156,7 +6475,7 @@
     // Initial pass (in case the timeline is already rendered at document-idle).
     runActiveFeatures();
     log(
-      'loaded — version 0.10.0',
+      'loaded — version 0.11.0',
       isDebug()
         ? '(debug on)'
         : '(debug off — enable with: localStorage.setItem(\'momentum-light-debug\', \'1\'))',
