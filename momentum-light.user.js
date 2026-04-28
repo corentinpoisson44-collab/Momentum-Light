@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.11.2
+// @version      0.11.3
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne, macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, menu « How-to » guidé qui surligne chaque feature au premier lancement, toggle « Vue PM / Vue Business » qui remplace les overlays de chiffrage par la date d'atterrissage (duedate) de chaque Epic, recoloration ternaire 🟢🟡🔴 (On Track / At Risk / Off Track / Livré) de chaque barre d'Epic en Vue Business calculée à partir de la duedate, de la projection vélocité et de la confidence, surcharge du menu Export → Image (.png) qui capture la Timeline au format natif (via html2canvas) avec tous les overlays Momentum-Light visibles dessus, et variante d'export business-friendly (en Vue Business) qui ajoute une bande titre + légende des couleurs de statut au-dessus de la Timeline capturée.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -189,7 +189,6 @@
   function showToast(text) {
     const toast = document.createElement('div');
     toast.id = 'momentum-export-toast';
-    toast.textContent = text;
     Object.assign(toast.style, {
       position: 'fixed',
       top: '20px',
@@ -204,12 +203,50 @@
       fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
       zIndex: '99999',
       boxShadow: '0 4px 12px rgba(0,0,0,0.18)',
+      display: 'inline-flex',
+      alignItems: 'center',
+      gap: '12px',
       pointerEvents: 'none',
       transition: 'opacity 200ms ease-out',
     });
+    // Text and action live in two distinct children so `update()` can repaint
+    // the message without nuking an action button attached via `setAction()`.
+    const textEl = document.createElement('span');
+    textEl.textContent = text;
+    toast.appendChild(textEl);
+    let actionEl = null;
     document.body.appendChild(toast);
     return {
-      update(t) { toast.textContent = t; },
+      update(t) { textEl.textContent = t; },
+      // Attach an inline action button (e.g. "Recharger"). Calling this
+      // flips the toast to `pointerEvents: auto` so the click reaches us
+      // through what is otherwise a transparent click-through banner.
+      setAction(label, onClick) {
+        if (actionEl) actionEl.remove();
+        actionEl = document.createElement('button');
+        actionEl.type = 'button';
+        actionEl.textContent = label;
+        Object.assign(actionEl.style, {
+          padding: '4px 10px',
+          background: 'rgba(255, 255, 255, 0.12)',
+          color: '#FFFFFF',
+          border: '1px solid rgba(255, 255, 255, 0.45)',
+          borderRadius: '4px',
+          fontFamily: 'inherit',
+          fontSize: '12px',
+          fontWeight: '600',
+          cursor: 'pointer',
+        });
+        actionEl.addEventListener('mouseenter', () => {
+          actionEl.style.background = 'rgba(255, 255, 255, 0.22)';
+        });
+        actionEl.addEventListener('mouseleave', () => {
+          actionEl.style.background = 'rgba(255, 255, 255, 0.12)';
+        });
+        actionEl.addEventListener('click', onClick);
+        toast.appendChild(actionEl);
+        toast.style.pointerEvents = 'auto';
+      },
       hide() {
         toast.style.opacity = '0';
         setTimeout(() => toast.remove(), 250);
@@ -4021,16 +4058,24 @@
             : await timelineSort.sortByStartDate(onProgress);
           if (result?.skipped) {
             toast.update('Momentum-Light — déjà classé par date de début ✓');
-          } else if (isRevert) {
-            toast.update(
-              `Momentum-Light — ordre restauré (${result.count} Epics) ↩`,
-            );
+            setTimeout(() => toast.hide(), 1800);
           } else {
+            // JIRA Plans virtualise ses lignes depuis son store React et
+            // ne re-fetch pas le rank suite à un PUT externe — l'utilisateur
+            // doit recharger la page pour que le nouvel ordre s'affiche. On
+            // surface le besoin dans le toast et on offre un clic direct.
             toast.update(
-              `Momentum-Light — ${result.count} Epics classés par date de début ✓`,
+              isRevert
+                ? `Momentum-Light — ordre restauré (${result.count} Epics) ↩ — rechargez pour voir`
+                : `Momentum-Light — ${result.count} Epics classés ✓ — rechargez pour voir`,
             );
+            toast.setAction('↻ Recharger', () => {
+              location.reload();
+            });
+            // Plus long que les autres toasts (8 s) car l'utilisateur doit
+            // avoir le temps de lire et cliquer le bouton de rechargement.
+            setTimeout(() => toast.hide(), 8000);
           }
-          setTimeout(() => toast.hide(), 1800);
         } catch (e) {
           warn('timeline sort failed:', e?.message || e);
           toast.update(
@@ -6512,7 +6557,7 @@
     // Initial pass (in case the timeline is already rendered at document-idle).
     runActiveFeatures();
     log(
-      'loaded — version 0.11.2',
+      'loaded — version 0.11.3',
       isDebug()
         ? '(debug on)'
         : '(debug off — enable with: localStorage.setItem(\'momentum-light-debug\', \'1\'))',
