@@ -32,6 +32,7 @@
   const OVERLAY_CLASS = 'momentum-progress';
   const OVERLAY_FILL_CLASS = 'momentum-progress__fill';
   const OVERLAY_LABEL_CLASS = 'momentum-progress__label';
+  const OVERLAY_PACE_MARKER_CLASS = 'momentum-progress__pace-marker';
   const OVERLAY_ESTIMATE_MOD = 'momentum-progress--estimate';
   const OVERLAY_SPRINT_FILL_MOD = 'momentum-progress--sprint-fill';
   const VELOCITY_BANNER_ID = 'momentum-velocity-banner';
@@ -1073,6 +1074,10 @@
         id: s.id,
         name: s.name,
         state: s.state, // 'active' | 'future'
+        // startDate powers the active-sprint burndown overlay (ratio of
+        // elapsed time vs total sprint duration); harmless on future
+        // sprints where the overlay ignores it.
+        startDate: s.startDate || null,
         // Carried so the Business-view status pastille can compare the
         // projected end date to the Epic's duedate. Falls back to startDate
         // when JIRA hasn't set an endDate (rare on configured boards).
@@ -1692,6 +1697,51 @@
           rgba(222, 53, 11, 0.22) 100%
         );
         --momentum-sprint-fill-accent: #DE350B;
+      }
+      /* Burndown variant (active sprint only): the bar tracks % SP
+         delivered, and a vertical marker at --momentum-pace-marker shows
+         where we *should* be given elapsed sprint time. State colors
+         encode the pace gap (behind / on-pace / ahead) instead of the
+         capacity-vs-velocity ratio used by future sprints. */
+      .${OVERLAY_SPRINT_FILL_MOD}[data-mode="burndown"][data-fill-state="behind"] .${OVERLAY_FILL_CLASS} {
+        background: linear-gradient(
+          90deg,
+          rgba(222, 53, 11, 0.30) 0%,
+          rgba(222, 53, 11, 0.22) 100%
+        );
+        --momentum-sprint-fill-accent: #DE350B;
+      }
+      .${OVERLAY_SPRINT_FILL_MOD}[data-mode="burndown"][data-fill-state="on-pace"] .${OVERLAY_FILL_CLASS} {
+        background: linear-gradient(
+          90deg,
+          rgba(54, 179, 126, 0.32) 0%,
+          rgba(54, 179, 126, 0.22) 100%
+        );
+        --momentum-sprint-fill-accent: #36B37E;
+      }
+      .${OVERLAY_SPRINT_FILL_MOD}[data-mode="burndown"][data-fill-state="ahead"] .${OVERLAY_FILL_CLASS} {
+        background: linear-gradient(
+          90deg,
+          rgba(0, 120, 212, 0.30) 0%,
+          rgba(0, 120, 212, 0.22) 100%
+        );
+        --momentum-sprint-fill-accent: #0078D4;
+      }
+      /* Vertical "ideal pace" marker. Drawn as a 2px line at the
+         elapsed-time position with a tiny notch top/bottom so it reads
+         as a tick rather than just a stray border. pointer-events:none
+         so it never steals hover from the chip. */
+      .${OVERLAY_SPRINT_FILL_MOD} .${OVERLAY_PACE_MARKER_CLASS} {
+        position: absolute;
+        top: 0;
+        bottom: 0;
+        left: var(--momentum-pace-marker, 0%);
+        width: 2px;
+        margin-left: -1px;
+        background: rgba(9, 30, 66, 0.55);
+        box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.5);
+        pointer-events: none;
+        z-index: 1;
       }
       /* No in-chip numeric label — the sprint name stays clean and the
          exact numbers live in the tooltip via dataset.momentumTooltip. */
@@ -3456,28 +3506,82 @@
       return 'over';
     }
 
-    function applyFill(chip, { load, average, state, sprintName }) {
+    // Burndown pace classification for the active sprint: how does the
+    // % of work delivered compare to the % of sprint time elapsed?
+    // Tolerance band of 10pp keeps a healthy "on-pace" signal even when
+    // standups, weekends, and CI lulls jitter the daily curve.
+    function paceStateFor(donePct, timePct) {
+      const gap = donePct - timePct;
+      if (gap < -10) return 'behind';
+      if (gap > 10) return 'ahead';
+      return 'on-pace';
+    }
+
+    function tryBurndownContext({ total, remaining, startDate, endDate }) {
+      if (!Number.isFinite(total) || total <= 0) return null;
+      if (!Number.isFinite(remaining) || remaining < 0) return null;
+      const start = startDate ? Date.parse(startDate) : NaN;
+      const end = endDate ? Date.parse(endDate) : NaN;
+      if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+        return null;
+      }
+      const now = Date.now();
+      const donePct = Math.max(0, Math.min(100, ((total - remaining) / total) * 100));
+      const timePct = Math.max(0, Math.min(100, ((now - start) / (end - start)) * 100));
+      const totalDays = Math.max(1, Math.round((end - start) / 86_400_000));
+      const elapsedDaysRaw = Math.round((now - start) / 86_400_000);
+      const elapsedDays = Math.max(0, Math.min(totalDays, elapsedDaysRaw));
+      return { donePct, timePct, totalDays, elapsedDays, doneSp: total - remaining };
+    }
+
+    function applyFill(
+      chip,
+      { load, total, remaining, average, state, sprintName, startDate, endDate },
+    ) {
+      const overlay = ensureOverlay(chip);
+      const fill = overlay.querySelector(`.${OVERLAY_FILL_CLASS}`);
+      const label = overlay.querySelector(`.${OVERLAY_LABEL_CLASS}`);
+      // Label node is hidden via CSS for the sprint-fill variant (the chip's
+      // own text is enough and the numbers live in the tooltip). Kept blank
+      // to keep CSS the single source of truth for label visibility.
+      if (label) label.textContent = '';
+
+      // Active sprints: switch to a burndown-vs-ideal display. The bar
+      // tracks % SP delivered, a vertical marker shows where we *should*
+      // be given elapsed sprint time. State (behind/on-pace/ahead) is the
+      // gap between the two and is what colors the bar.
+      const burndown =
+        state === 'active'
+          ? tryBurndownContext({ total, remaining, startDate, endDate })
+          : null;
+
+      if (burndown) {
+        overlay.dataset.mode = 'burndown';
+        overlay.dataset.fillState = paceStateFor(burndown.donePct, burndown.timePct);
+        overlay.style.setProperty('--momentum-pace-marker', `${burndown.timePct.toFixed(1)}%`);
+        if (fill) fill.style.width = `${burndown.donePct.toFixed(1)}%`;
+        ensurePaceMarker(overlay);
+        chip.dataset.momentumTooltip =
+          `${sprintName} — ${Math.round(burndown.doneSp)}/${Math.round(total)} SP fait ` +
+          `(${Math.round(burndown.donePct)}%) · J${burndown.elapsedDays}/${burndown.totalDays} ` +
+          `(${Math.round(burndown.timePct)}%) · ${paceLabel(overlay.dataset.fillState)}`;
+        return;
+      }
+
+      // Capacity-vs-velocity display (future sprints, or active sprints
+      // missing dates / SP data — falls back to the historical behavior).
       if (!Number.isFinite(load) || !Number.isFinite(average) || average <= 0) {
         removeOverlay(chip);
         delete chip.dataset.momentumTooltip;
         return;
       }
+      delete overlay.dataset.mode;
+      removePaceMarker(overlay);
+      overlay.style.removeProperty('--momentum-pace-marker');
       const ratio = load / average;
       const pct = Math.max(0, Math.min(100, ratio * 100));
-      const overlay = ensureOverlay(chip);
       overlay.dataset.fillState = fillStateFor(ratio);
-      const fill = overlay.querySelector(`.${OVERLAY_FILL_CLASS}`);
-      const label = overlay.querySelector(`.${OVERLAY_LABEL_CLASS}`);
       if (fill) fill.style.width = `${pct.toFixed(1)}%`;
-
-      // Compact label inside the chip. 80px is the rough breakpoint below
-      // which the "X / Y SP" form no longer fits; fall back to a bare
-      // percentage there.
-      // Label node is hidden via CSS for the sprint-fill variant (the chip's
-      // own text is enough and the numbers live in the tooltip). We still
-      // populate its textContent as a no-op safety so CSS keeps it the only
-      // source of truth for the label visibility.
-      if (label) label.textContent = '';
 
       // Tooltip override via dataset.momentumTooltip — picked up by
       // tooltipInterceptor when Atlaskit's React tooltip appears on hover.
@@ -3488,6 +3592,27 @@
       chip.dataset.momentumTooltip = `${sprintName} — ${Math.round(
         load,
       )} SP${stateSuffix} / ${Math.round(average)} SP moyenne (${Math.round(ratio * 100)}%)`;
+    }
+
+    function paceLabel(paceState) {
+      if (paceState === 'behind') return 'en retard';
+      if (paceState === 'ahead') return 'en avance';
+      return 'dans les temps';
+    }
+
+    function ensurePaceMarker(overlay) {
+      let marker = overlay.querySelector(`:scope > .${OVERLAY_PACE_MARKER_CLASS}`);
+      if (!marker) {
+        marker = document.createElement('div');
+        marker.className = OVERLAY_PACE_MARKER_CLASS;
+        overlay.appendChild(marker);
+      }
+      return marker;
+    }
+
+    function removePaceMarker(overlay) {
+      const marker = overlay.querySelector(`:scope > .${OVERLAY_PACE_MARKER_CLASS}`);
+      if (marker) marker.remove();
     }
 
     async function decorate(chip, byKey, average) {
@@ -3514,9 +3639,13 @@
       }
       applyFill(chip, {
         load: capacity.load,
+        total: capacity.total,
+        remaining: capacity.remaining,
         average,
         state: sprint.state,
         sprintName: name,
+        startDate: sprint.startDate || null,
+        endDate: sprint.endDate || null,
       });
       return sprint;
     }
