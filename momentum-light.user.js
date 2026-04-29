@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.10.5
+// @version      0.10.6
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne, macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, menu « How-to » guidé qui surligne chaque feature au premier lancement, toggle « Vue PM / Vue Business » qui remplace les overlays de chiffrage par la date d'atterrissage (duedate) de chaque Epic, recoloration ternaire 🟢🟡🔴 (On Track / At Risk / Off Track / Livré) de chaque barre d'Epic en Vue Business calculée à partir de la duedate, de la projection vélocité et de la confidence, surcharge du menu Export → Image (.png) qui capture la Timeline au format natif (via html2canvas) avec tous les overlays Momentum-Light visibles dessus, et variante d'export business-friendly (en Vue Business) qui ajoute une bande titre + légende des couleurs de statut au-dessus de la Timeline capturée.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -3232,17 +3232,20 @@
     // If the ticket has no SP, we silently skip (no overlay, no noise).
     function applyEstimate(bar, { sp, issueKey, statusCategory }) {
       const hasSp = Number.isFinite(sp) && sp > 0;
-      // No SP → no overlay. JIRA renders a full-row "click to schedule"
-      // hover target on unestimated / unscheduled stories that shares
-      // the chart-item testid prefix; tinting it would paint a giant
-      // bar across the whole row. Keeping the SP guard scopes the tint
-      // to actual scheduled bars.
-      if (!hasSp) {
+      const ticketStatus = mapTicketStatus(statusCategory);
+      // No SP → most often the bar is JIRA's full-row "click to
+      // schedule" hover placeholder (shares the chart-item testid
+      // prefix) which would paint a giant tint across the whole row.
+      // The placeholder only renders on UNSCHEDULED stories — those
+      // are virtually always still open. A closed/done story without
+      // SP is, in practice, a real (small) bar in its sprint that
+      // simply lacks an estimate, and overrides JIRA's gray native
+      // rendering with our green tint.
+      if (!hasSp && ticketStatus !== 'done') {
         removeOverlay(bar);
         delete bar.dataset.momentumTooltip;
         return;
       }
-      const ticketStatus = mapTicketStatus(statusCategory);
       const overlay = ensureOverlay(bar);
       overlay.classList.add(OVERLAY_ESTIMATE_MOD);
       overlay.classList.remove(OVERLAY_LANDING_MOD);
@@ -3260,9 +3263,10 @@
       if (ticketStatus) overlay.dataset.status = ticketStatus;
       else delete overlay.dataset.status;
       const label = overlay.querySelector(`.${OVERLAY_LABEL_CLASS}`);
-      if (label) label.textContent = `${sp} SP`;
+      if (label) label.textContent = hasSp ? `${sp} SP` : '';
 
-      const parts = [`${issueKey} — ${sp} SP`];
+      const parts = [issueKey];
+      if (hasSp) parts.push(`${sp} SP`);
       if (ticketStatus) parts.push(ticketStatusLabel(ticketStatus));
       const tooltipText = parts.join(' — ');
       bar.dataset.momentumTooltip = tooltipText;
@@ -6347,7 +6351,7 @@
     // Initial pass (in case the timeline is already rendered at document-idle).
     runActiveFeatures();
     log(
-      'loaded — version 0.10.5',
+      'loaded — version 0.10.6',
       isDebug()
         ? '(debug on)'
         : '(debug off — enable with: localStorage.setItem(\'momentum-light-debug\', \'1\'))',
