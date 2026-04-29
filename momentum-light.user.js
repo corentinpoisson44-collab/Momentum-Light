@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.10.2
+// @version      0.10.3
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne, macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, menu « How-to » guidé qui surligne chaque feature au premier lancement, toggle « Vue PM / Vue Business » qui remplace les overlays de chiffrage par la date d'atterrissage (duedate) de chaque Epic, recoloration ternaire 🟢🟡🔴 (On Track / At Risk / Off Track / Livré) de chaque barre d'Epic en Vue Business calculée à partir de la duedate, de la projection vélocité et de la confidence, surcharge du menu Export → Image (.png) qui capture la Timeline au format natif (via html2canvas) avec tous les overlays Momentum-Light visibles dessus, et variante d'export business-friendly (en Vue Business) qui ajoute une bande titre + légende des couleurs de statut au-dessus de la Timeline capturée.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -2104,6 +2104,22 @@
       .${OVERLAY_CLASS}[data-status="unsized"] {
         background-color: #42526E;
       }
+      /* Story bar tint by workflow status — applies in BOTH views.
+         The tint replaces JIRA's native bar fill so the same color
+         language reads identically whatever the team's status palette
+         (To Do/In Progress/Done all map cleanly to the three
+         statusCategory keys). Scoped under OVERLAY_ESTIMATE_MOD to
+         avoid colliding with the Epic Business-status tints above
+         which share the data-status attribute namespace. */
+      .${OVERLAY_ESTIMATE_MOD}[data-status="todo"] {
+        background-color: #6B778C;
+      }
+      .${OVERLAY_ESTIMATE_MOD}[data-status="in-progress"] {
+        background-color: #2684FF;
+      }
+      .${OVERLAY_ESTIMATE_MOD}[data-status="done"] {
+        background-color: #36B37E;
+      }
       /* Keep JIRA's native dependency link-icon visible above the
          Business status tint. Scoped to Business view so PM-view
          rendering (where the overlay has no solid tint) is left
@@ -3199,8 +3215,13 @@
     // Non-Epic variant: just paint the ticket's SP estimate as a chip on the
     // bar. No fill — tickets aren't "x% done", they're just sized at X SP.
     // If the ticket has no SP, we silently skip (no overlay, no noise).
-    function applyEstimate(bar, { sp, issueKey }) {
-      if (sp == null || !(sp > 0)) {
+    function applyEstimate(bar, { sp, issueKey, statusCategory }) {
+      const ticketStatus = mapTicketStatus(statusCategory);
+      const hasSp = Number.isFinite(sp) && sp > 0;
+      // No SP and no actionable status → nothing to render. Drops the
+      // overlay so the JIRA-native bar stays untouched (matches the
+      // pre-tint behavior for unknown / closed tickets).
+      if (!hasSp && !ticketStatus) {
         removeOverlay(bar);
         delete bar.dataset.momentumTooltip;
         return;
@@ -3215,13 +3236,36 @@
       delete overlay.dataset.confidence;
       delete overlay.dataset.discovery;
       resetBarConfidence(bar);
+      // Tint the bar with the workflow status (todo/in-progress/done).
+      // The values are deliberately distinct from the Epic Business
+      // tints (on-track/at-risk/off-track/delivered/unsized) so the two
+      // namespaces never collide on the shared `data-status` attribute.
+      if (ticketStatus) overlay.dataset.status = ticketStatus;
+      else delete overlay.dataset.status;
       const label = overlay.querySelector(`.${OVERLAY_LABEL_CLASS}`);
-      if (label) label.textContent = `${sp} SP`;
+      if (label) label.textContent = hasSp ? `${sp} SP` : '';
 
-      const tooltipText = `${issueKey} — ${sp} SP`;
+      const parts = [issueKey];
+      if (hasSp) parts.push(`${sp} SP`);
+      if (ticketStatus) parts.push(ticketStatusLabel(ticketStatus));
+      const tooltipText = parts.join(' — ');
       bar.dataset.momentumTooltip = tooltipText;
       bar.setAttribute('aria-label', tooltipText);
       bar.title = tooltipText;
+    }
+
+    function mapTicketStatus(category) {
+      if (category === 'new') return 'todo';
+      if (category === 'indeterminate') return 'in-progress';
+      if (category === 'done') return 'done';
+      return null;
+    }
+
+    function ticketStatusLabel(s) {
+      if (s === 'todo') return 'À faire';
+      if (s === 'in-progress') return 'En cours';
+      if (s === 'done') return 'Terminé';
+      return '';
     }
 
     // Format a raw Jira duedate (YYYY-MM-DD) for display. `short` is used
@@ -3286,7 +3330,11 @@
         // En Vue Business, la duedate vit au niveau Epic — les US gardent
         // donc leur estimation SP pour rester lisibles dans le récap.
         if (isDebug() && !isRefresh) debug(`${issueKey} (ticket, ${view}): ${meta.storyPoints ?? '—'} SP`);
-        applyEstimate(bar, { sp: meta.storyPoints, issueKey });
+        applyEstimate(bar, {
+          sp: meta.storyPoints,
+          issueKey,
+          statusCategory: meta.statusCategory,
+        });
       }
     }
 
@@ -6283,7 +6331,7 @@
     // Initial pass (in case the timeline is already rendered at document-idle).
     runActiveFeatures();
     log(
-      'loaded — version 0.10.2',
+      'loaded — version 0.10.3',
       isDebug()
         ? '(debug on)'
         : '(debug off — enable with: localStorage.setItem(\'momentum-light-debug\', \'1\'))',
