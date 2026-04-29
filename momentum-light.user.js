@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.10.1
+// @version      0.10.2
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne, macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, menu « How-to » guidé qui surligne chaque feature au premier lancement, toggle « Vue PM / Vue Business » qui remplace les overlays de chiffrage par la date d'atterrissage (duedate) de chaque Epic, recoloration ternaire 🟢🟡🔴 (On Track / At Risk / Off Track / Livré) de chaque barre d'Epic en Vue Business calculée à partir de la duedate, de la projection vélocité et de la confidence, surcharge du menu Export → Image (.png) qui capture la Timeline au format natif (via html2canvas) avec tous les overlays Momentum-Light visibles dessus, et variante d'export business-friendly (en Vue Business) qui ajoute une bande titre + légende des couleurs de statut au-dessus de la Timeline capturée.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -3281,13 +3281,11 @@
           view,
           dueDate: meta.dueDate,
         });
-      } else if (view === VIEW_MODE_BUSINESS) {
-        // Ticket bars: no overlay in Business view — only Epics carry a
-        // landing-date payload.
-        removeOverlay(bar);
-        delete bar.dataset.momentumTooltip;
       } else {
-        if (isDebug() && !isRefresh) debug(`${issueKey} (ticket): ${meta.storyPoints ?? '—'} SP`);
+        // Tickets (non-Epic) : on affiche les SP dans les deux vues.
+        // En Vue Business, la duedate vit au niveau Epic — les US gardent
+        // donc leur estimation SP pour rester lisibles dans le récap.
+        if (isDebug() && !isRefresh) debug(`${issueKey} (ticket, ${view}): ${meta.storyPoints ?? '—'} SP`);
         applyEstimate(bar, { sp: meta.storyPoints, issueKey });
       }
     }
@@ -6285,7 +6283,7 @@
     // Initial pass (in case the timeline is already rendered at document-idle).
     runActiveFeatures();
     log(
-      'loaded — version 0.10.1',
+      'loaded — version 0.10.2',
       isDebug()
         ? '(debug on)'
         : '(debug off — enable with: localStorage.setItem(\'momentum-light-debug\', \'1\'))',
