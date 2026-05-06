@@ -1136,8 +1136,15 @@
   // Returned shape:
   //   { done, committed, remaining }
   //     - done       = completedIssuesEstimateSum
-  //     - committed  = allIssuesEstimateSum (includes mid-sprint scope adds)
   //     - remaining  = issuesNotCompletedEstimateSum
+  //     - committed  = done + remaining (i.e. what's *currently* in the
+  //                    sprint). We deliberately do NOT use
+  //                    allIssuesEstimateSum here: that field also
+  //                    includes punted issues and issues that started
+  //                    in this sprint but were completed in another,
+  //                    which makes the total drift away from Jira's
+  //                    Active Sprint widget. The widget reports "done /
+  //                    in-sprint" → so do we.
   // ---------------------------------------------------------------------------
 
   const sprintReport = (() => {
@@ -1156,10 +1163,12 @@
         `/rest/greenhopper/1.0/rapid/charts/sprintreport?rapidViewId=${boardId}&sprintId=${sprintId}`,
       );
       const c = data?.contents || {};
+      const done = num(c.completedIssuesEstimateSum);
+      const remaining = num(c.issuesNotCompletedEstimateSum);
       return {
-        done: num(c.completedIssuesEstimateSum),
-        committed: num(c.allIssuesEstimateSum),
-        remaining: num(c.issuesNotCompletedEstimateSum),
+        done,
+        remaining,
+        committed: done + remaining,
       };
     }
 
