@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.10.8
-// @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur de remplissage sur chaque chip de sprint actif/futur vs. la vélocité moyenne, macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, menu « How-to » guidé qui surligne chaque feature au premier lancement, toggle « Vue PM / Vue Business » qui remplace les overlays de chiffrage par la date d'atterrissage (duedate) de chaque Epic, recoloration ternaire 🟢🟡🔴 (On Track / At Risk / Off Track / Livré) de chaque barre d'Epic en Vue Business calculée à partir de la duedate, de la projection vélocité et de la confidence, surcharge du menu Export → Image (.png) qui capture la Timeline au format natif (via html2canvas) avec tous les overlays Momentum-Light visibles dessus, et variante d'export business-friendly (en Vue Business) qui ajoute une bande titre + légende des couleurs de statut au-dessus de la Timeline capturée.
+// @version      0.10.9
+// @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur sur chaque chip de sprint (actif : progression fait/engagé issue du Sprint Report, teinté par engagement vs vélocité moyenne ; futur : charge planifiée vs vélocité moyenne), macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, menu « How-to » guidé qui surligne chaque feature au premier lancement, toggle « Vue PM / Vue Business » qui remplace les overlays de chiffrage par la date d'atterrissage (duedate) de chaque Epic, recoloration ternaire 🟢🟡🔴 (On Track / At Risk / Off Track / Livré) de chaque barre d'Epic en Vue Business calculée à partir de la duedate, de la projection vélocité et de la confidence, surcharge du menu Export → Image (.png) qui capture la Timeline au format natif (via html2canvas) avec tous les overlays Momentum-Light visibles dessus, et variante d'export business-friendly (en Vue Business) qui ajoute une bande titre + légende des couleurs de statut au-dessus de la Timeline capturée.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
 // @run-at       document-idle
@@ -32,7 +32,6 @@
   const OVERLAY_CLASS = 'momentum-progress';
   const OVERLAY_FILL_CLASS = 'momentum-progress__fill';
   const OVERLAY_LABEL_CLASS = 'momentum-progress__label';
-  const OVERLAY_PACE_MARKER_CLASS = 'momentum-progress__pace-marker';
   const OVERLAY_ESTIMATE_MOD = 'momentum-progress--estimate';
   const OVERLAY_SPRINT_FILL_MOD = 'momentum-progress--sprint-fill';
   const VELOCITY_BANNER_ID = 'momentum-velocity-banner';
@@ -1100,10 +1099,6 @@
         id: s.id,
         name: s.name,
         state: s.state, // 'active' | 'future'
-        // startDate powers the active-sprint burndown overlay (ratio of
-        // elapsed time vs total sprint duration); harmless on future
-        // sprints where the overlay ignores it.
-        startDate: s.startDate || null,
         // Carried so the Business-view status pastille can compare the
         // projected end date to the Epic's duedate. Falls back to startDate
         // when JIRA hasn't set an endDate (rare on configured boards).
@@ -1153,6 +1148,117 @@
         return cache && cache.value ? cache.value : null;
       },
     };
+  })();
+
+  // ---------------------------------------------------------------------------
+  // sprintReport — authoritative progression numbers for an *active* sprint,
+  // pulled from the Greenhopper Sprint Report endpoint (same source as
+  // Jira's "Active Sprint" widget and the Backlog committed/done counter).
+  // Used by the timeline sprint chip to show actual progression
+  // (done / committed) instead of the more abstract remaining-vs-velocity
+  // ratio. Closed/future sprints don't have meaningful report data here
+  // — callers must guard on state.
+  //
+  // Returned shape:
+  //   { done, committed, remaining }
+  //     - done       = sum of SP across `completedIssues[]`
+  //     - remaining  = sum of SP across `issuesNotCompletedInCurrentSprint[]`
+  //     - committed  = done + remaining (what's *currently* in the
+  //                    sprint, excluding punted and "completed in another
+  //                    sprint" issues — same as Jira's Active Sprint
+  //                    widget).
+  //
+  // We iterate the per-issue arrays rather than reading the pre-aggregated
+  // `*EstimateSum` fields so we can apply the same filters Jira's widget
+  // applies: subtasks are excluded (they don't carry SP for the team's
+  // commitment), and `hidden` issues (filtered out by the board's saved
+  // filter) are skipped. Without those filters the totals drift above
+  // the widget's numbers.
+  // ---------------------------------------------------------------------------
+
+  const sprintReport = (() => {
+    const TTL_MS = 30_000;
+    const cache = new Map(); // `${boardId}:${sprintId}` -> { expiresAt, value }
+    const inflight = new Map();
+
+    function issueSp(issue) {
+      // Greenhopper exposes SP via `estimateStatistic.statFieldValue.value`
+      // (current value) — `currentEstimateStatistic` is the same value on
+      // recent Jira versions; we read both to stay forward-compatible.
+      const raw =
+        issue?.estimateStatistic?.statFieldValue?.value ??
+        issue?.currentEstimateStatistic?.statFieldValue?.value;
+      const n = typeof raw === 'number' ? raw : Number(raw);
+      return Number.isFinite(n) && n > 0 ? n : 0;
+    }
+
+    function isSubtask(issue) {
+      const t = (issue?.typeName || '').toLowerCase();
+      return t === 'sub-task' || t === 'subtask' || t === 'sous-tâche' || t === 'sous-tache';
+    }
+
+    function sumSp(issues) {
+      let total = 0;
+      for (const issue of issues || []) {
+        if (issue?.hidden === true) continue;
+        if (isSubtask(issue)) continue;
+        total += issueSp(issue);
+      }
+      return total;
+    }
+
+    async function fetchStats(boardId, sprintId) {
+      const data = await jiraApi.request(
+        `/rest/greenhopper/1.0/rapid/charts/sprintreport?rapidViewId=${boardId}&sprintId=${sprintId}`,
+      );
+      const c = data?.contents || {};
+      const done = sumSp(c.completedIssues);
+      const remaining = sumSp(c.issuesNotCompletedInCurrentSprint);
+      if (isDebug()) {
+        debug(
+          `sprint-report ${sprintId}: done=${done} (${(c.completedIssues || []).length} issues), ` +
+            `remaining=${remaining} (${(c.issuesNotCompletedInCurrentSprint || []).length} issues)`,
+        );
+      }
+      return {
+        done,
+        remaining,
+        committed: done + remaining,
+      };
+    }
+
+    async function get(boardId, sprintId) {
+      const key = `${boardId}:${sprintId}`;
+      const hit = cache.get(key);
+      if (hit && hit.expiresAt > Date.now()) return hit.value;
+      const pending = inflight.get(key);
+      if (pending) return pending;
+      const p = (async () => {
+        try {
+          const value = await fetchStats(boardId, sprintId);
+          cache.set(key, { expiresAt: Date.now() + TTL_MS, value });
+          return value;
+        } finally {
+          inflight.delete(key);
+        }
+      })();
+      inflight.set(key, p);
+      return p;
+    }
+
+    function invalidate(sprintId) {
+      // Mark stale (SWR): keep the value visible until the refetch lands.
+      const suffix = `:${sprintId}`;
+      for (const [k, v] of cache) {
+        if (k.endsWith(suffix)) v.expiresAt = 0;
+      }
+    }
+
+    function invalidateAll() {
+      for (const v of cache.values()) v.expiresAt = 0;
+    }
+
+    return { get, invalidate, invalidateAll };
   })();
 
   // ---------------------------------------------------------------------------
@@ -1723,51 +1829,6 @@
           rgba(222, 53, 11, 0.22) 100%
         );
         --momentum-sprint-fill-accent: #DE350B;
-      }
-      /* Burndown variant (active sprint only): the bar tracks % SP
-         delivered, and a vertical marker at --momentum-pace-marker shows
-         where we *should* be given elapsed sprint time. State colors
-         encode the pace gap (behind / on-pace / ahead) instead of the
-         capacity-vs-velocity ratio used by future sprints. */
-      .${OVERLAY_SPRINT_FILL_MOD}[data-mode="burndown"][data-fill-state="behind"] .${OVERLAY_FILL_CLASS} {
-        background: linear-gradient(
-          90deg,
-          rgba(222, 53, 11, 0.30) 0%,
-          rgba(222, 53, 11, 0.22) 100%
-        );
-        --momentum-sprint-fill-accent: #DE350B;
-      }
-      .${OVERLAY_SPRINT_FILL_MOD}[data-mode="burndown"][data-fill-state="on-pace"] .${OVERLAY_FILL_CLASS} {
-        background: linear-gradient(
-          90deg,
-          rgba(54, 179, 126, 0.32) 0%,
-          rgba(54, 179, 126, 0.22) 100%
-        );
-        --momentum-sprint-fill-accent: #36B37E;
-      }
-      .${OVERLAY_SPRINT_FILL_MOD}[data-mode="burndown"][data-fill-state="ahead"] .${OVERLAY_FILL_CLASS} {
-        background: linear-gradient(
-          90deg,
-          rgba(0, 120, 212, 0.30) 0%,
-          rgba(0, 120, 212, 0.22) 100%
-        );
-        --momentum-sprint-fill-accent: #0078D4;
-      }
-      /* Vertical "ideal pace" marker. Drawn as a 2px line at the
-         elapsed-time position with a tiny notch top/bottom so it reads
-         as a tick rather than just a stray border. pointer-events:none
-         so it never steals hover from the chip. */
-      .${OVERLAY_SPRINT_FILL_MOD} .${OVERLAY_PACE_MARKER_CLASS} {
-        position: absolute;
-        top: 0;
-        bottom: 0;
-        left: var(--momentum-pace-marker, 0%);
-        width: 2px;
-        margin-left: -1px;
-        background: rgba(9, 30, 66, 0.55);
-        box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.5);
-        pointer-events: none;
-        z-index: 1;
       }
       /* No in-chip numeric label — the sprint name stays clean and the
          exact numbers live in the tooltip via dataset.momentumTooltip. */
@@ -3619,116 +3680,64 @@
       return 'over';
     }
 
-    // Burndown pace classification for the active sprint: how does the
-    // % of work delivered compare to the % of sprint time elapsed?
-    // Tolerance band of 10pp keeps a healthy "on-pace" signal even when
-    // standups, weekends, and CI lulls jitter the daily curve.
-    function paceStateFor(donePct, timePct) {
-      const gap = donePct - timePct;
-      if (gap < -10) return 'behind';
-      if (gap > 10) return 'ahead';
-      return 'on-pace';
-    }
-
-    function tryBurndownContext({ total, remaining, startDate, endDate }) {
-      if (!Number.isFinite(total) || total <= 0) return null;
-      if (!Number.isFinite(remaining) || remaining < 0) return null;
-      const start = startDate ? Date.parse(startDate) : NaN;
-      const end = endDate ? Date.parse(endDate) : NaN;
-      if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
-        return null;
-      }
-      const now = Date.now();
-      const donePct = Math.max(0, Math.min(100, ((total - remaining) / total) * 100));
-      const timePct = Math.max(0, Math.min(100, ((now - start) / (end - start)) * 100));
-      const totalDays = Math.max(1, Math.round((end - start) / 86_400_000));
-      const elapsedDaysRaw = Math.round((now - start) / 86_400_000);
-      const elapsedDays = Math.max(0, Math.min(totalDays, elapsedDaysRaw));
-      return { donePct, timePct, totalDays, elapsedDays, doneSp: total - remaining };
-    }
-
-    function applyFill(
-      chip,
-      { load, total, remaining, average, state, sprintName, startDate, endDate },
-    ) {
-      const overlay = ensureOverlay(chip);
-      const fill = overlay.querySelector(`.${OVERLAY_FILL_CLASS}`);
-      const label = overlay.querySelector(`.${OVERLAY_LABEL_CLASS}`);
-      // Label node is hidden via CSS for the sprint-fill variant (the chip's
-      // own text is enough and the numbers live in the tooltip). Kept blank
-      // to keep CSS the single source of truth for label visibility.
-      if (label) label.textContent = '';
-
-      // Active sprints: switch to a burndown-vs-ideal display. The bar
-      // tracks % SP delivered, a vertical marker shows where we *should*
-      // be given elapsed sprint time. State (behind/on-pace/ahead) is the
-      // gap between the two and is what colors the bar.
-      const burndown =
-        state === 'active'
-          ? tryBurndownContext({ total, remaining, startDate, endDate })
-          : null;
-
-      if (burndown) {
-        overlay.dataset.mode = 'burndown';
-        overlay.dataset.fillState = paceStateFor(burndown.donePct, burndown.timePct);
-        overlay.style.setProperty('--momentum-pace-marker', `${burndown.timePct.toFixed(1)}%`);
-        if (fill) fill.style.width = `${burndown.donePct.toFixed(1)}%`;
-        ensurePaceMarker(overlay);
-        chip.dataset.momentumTooltip =
-          `${sprintName} — ${Math.round(burndown.doneSp)}/${Math.round(total)} SP fait ` +
-          `(${Math.round(burndown.donePct)}%) · J${burndown.elapsedDays}/${burndown.totalDays} ` +
-          `(${Math.round(burndown.timePct)}%) · ${paceLabel(overlay.dataset.fillState)}`;
+    // Active-sprint mode: fill width = progression (done / committed),
+    // colour = engagement vs velocity (committed / avg). The two signals
+    // are decoupled so a 30 % filled bar tinted orange reads as "early
+    // sprint, but already overcommitted" — exactly the dual signal the
+    // timeline needs.
+    function applyProgressionFill(chip, { done, committed, average, sprintName }) {
+      if (!Number.isFinite(done) || !Number.isFinite(committed) || committed <= 0) {
+        removeOverlay(chip);
+        delete chip.dataset.momentumTooltip;
         return;
       }
+      const progressionRatio = done / committed;
+      const pct = Math.max(0, Math.min(100, progressionRatio * 100));
+      const overlay = ensureOverlay(chip);
+      const engagementRatio = average > 0 ? committed / average : 1;
+      overlay.dataset.fillState = fillStateFor(engagementRatio);
+      const fill = overlay.querySelector(`.${OVERLAY_FILL_CLASS}`);
+      const label = overlay.querySelector(`.${OVERLAY_LABEL_CLASS}`);
+      if (fill) fill.style.width = `${pct.toFixed(1)}%`;
+      if (label) label.textContent = '';
 
-      // Capacity-vs-velocity display (future sprints, or active sprints
-      // missing dates / SP data — falls back to the historical behavior).
+      const parts = [
+        `${sprintName} — ${Math.round(done)} / ${Math.round(committed)} SP fait (${Math.round(progressionRatio * 100)}%)`,
+      ];
+      if (Number.isFinite(average) && average > 0) {
+        parts.push(
+          `engagement ${Math.round(committed)} SP vs vélocité moyenne ${Math.round(average)} SP (${Math.round(engagementRatio * 100)}%)`,
+        );
+      }
+      chip.dataset.momentumTooltip = parts.join(' · ');
+    }
+
+    // Future-sprint (or fallback) mode: fill width = planned load /
+    // average velocity. Same signal we've shipped since 0.6: surfaces
+    // sprints that are over- or under-committed against historical
+    // throughput before they start.
+    function applyLoadFill(chip, { load, average, state, sprintName }) {
       if (!Number.isFinite(load) || !Number.isFinite(average) || average <= 0) {
         removeOverlay(chip);
         delete chip.dataset.momentumTooltip;
         return;
       }
-      delete overlay.dataset.mode;
-      removePaceMarker(overlay);
-      overlay.style.removeProperty('--momentum-pace-marker');
       const ratio = load / average;
       const pct = Math.max(0, Math.min(100, ratio * 100));
+      const overlay = ensureOverlay(chip);
       overlay.dataset.fillState = fillStateFor(ratio);
+      const fill = overlay.querySelector(`.${OVERLAY_FILL_CLASS}`);
+      const label = overlay.querySelector(`.${OVERLAY_LABEL_CLASS}`);
       if (fill) fill.style.width = `${pct.toFixed(1)}%`;
+      if (label) label.textContent = '';
 
-      // Tooltip override via dataset.momentumTooltip — picked up by
-      // tooltipInterceptor when Atlaskit's React tooltip appears on hover.
-      // Intentionally NOT writing aria-label/title on the chip: doing so
-      // would overwrite Jira's own a11y label and pollute the name that
-      // extractSprintName reads on the next cycle.
       const stateSuffix = state === 'active' ? ' (restant)' : ' (planifié)';
       chip.dataset.momentumTooltip = `${sprintName} — ${Math.round(
         load,
       )} SP${stateSuffix} / ${Math.round(average)} SP moyenne (${Math.round(ratio * 100)}%)`;
     }
 
-    function paceLabel(paceState) {
-      if (paceState === 'behind') return 'en retard';
-      if (paceState === 'ahead') return 'en avance';
-      return 'dans les temps';
-    }
-
-    function ensurePaceMarker(overlay) {
-      let marker = overlay.querySelector(`:scope > .${OVERLAY_PACE_MARKER_CLASS}`);
-      if (!marker) {
-        marker = document.createElement('div');
-        marker.className = OVERLAY_PACE_MARKER_CLASS;
-        overlay.appendChild(marker);
-      }
-      return marker;
-    }
-
-    function removePaceMarker(overlay) {
-      const marker = overlay.querySelector(`:scope > .${OVERLAY_PACE_MARKER_CLASS}`);
-      if (marker) marker.remove();
-    }
-
-    async function decorate(chip, byKey, average) {
+    async function decorate(chip, byKey, average, boardId) {
       const name = extractSprintName(chip);
       if (!name) return null;
       const sprint = resolveSprint(name, byKey);
@@ -3744,21 +3753,43 @@
       const isRefresh = prev && prev.sprintId === sprint.id && prev.state === sprint.state;
       if (!isRefresh) decorated.set(chip, { sprintId: sprint.id, state: sprint.state });
 
+      // Active sprints: pull authoritative done / committed from the
+      // Sprint Report (matches Jira's Active Sprint widget). Falls back
+      // to the JQL-based capacity if the report is unavailable on this
+      // instance — same approach as the velocity computation.
+      if (sprint.state === 'active' && Number.isFinite(boardId)) {
+        try {
+          const report = await sprintReport.get(boardId, sprint.id);
+          if (report && report.committed > 0) {
+            if (isDebug() && !isRefresh) {
+              debug(
+                `sprint ${sprint.id} "${name}" (active): done=${report.done}/${report.committed} SP, avg=${average}`,
+              );
+            }
+            applyProgressionFill(chip, {
+              done: report.done,
+              committed: report.committed,
+              average,
+              sprintName: name,
+            });
+            return sprint;
+          }
+        } catch (e) {
+          warn(`sprint-report unavailable for sprint ${sprint.id}, falling back to JQL:`, e?.message || e);
+        }
+      }
+
       const capacity = await sprintCapacity.get(sprint.id, sprint.state);
       if (isDebug() && !isRefresh) {
         debug(
           `sprint ${sprint.id} "${name}" (${sprint.state}): load=${capacity.load} SP, avg=${average}`,
         );
       }
-      applyFill(chip, {
+      applyLoadFill(chip, {
         load: capacity.load,
-        total: capacity.total,
-        remaining: capacity.remaining,
         average,
         state: sprint.state,
         sprintName: name,
-        startDate: sprint.startDate || null,
-        endDate: sprint.endDate || null,
       });
       return sprint;
     }
@@ -5715,8 +5746,10 @@
     {
       id: 'sprint-fill-indicator',
       description:
-        'Fill overlay on each active/future sprint chip (Sprints row) keyed to the 5-sprint ' +
-        'average velocity. Active sprints show remaining SP; future sprints show planned SP.',
+        'Fill overlay on each active/future sprint chip (Sprints row). Active sprints show ' +
+        'progression (done / committed SP) from the Sprint Report — same numbers as Jira\'s ' +
+        'Active Sprint widget — with the chip tinted by engagement vs the 5-sprint velocity. ' +
+        'Future sprints show planned SP vs the 5-sprint average velocity.',
       isActive: isTimelineLikePath,
       _warnedZeroMatch: false,
       async onMutation(root) {
@@ -5743,7 +5776,7 @@
         // without duplicating the matching logic here.
         const outcomes = await Promise.all(
           chips.map((chip) =>
-            sprintChipDom.decorate(chip, byKey, ctx.average).catch((e) => {
+            sprintChipDom.decorate(chip, byKey, ctx.average, ctx.boardId).catch((e) => {
               warn('sprint decorate failed:', e?.message || e);
               return null;
             }),
@@ -6196,8 +6229,13 @@
     function onMutationConfirmed(url) {
       perfStamp(`api-mutation confirmed ${url.replace(/\?.*/, '')}`);
       const sprintId = extractSprintId(url);
-      if (sprintId) sprintCapacity.invalidate(sprintId);
-      else sprintCapacity.invalidateAll();
+      if (sprintId) {
+        sprintCapacity.invalidate(sprintId);
+        sprintReport.invalidate(sprintId);
+      } else {
+        sprintCapacity.invalidateAll();
+        sprintReport.invalidateAll();
+      }
       // Drop the 60 s meta + progress caches so the repaint below reads
       // post-mutation data instead of showing stale values until the TTL
       // lapses. When the URL carries an explicit issue key we invalidate
@@ -6398,7 +6436,7 @@
     // Initial pass (in case the timeline is already rendered at document-idle).
     runActiveFeatures();
     log(
-      'loaded — version 0.10.8',
+      'loaded — version 0.10.9',
       isDebug()
         ? '(debug on)'
         : '(debug off — enable with: localStorage.setItem(\'momentum-light-debug\', \'1\'))',
