@@ -1135,16 +1135,19 @@
   //
   // Returned shape:
   //   { done, committed, remaining }
-  //     - done       = completedIssuesEstimateSum
-  //     - remaining  = issuesNotCompletedEstimateSum
-  //     - committed  = done + remaining (i.e. what's *currently* in the
-  //                    sprint). We deliberately do NOT use
-  //                    allIssuesEstimateSum here: that field also
-  //                    includes punted issues and issues that started
-  //                    in this sprint but were completed in another,
-  //                    which makes the total drift away from Jira's
-  //                    Active Sprint widget. The widget reports "done /
-  //                    in-sprint" → so do we.
+  //     - done       = sum of SP across `completedIssues[]`
+  //     - remaining  = sum of SP across `issuesNotCompletedInCurrentSprint[]`
+  //     - committed  = done + remaining (what's *currently* in the
+  //                    sprint, excluding punted and "completed in another
+  //                    sprint" issues — same as Jira's Active Sprint
+  //                    widget).
+  //
+  // We iterate the per-issue arrays rather than reading the pre-aggregated
+  // `*EstimateSum` fields so we can apply the same filters Jira's widget
+  // applies: subtasks are excluded (they don't carry SP for the team's
+  // commitment), and `hidden` issues (filtered out by the board's saved
+  // filter) are skipped. Without those filters the totals drift above
+  // the widget's numbers.
   // ---------------------------------------------------------------------------
 
   const sprintReport = (() => {
@@ -1152,10 +1155,30 @@
     const cache = new Map(); // `${boardId}:${sprintId}` -> { expiresAt, value }
     const inflight = new Map();
 
-    function num(field) {
-      const raw = field?.value;
+    function issueSp(issue) {
+      // Greenhopper exposes SP via `estimateStatistic.statFieldValue.value`
+      // (current value) — `currentEstimateStatistic` is the same value on
+      // recent Jira versions; we read both to stay forward-compatible.
+      const raw =
+        issue?.estimateStatistic?.statFieldValue?.value ??
+        issue?.currentEstimateStatistic?.statFieldValue?.value;
       const n = typeof raw === 'number' ? raw : Number(raw);
-      return Number.isFinite(n) ? n : 0;
+      return Number.isFinite(n) && n > 0 ? n : 0;
+    }
+
+    function isSubtask(issue) {
+      const t = (issue?.typeName || '').toLowerCase();
+      return t === 'sub-task' || t === 'subtask' || t === 'sous-tâche' || t === 'sous-tache';
+    }
+
+    function sumSp(issues) {
+      let total = 0;
+      for (const issue of issues || []) {
+        if (issue?.hidden === true) continue;
+        if (isSubtask(issue)) continue;
+        total += issueSp(issue);
+      }
+      return total;
     }
 
     async function fetchStats(boardId, sprintId) {
@@ -1163,8 +1186,14 @@
         `/rest/greenhopper/1.0/rapid/charts/sprintreport?rapidViewId=${boardId}&sprintId=${sprintId}`,
       );
       const c = data?.contents || {};
-      const done = num(c.completedIssuesEstimateSum);
-      const remaining = num(c.issuesNotCompletedEstimateSum);
+      const done = sumSp(c.completedIssues);
+      const remaining = sumSp(c.issuesNotCompletedInCurrentSprint);
+      if (isDebug()) {
+        debug(
+          `sprint-report ${sprintId}: done=${done} (${(c.completedIssues || []).length} issues), ` +
+            `remaining=${remaining} (${(c.issuesNotCompletedInCurrentSprint || []).length} issues)`,
+        );
+      }
       return {
         done,
         remaining,
