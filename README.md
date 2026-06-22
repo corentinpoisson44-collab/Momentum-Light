@@ -31,6 +31,7 @@ Les mises à jour sont poussées automatiquement (Tampermonkey vérifie le `@upd
 | 7 | **Vue PM / Vue Business** — toggle segmenté dans le bandeau Momentum (en haut de la Timeline) qui bascule l'affichage des overlays d'Epic. La **Vue PM** garde le comportement historique (progression SP, chiffrage des tickets, badge T-Shirt, confiance). La **Vue Business** remplace chaque overlay d'Epic par sa **date d'atterrissage** (`duedate`) formatée en français, masque les overlays de tickets, et cache les légendes PM-only. Le choix est persisté dans `localStorage`. | ✅ v0.8.0 |
 | 8 | **Statut business 🟢🟡🔴** — en Vue Business, chaque barre d'Epic est recolorée selon son statut ternaire (`On Track` vert, `At Risk` orange, `Off Track` rouge, `Livré` gris). Calculé à partir de la `duedate`, de la projection de fin via la vélocité moyenne, de la confidence et de la status category — aucune nouvelle requête API. Le pourquoi du statut s'affiche dans la première ligne du tooltip (ex. `Statut : Off Track 🔴 — Fin estimée 15 juin 2026, due 30 mai 2026 (+16 j)`). | ✅ v0.9.0 |
 | 9 | **Export business-friendly (.png)** — en Vue Business, l'entrée `Image enrichie Momentum (.png)` produit une variante avec une bande titre `Roadmap Produit — T<n> <année>` et une légende des couleurs de statut composée au-dessus de la Timeline capturée. Le fichier est nommé `momentum-roadmap-business-<iso>.png`. En Vue PM, l'export reste strictement inchangé. | ✅ v0.9.0 |
+| 11 | **Indicateur Epic « On Hold »** — en Vue Business, une Epic dont le statut JIRA dénote une mise en pause (`On Hold`, `En attente`, `Suspendu`, `Standby`, `Gelé`…) voit sa barre **grisée (désaturée + atténuée)** avec un badge **⏸** épinglé à droite, pour qu'un scope figé recule visuellement sur la roadmap. Le signal est **transverse** : il se superpose au statut ternaire sans le remplacer (une Epic en pause peut rester `On Track` ou `Off Track` sur les dates). Le tooltip ajoute une première ligne `⏸ Epic en pause (<statut>)` et la légende gagne une entrée `En pause ⏸`. Aucune nouvelle requête API. | ✅ v0.11.0 |
 | 10 | **Statistiques de sprint (Backlog)** — sur la vue Backlog, chaque sprint (actif ou à venir) gagne un bouton `📊 Statistiques` dans son en-tête. Un clic déplie un panneau de camemberts SVG qui décomposent la composition du sprint selon les dimensions choisies par l'utilisateur : **Type** d'issue, **Statut** (À faire / En cours / Terminé), **Assigné**, et **Epic parente**. Toggle `Tickets ↔ SP` pour basculer la pondération. Les préférences (mode + dimensions cochées) et l'état ouvert/fermé de chaque panneau sont persistés dans `localStorage` pour survivre au refresh. Les camemberts sont dessinés en SVG natif (aucune nouvelle dépendance). | ✅ v0.10.0 |
 
 ### Configuration
@@ -48,6 +49,14 @@ Les mises à jour sont poussées automatiquement (Tampermonkey vérifie le `@upd
   }))
   ```
   Les clés sont matchées case-insensitive contre le nom trimé du statut ; les valeurs doivent être `'new'`, `'indeterminate'` ou `'done'`. Un override supplante tout (y compris une catégorie JIRA non-`new`). En mode debug (voir ci-dessous), chaque reclassification est loguée une fois pour faciliter la vérification.
+- **Statuts « On Hold » — indicateur de pause** : en Vue Business, Momentum-Light grise la barre des Epics en pause et y épingle un badge ⏸. Les motifs courants (FR + EN : `On Hold`, `En attente`, `Suspendu`, `Standby`, `Gelé`, `Parked`…) sont reconnus automatiquement. Pour un libellé maison non couvert, ajoutez-le via `localStorage` :
+  ```js
+  localStorage.setItem('momentum-light::on-hold-statuses', JSON.stringify([
+    'EN VEILLE',
+    'PARKING PRODUIT',
+  ]))
+  ```
+  La liste est matchée case-insensitive contre le nom trimé du statut. Ce signal est transverse au statut d'atterrissage (🟢🟡🔴) : il se superpose sans le remplacer.
 - **Debug** : `localStorage.setItem('momentum-light-debug', '1')` dans la console du navigateur.
 - **Relancer le guide How-to** : cliquez sur le bouton flottant `?` en bas à droite, ou exécutez `localStorage.removeItem('momentum-light::howto-seen')` puis rechargez la page pour forcer l'auto-lancement.
 

@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.10.9
-// @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur sur chaque chip de sprint (actif : progression fait/engagé issue du Sprint Report, teinté par engagement vs vélocité moyenne ; futur : charge planifiée vs vélocité moyenne), macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, menu « How-to » guidé qui surligne chaque feature au premier lancement, toggle « Vue PM / Vue Business » qui remplace les overlays de chiffrage par la date d'atterrissage (duedate) de chaque Epic, recoloration ternaire 🟢🟡🔴 (On Track / At Risk / Off Track / Livré) de chaque barre d'Epic en Vue Business calculée à partir de la duedate, de la projection vélocité et de la confidence, surcharge du menu Export → Image (.png) qui capture la Timeline au format natif (via html2canvas) avec tous les overlays Momentum-Light visibles dessus, et variante d'export business-friendly (en Vue Business) qui ajoute une bande titre + légende des couleurs de statut au-dessus de la Timeline capturée.
+// @version      0.11.0
+// @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur sur chaque chip de sprint (actif : progression fait/engagé issue du Sprint Report, teinté par engagement vs vélocité moyenne ; futur : charge planifiée vs vélocité moyenne), macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, menu « How-to » guidé qui surligne chaque feature au premier lancement, toggle « Vue PM / Vue Business » qui remplace les overlays de chiffrage par la date d'atterrissage (duedate) de chaque Epic, recoloration ternaire 🟢🟡🔴 (On Track / At Risk / Off Track / Livré) de chaque barre d'Epic en Vue Business calculée à partir de la duedate, de la projection vélocité et de la confidence, surcharge du menu Export → Image (.png) qui capture la Timeline au format natif (via html2canvas) avec tous les overlays Momentum-Light visibles dessus, variante d'export business-friendly (en Vue Business) qui ajoute une bande titre + légende des couleurs de statut au-dessus de la Timeline capturée, et indicateur « On Hold » qui grise la barre d'une Epic en pause (désaturée + badge ⏸) en Vue Business, transversalement au statut d'atterrissage.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
 // @run-at       document-idle
@@ -42,6 +42,7 @@
   const HOWTO_OVERLAY_ID = 'momentum-howto-overlay';
   const HOWTO_SEEN_KEY = 'momentum-light::howto-seen';
   const OVERLAY_TSHIRT_CLASS = 'momentum-progress__tshirt';
+  const OVERLAY_HOLD_CLASS = 'momentum-progress__hold';
   // View-mode toggle — "pm" (default, full chiffrage overlays) vs "business"
   // (Epic bars show only their landing date; ticket overlays are hidden).
   const VIEW_MODE_KEY = 'momentum-light::view-mode';
@@ -590,6 +591,74 @@
     /\btermin[eé]e?s?(?![a-zé])/i,
   ];
 
+  // ON HOLD detection — Epics explicitly paused/suspended. Orthogonal to
+  // the three-bucket statusCategory: an Epic "On Hold" can be early OR late
+  // on its dates, so the pause is a separate signal that doesn't override
+  // the ternary landing status — it layers on top of it (desaturated bar +
+  // ⏸ badge in the Business view). Matched against the raw status NAME
+  // (case-insensitive, FR + EN). Teams whose paused label isn't covered can
+  // extend the set via a localStorage list (matched case-insensitively
+  // against the trimmed status name):
+  //   localStorage.setItem(
+  //     'momentum-light::on-hold-statuses',
+  //     JSON.stringify(['GELÉ', 'PARKED', 'EN VEILLE']),
+  //   )
+  const STATUS_ON_HOLD_STORAGE_KEY = 'momentum-light::on-hold-statuses';
+  const STATUS_ON_HOLD_PATTERNS = [
+    /\bon\s*hold\b/i,
+    /\bpaused?\b/i,
+    /\bsuspend(?:ed|u)?\b/i,
+    /\bsuspendue?s?(?![a-zé])/i,
+    /\ben\s+(attente|pause|standby|veille)\b/i,
+    /\bstand[-\s]?by\b/i,
+    /\bgel[eé]e?s?(?![a-zé])/i,
+    /\bparked\b/i,
+  ];
+
+  // Cached parse of the localStorage on-hold list. Same invalidation
+  // strategy as the override map: re-parses transparently when the raw
+  // storage string changes (same-tab edits take effect without reload).
+  let _onHoldRaw = null;
+  let _onHoldParsed = [];
+  function readOnHoldOverrides() {
+    let raw = null;
+    try {
+      raw = localStorage.getItem(STATUS_ON_HOLD_STORAGE_KEY);
+    } catch (_) {
+      return [];
+    }
+    if (raw === _onHoldRaw) return _onHoldParsed;
+    _onHoldRaw = raw;
+    if (!raw) {
+      _onHoldParsed = [];
+      return _onHoldParsed;
+    }
+    try {
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) {
+        _onHoldParsed = [];
+        return _onHoldParsed;
+      }
+      _onHoldParsed = parsed
+        .filter((s) => typeof s === 'string')
+        .map((s) => s.trim().toUpperCase())
+        .filter(Boolean);
+      return _onHoldParsed;
+    } catch (_) {
+      if (isDebug()) debug('on-hold-statuses: invalid JSON, ignoring');
+      _onHoldParsed = [];
+      return _onHoldParsed;
+    }
+  }
+
+  // True when the raw status NAME denotes a paused/suspended Epic.
+  function isOnHoldStatus(statusName) {
+    const name = (statusName || '').trim();
+    if (!name) return false;
+    if (readOnHoldOverrides().includes(name.toUpperCase())) return true;
+    return STATUS_ON_HOLD_PATTERNS.some((re) => re.test(name));
+  }
+
   // Cached parse of the localStorage override map. Keyed by the raw
   // storage string so a user edit (same tab) still takes effect without
   // reloading — the cache invalidates transparently when the raw string
@@ -755,6 +824,7 @@
             isEpic,
             storyPoints: Number.isFinite(sp) ? sp : null,
             statusCategory,
+            statusName: issue.fields?.status?.name || null,
             tshirtSize,
             dueDate,
           });
@@ -765,6 +835,7 @@
             isEpic: false,
             storyPoints: null,
             statusCategory: null,
+            statusName: null,
             tshirtSize: null,
             dueDate: null,
           };
@@ -1781,6 +1852,48 @@
         padding-left: 32px;
       }
 
+      /* ON HOLD treatment (Business view) — orthogonal to the data-status
+         tint. The Epic is paused/suspended, so the bar should visibly
+         RECEDE: we desaturate the status colour to gray and dim it a
+         touch ("frozen" read) while the ⏸ badge names the state. Grayscale
+         leaves the near-white label and the near-black badge essentially
+         untouched (both are hue-neutral), so only the coloured tint fades
+         — the date text stays legible. Guarded against the ticket-estimate
+         and sprint-fill variants which have their own visual language. */
+      .${OVERLAY_CLASS}:not(.${OVERLAY_ESTIMATE_MOD}):not(.${OVERLAY_SPRINT_FILL_MOD})[data-on-hold] {
+        filter: grayscale(0.92) brightness(0.92);
+      }
+      /* ⏸ pill on the RIGHT edge (the T-Shirt badge already owns the left).
+         Slightly brighter than the T-Shirt badge so the pause reads as an
+         active annotation, not part of the dimmed bar. Sits below JIRA's
+         dependency link-icon (z-index 5) on the rare bar that has one. */
+      .${OVERLAY_HOLD_CLASS} {
+        position: absolute;
+        top: 50%;
+        right: 6px;
+        transform: translateY(-50%);
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 16px;
+        height: 14px;
+        padding: 0 4px;
+        border-radius: 7px;
+        background: rgba(9, 30, 66, 0.55);
+        color: rgba(255, 255, 255, 0.95);
+        font-size: 9px;
+        line-height: 1;
+        z-index: 3;
+        box-sizing: border-box;
+        pointer-events: none;
+        white-space: nowrap;
+      }
+      /* Reserve a little right-padding on the (centered) landing-date label
+         so the date and the ⏸ pill don't overlap on narrow bars. */
+      .${OVERLAY_CLASS}[data-on-hold] .${OVERLAY_LABEL_CLASS} {
+        padding-right: 28px;
+      }
+
       /* Sprint-fill variant: a full-height translucent wash that covers the
          chip's body, so the fill level reads at a glance across the whole
          button while the chip's own text ("FHSBFF Sprint 53…") stays fully
@@ -2073,6 +2186,18 @@
       .${STATUS_LEGEND_CLASS}__swatch[data-status="off-track"] { background-color: #DE350B; }
       .${STATUS_LEGEND_CLASS}__swatch[data-status="delivered"] { background-color: #6B778C; }
       .${STATUS_LEGEND_CLASS}__swatch[data-status="unsized"] { background-color: #42526E; }
+      /* On-hold legend swatch — a desaturated gray carrying the ⏸ glyph,
+         mirroring the "frozen" read of a paused Epic bar (grayscale tint +
+         pause badge). It's a flag layered on any status, not a 6th status. */
+      .${STATUS_LEGEND_CLASS}__swatch[data-status="on-hold"] {
+        background-color: #8993A4;
+        color: #fff;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 8px;
+        line-height: 1;
+      }
 
       /* ---------------------------------------------------------------------
        * View toggle — segmented "Vue PM / Vue Business" chip that lives in
@@ -3095,7 +3220,7 @@
 
     function applyProgress(
       bar,
-      { done, total, epicKey, childStats, confidence, statusCategory, tshirtSize, view, dueDate },
+      { done, total, epicKey, childStats, confidence, statusCategory, statusName, tshirtSize, view, dueDate },
     ) {
       const stats = childStats || { done: 0, inProgress: 0, todo: 0, unestimated: 0, totalChildren: 0 };
       const isOpen = statusCategory === 'new';
@@ -3265,6 +3390,34 @@
         delete overlay.dataset.status;
       }
 
+      // --- ON HOLD flag -------------------------------------------------
+      // Orthogonal to the ternary status: an Epic explicitly paused /
+      // suspended reads as "frozen" whatever its date/risk profile, so we
+      // layer the signal ON TOP of data-status rather than replacing it.
+      // Business view only — the PM view already exposes the raw workflow
+      // status elsewhere and doesn't recolour bars by status. The CSS
+      // desaturates the bar (grayscale + dimmed) so paused scope visibly
+      // recedes on the roadmap; the ⏸ badge names it explicitly.
+      const onHold = isBusiness && isOnHoldStatus(statusName);
+      if (onHold) {
+        overlay.dataset.onHold = '';
+      } else {
+        delete overlay.dataset.onHold;
+      }
+      let holdBadge = overlay.querySelector(`.${OVERLAY_HOLD_CLASS}`);
+      if (onHold) {
+        if (!holdBadge) {
+          holdBadge = document.createElement('span');
+          holdBadge.className = OVERLAY_HOLD_CLASS;
+          overlay.appendChild(holdBadge);
+        }
+        // Glyph-only pill — the full "En pause" wording lives in the
+        // tooltip so the badge stays readable on narrow bars.
+        holdBadge.textContent = '⏸';
+      } else if (holdBadge) {
+        holdBadge.remove();
+      }
+
       // Tooltip text — the interceptor (installed at bootstrap) will rewrite
       // JIRA's Atlaskit tooltip with this value when it appears on hover.
       // aria-label and title are set as accessibility/fallback hints.
@@ -3310,8 +3463,14 @@
             ? `Statut : ${STATUS_LABEL[businessStatus.status] || businessStatus.status} — ${businessStatus.reason}`
             : `Statut : ${STATUS_LABEL[businessStatus.status] || businessStatus.status}`)
         : null;
+      // En-pause se lit avant tout le reste : c'est l'info qui qualifie
+      // l'ensemble des autres signaux (« cet atterrissage est figé »).
+      const holdLine = onHold
+        ? `⏸ Epic en pause${statusName ? ` (${statusName})` : ''}`
+        : null;
       const tooltipLines = isBusiness
         ? [
+            holdLine,
             statusLine,
             `${epicKey} — ${landingLine}`,
             pmHeader,
@@ -3449,6 +3608,7 @@
           childStats,
           confidence,
           statusCategory: meta.statusCategory,
+          statusName: meta.statusName,
           tshirtSize: meta.tshirtSize,
           view,
           dueDate: meta.dueDate,
@@ -4019,19 +4179,22 @@
         '  • At Risk : dérive ≤ 2 semaines ou fiabilité à confirmer\n' +
         '  • Off Track : dérive > 2 semaines ou duedate dépassée\n' +
         '  • Livré : Epic en catégorie Done\n' +
-        '  • Sans sizing : Epic sans T-Shirt size (scope à chiffrer)';
+        '  • Sans sizing : Epic sans T-Shirt size (scope à chiffrer)\n' +
+        '  • En pause : Epic « On Hold » — barre grisée, signal transverse';
       const items = [
         { status: 'on-track', label: 'On Track' },
         { status: 'at-risk', label: 'At Risk' },
         { status: 'off-track', label: 'Off Track' },
         { status: 'delivered', label: 'Livré' },
         { status: 'unsized', label: 'Sans sizing' },
+        // Flag layered on top of any status — desaturated bar + ⏸ badge.
+        { status: 'on-hold', label: 'En pause', glyph: '⏸' },
       ];
       const itemsHtml = items
         .map(
           (it) =>
             `<span class="${STATUS_LEGEND_CLASS}__item">` +
-              `<span class="${STATUS_LEGEND_CLASS}__swatch" data-status="${it.status}"></span>${it.label}` +
+              `<span class="${STATUS_LEGEND_CLASS}__swatch" data-status="${it.status}">${it.glyph || ''}</span>${it.label}` +
             `</span>`,
         )
         .join('');
