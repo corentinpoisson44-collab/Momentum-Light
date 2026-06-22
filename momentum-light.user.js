@@ -174,41 +174,20 @@
   }
 
   // ---------------------------------------------------------------------------
-  // viewMode — "pm" (default) vs "business". Persisted in localStorage so a
-  // refresh keeps the toggle where the user left it. Consumers subscribe via
-  // `onChange(cb)` — the velocity banner re-paints its toggle, and the main
-  // bootstrap re-runs the feature pipeline so every Epic bar is re-decorated
-  // under the new mode without waiting for the next DOM mutation.
+  // viewMode — Business only. The PM view (and its toggle) has been removed;
+  // the script now always renders the Business view. `get()` is kept so the
+  // existing isBusiness branches keep resolving to the Business path, and
+  // `onChange`/`syncBody` stay as no-op-friendly stubs for the few callers
+  // that still reference them.
   // ---------------------------------------------------------------------------
   const viewMode = (() => {
-    const listeners = new Set();
-    function read() {
-      try {
-        const v = localStorage.getItem(VIEW_MODE_KEY);
-        return v === VIEW_MODE_BUSINESS ? VIEW_MODE_BUSINESS : VIEW_MODE_PM;
-      } catch (_) {
-        return VIEW_MODE_PM;
-      }
-    }
-    let current = read();
+    const current = VIEW_MODE_BUSINESS;
     function syncBody() {
       if (document.body) document.body.dataset.momentumView = current;
     }
     function get() { return current; }
-    function set(next) {
-      if (next !== VIEW_MODE_PM && next !== VIEW_MODE_BUSINESS) return;
-      if (next === current) return;
-      current = next;
-      try { localStorage.setItem(VIEW_MODE_KEY, next); } catch (_) { /* private mode */ }
-      syncBody();
-      for (const cb of listeners) {
-        try { cb(current); } catch (e) { warn('viewMode listener error:', e?.message || e); }
-      }
-    }
-    function onChange(cb) {
-      listeners.add(cb);
-      return () => listeners.delete(cb);
-    }
+    function set() { /* PM view removed — Business is the only mode. */ }
+    function onChange() { return () => {}; }
     return { get, set, onChange, syncBody };
   })();
 
@@ -4203,64 +4182,14 @@
       return legend;
     }
 
-    function buildViewToggle() {
-      // Single toggle button: clicking anywhere on the chip swaps modes.
-      // A <button> root makes keyboard activation (Enter/Space) free and
-      // gives us a native focus ring. The two inner segments are pure
-      // visual labels that reflect the current selection via
-      // [data-active], not independent click targets.
-      const wrapper = document.createElement('button');
-      wrapper.type = 'button';
-      wrapper.className = VIEW_TOGGLE_CLASS;
-      wrapper.title =
-        'Cliquez pour basculer entre Vue PM et Vue Business.\n' +
-        'Vue PM : progression, chiffrage SP et badges T-Shirt.\n' +
-        'Vue Business : date d\'atterrissage (duedate) de chaque Epic.';
-      const segments = [];
-      for (const { view, label } of [
-        { view: VIEW_MODE_PM, label: 'Vue PM' },
-        { view: VIEW_MODE_BUSINESS, label: 'Vue Business' },
-      ]) {
-        const seg = document.createElement('span');
-        seg.className = `${VIEW_TOGGLE_CLASS}__btn`;
-        seg.dataset.view = view;
-        seg.textContent = label;
-        wrapper.appendChild(seg);
-        segments.push(seg);
-      }
-      wrapper.addEventListener('click', () => {
-        const next = viewMode.get() === VIEW_MODE_PM ? VIEW_MODE_BUSINESS : VIEW_MODE_PM;
-        viewMode.set(next);
-      });
-      function sync() {
-        const active = viewMode.get();
-        wrapper.dataset.view = active;
-        wrapper.setAttribute(
-          'aria-label',
-          active === VIEW_MODE_PM
-            ? 'Vue PM active — cliquer pour basculer en Vue Business'
-            : 'Vue Business active — cliquer pour basculer en Vue PM',
-        );
-        for (const seg of segments) {
-          seg.dataset.active = seg.dataset.view === active ? '1' : '0';
-        }
-      }
-      sync();
-      viewMode.onChange(sync);
-      return wrapper;
-    }
-
     function build(mode) {
       const wrapper = document.createElement('div');
       wrapper.id = VELOCITY_BANNER_ID;
       wrapper.dataset.anchor = mode;
       wrapper.appendChild(buildSizeLegend());
       wrapper.appendChild(buildLegend());
-      // Status legend (Business view only) — hidden by CSS in Vue PM via
-      // body[data-momentum-view]. Always mounted so the ordering in the
-      // banner stays stable across toggles (no remount flicker).
+      // Status legend — always shown now that Business is the only view.
       wrapper.appendChild(buildStatusLegend());
-      wrapper.appendChild(buildViewToggle());
       const chip = document.createElement('span');
       chip.className = 'momentum-velocity-banner__chip';
       chip.title = 'Cliquez pour rafraîchir';
