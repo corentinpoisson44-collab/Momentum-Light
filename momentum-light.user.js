@@ -34,6 +34,11 @@
   const OVERLAY_LABEL_CLASS = 'momentum-progress__label';
   const OVERLAY_ESTIMATE_MOD = 'momentum-progress--estimate';
   const OVERLAY_SPRINT_FILL_MOD = 'momentum-progress--sprint-fill';
+  // Vertical "time elapsed" cursor laid over the sprint-fill overlay on the
+  // active sprint chip. Position is `(now - startDate) / (endDate - startDate)`,
+  // clamped to [0, 100] %. Lets the eye compare time-elapsed against
+  // work-completed (the fill width) at a glance.
+  const OVERLAY_TIME_CURSOR_CLASS = 'momentum-progress__time-cursor';
   const VELOCITY_BANNER_ID = 'momentum-velocity-banner';
   const CONFIDENCE_LEGEND_CLASS = 'momentum-confidence-legend';
   const SIZE_LEGEND_CLASS = 'momentum-size-legend';
@@ -1174,6 +1179,10 @@
         // projected end date to the Epic's duedate. Falls back to startDate
         // when JIRA hasn't set an endDate (rare on configured boards).
         endDate: s.endDate || s.startDate || null,
+        // startDate powers the time-remaining cursor on the active sprint
+        // chip — we render a thin vertical marker at `(now-start)/(end-start)`
+        // so users can read time-elapsed against work-completed at a glance.
+        startDate: s.startDate || null,
       }));
 
       return { average, sprints: perSprint, boardId, openSprints: openLite };
@@ -1947,6 +1956,26 @@
          exact numbers live in the tooltip via dataset.momentumTooltip. */
       .${OVERLAY_SPRINT_FILL_MOD} .${OVERLAY_LABEL_CLASS} {
         display: none;
+      }
+      /* Time-elapsed cursor on the active sprint chip. A 2px vertical bar
+         positioned via "left: <pct>%" along the chip body. The white outer
+         shadow keeps it readable even when it sits right on the trailing
+         edge of the fill, where contrast is weakest. The cursor reads as
+         "where we should be" while the fill reads as "where we are" — the
+         gap between the two is the visual signal. The parent overlay
+         clips with overflow:hidden, so we keep the cursor strictly inside
+         the chip's rounded rectangle (no top flag). */
+      .${OVERLAY_TIME_CURSOR_CLASS} {
+        position: absolute;
+        top: 1px;
+        bottom: 1px;
+        width: 2px;
+        margin-left: -1px;
+        background: rgba(23, 43, 77, 0.9);
+        box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.7);
+        border-radius: 1px;
+        pointer-events: none;
+        z-index: 2;
       }
       /* Full-width sticky banner anchored at the top of the plan's main
          content area. "pointer-events: none" on the wrapper lets clicks
@@ -3840,12 +3869,55 @@
       return 'over';
     }
 
+    // Compute the "time elapsed" ratio for an active sprint based on its
+    // start/end timestamps. Returns null when the dates are missing or
+    // pathological (zero/negative duration) so callers can skip the cursor
+    // gracefully. The ratio is NOT clamped here — callers clamp at render
+    // time so they can still surface the raw value in the tooltip.
+    function timeElapsedRatio(startDate, endDate, now = Date.now()) {
+      if (!startDate || !endDate) return null;
+      const start = new Date(startDate).getTime();
+      const end = new Date(endDate).getTime();
+      if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return null;
+      return (now - start) / (end - start);
+    }
+
+    function ensureTimeCursor(overlay) {
+      let cursor = overlay.querySelector(`:scope > .${OVERLAY_TIME_CURSOR_CLASS}`);
+      if (cursor) return cursor;
+      cursor = document.createElement('div');
+      cursor.className = OVERLAY_TIME_CURSOR_CLASS;
+      overlay.appendChild(cursor);
+      return cursor;
+    }
+
+    function removeTimeCursor(overlay) {
+      const cursor = overlay.querySelector(`:scope > .${OVERLAY_TIME_CURSOR_CLASS}`);
+      if (cursor) cursor.remove();
+    }
+
+    // Format a ms duration into a short FR string ("3 j", "5 h", "12 min")
+    // for the tooltip's "temps restant" hint. Past-due sprints surface as
+    // "0 j" so the tooltip stays compact — the % itself reads >100 % and
+    // tells the rest of the story.
+    function formatRemaining(ms) {
+      if (!Number.isFinite(ms) || ms <= 0) return '0 j';
+      const minutes = Math.floor(ms / 60000);
+      if (minutes < 60) return `${minutes} min`;
+      const hours = Math.floor(minutes / 60);
+      if (hours < 24) return `${hours} h`;
+      const days = Math.floor(hours / 24);
+      return `${days} j`;
+    }
+
     // Active-sprint mode: fill width = progression (done / committed),
     // colour = engagement vs velocity (committed / avg). The two signals
     // are decoupled so a 30 % filled bar tinted orange reads as "early
     // sprint, but already overcommitted" — exactly the dual signal the
-    // timeline needs.
-    function applyProgressionFill(chip, { done, committed, average, sprintName }) {
+    // timeline needs. When start/end dates are known, a vertical cursor
+    // also marks "where we should be" by elapsed time, so the gap with
+    // the fill width tells the on-track / behind story instantly.
+    function applyProgressionFill(chip, { done, committed, average, sprintName, startDate, endDate }) {
       if (!Number.isFinite(done) || !Number.isFinite(committed) || committed <= 0) {
         removeOverlay(chip);
         delete chip.dataset.momentumTooltip;
@@ -3861,12 +3933,27 @@
       if (fill) fill.style.width = `${pct.toFixed(1)}%`;
       if (label) label.textContent = '';
 
+      const elapsed = timeElapsedRatio(startDate, endDate);
+      if (elapsed !== null) {
+        const cursor = ensureTimeCursor(overlay);
+        const cursorPct = Math.max(0, Math.min(100, elapsed * 100));
+        cursor.style.left = `${cursorPct.toFixed(1)}%`;
+      } else {
+        removeTimeCursor(overlay);
+      }
+
       const parts = [
         `${sprintName} — ${Math.round(done)} / ${Math.round(committed)} SP fait (${Math.round(progressionRatio * 100)}%)`,
       ];
       if (Number.isFinite(average) && average > 0) {
         parts.push(
           `engagement ${Math.round(committed)} SP vs vélocité moyenne ${Math.round(average)} SP (${Math.round(engagementRatio * 100)}%)`,
+        );
+      }
+      if (elapsed !== null && endDate) {
+        const remainingMs = new Date(endDate).getTime() - Date.now();
+        parts.push(
+          `temps écoulé ${Math.round(Math.max(0, Math.min(1, elapsed)) * 100)}% · reste ${formatRemaining(remainingMs)}`,
         );
       }
       chip.dataset.momentumTooltip = parts.join(' · ');
@@ -3890,6 +3977,9 @@
       const label = overlay.querySelector(`.${OVERLAY_LABEL_CLASS}`);
       if (fill) fill.style.width = `${pct.toFixed(1)}%`;
       if (label) label.textContent = '';
+      // Time cursor only makes sense against a "done / committed" fill —
+      // strip any leftover cursor when this chip falls back to load mode.
+      removeTimeCursor(overlay);
 
       const stateSuffix = state === 'active' ? ' (restant)' : ' (planifié)';
       chip.dataset.momentumTooltip = `${sprintName} — ${Math.round(
@@ -3931,6 +4021,8 @@
               committed: report.committed,
               average,
               sprintName: name,
+              startDate: sprint.startDate,
+              endDate: sprint.endDate,
             });
             return sprint;
           }
