@@ -5307,13 +5307,20 @@
   // Data model (read from the API, not from a screenshot):
   //   - Epics      = visible issues classified as Epic (same heuristic as
   //                  issueMeta). Build period = Epic start date → due date.
-  //   - Disco      = visible non-Epic children of a visible Epic (the user
-  //                  filters the view down to the discovery tasks). Several
-  //                  disco children are merged into one span. A disco task
-  //                  with no dates is drawn as an estimate: the 2 weeks right
-  //                  before the build starts, labelled « Disco (est.) ».
-  //   - Milestones = unreleased/released versions of the Epics' projects whose
-  //                  releaseDate falls inside the drawn period.
+  //   - Disco      = visible non-Epic rows attached to a visible Epic (the user
+  //                  filters the view down to the discovery tasks). Attached =
+  //                  `parent` points at the Epic, or, failing that, the row sits
+  //                  under the Epic on the Timeline (covers classic "Epic Link"
+  //                  setups). Several disco rows are merged into one span.
+  //                  Dates: start/due, else the dates of the ticket's sprint(s)
+  //                  (what Plans draws when no explicit date is set), else an
+  //                  estimate — the 2 weeks right before the build starts,
+  //                  labelled « Disco (est.) ».
+  //   - Period     = one quarter (the current one by default). Bars that
+  //                  overflow it are clipped with a « → date » marker.
+  //   - Milestones = versions of the Epics' projects dated inside the quarter,
+  //                  filtered by name (default: Go-Live only) to keep the
+  //                  slide readable.
   //
   // Rendering is done straight on a 2D canvas (no html2canvas, no SVG → image
   // round-trip) so fonts, truncation and colours are deterministic.
@@ -5321,6 +5328,9 @@
   // Optional overrides (localStorage):
   //   momentum-light::ppt-title      → title of the image (default « Roadmap produit »)
   //   momentum-light::ppt-start-field → custom field id for the start date
+  //   momentum-light::ppt-quarter    → '2027-T1', 'next' or 'previous' (default: current quarter)
+  //   momentum-light::ppt-milestones → regex on version names (default 'go[- ]?live'),
+  //                                    '*' = all versions, '' = none
   // ---------------------------------------------------------------------------
 
   const pptRoadmap = (() => {
@@ -5355,6 +5365,34 @@
       const d = new Date(ms);
       return `T${Math.floor(d.getUTCMonth() / 3) + 1} ${d.getUTCFullYear()}`;
     };
+
+    function quarterBounds(ref) {
+      const raw = (localStorage.getItem('momentum-light::ppt-quarter') || '').trim().toLowerCase();
+      const d = new Date(ref);
+      let y = d.getUTCFullYear();
+      let q = Math.floor(d.getUTCMonth() / 3);
+      const m = raw.match(/^(\d{4})\s*-?\s*[tq]([1-4])$/);
+      if (m) { y = +m[1]; q = +m[2] - 1; } else if (raw === 'next') q += 1; else if (raw === 'previous') q -= 1;
+      const start = Date.UTC(y, q * 3, 1);
+      const end = Date.UTC(y, q * 3 + 3, 1); // exclusive
+      return { start, end };
+    }
+
+    function milestoneFilter() {
+      let raw = null;
+      try { raw = localStorage.getItem('momentum-light::ppt-milestones'); } catch (_) { /* default */ }
+      if (raw == null) raw = 'go[- ]?live';
+      raw = raw.trim();
+      if (raw === '') return () => false;
+      if (raw === '*') return () => true;
+      try {
+        const rx = new RegExp(raw, 'i');
+        return (name) => rx.test(name);
+      } catch (_) {
+        warn('ppt: invalid milestone regex, using default:', raw);
+        return (name) => /go[- ]?live/i.test(name);
+      }
+    }
 
     // ---- data ------------------------------------------------------------
     async function resolveStartFields() {
@@ -5404,8 +5442,12 @@
     }
 
     async function fetchIssues(keys) {
-      const startFields = await resolveStartFields().catch(() => []);
+      const [startFields, sprintFieldId] = await Promise.all([
+        resolveStartFields().catch(() => []),
+        sprintField.resolve().catch(() => null),
+      ]);
       const fields = ['summary', 'issuetype', 'status', 'duedate', 'parent', 'project', ...startFields];
+      if (sprintFieldId) fields.push(sprintFieldId);
       const out = [];
       for (let i = 0; i < keys.length; i += 100) {
         const chunk = keys.slice(i, i + 100);
@@ -5420,31 +5462,63 @@
         }
         return null;
       };
-      return out.map((issue) => ({
-        key: issue.key,
-        summary: issue.fields?.summary || issue.key,
-        isEpic: isEpicIssue(issue),
-        parentKey: issue.fields?.parent?.key || null,
-        projectKey: issue.fields?.project?.key || issue.key.split('-')[0],
-        start: startOf(issue),
-        due: parseDay(issue.fields?.duedate),
-      }));
+      // Plans draws a ticket without explicit dates over its sprint(s).
+      const sprintSpan = (issue) => {
+        const sprints = sprintFieldId ? issue.fields?.[sprintFieldId] : null;
+        if (!Array.isArray(sprints) || !sprints.length) return null;
+        let a = null;
+        let b = null;
+        for (const sp of sprints) {
+          const sa = parseDay(sp?.startDate);
+          const sb = parseDay(sp?.endDate);
+          if (sa != null) a = a == null ? sa : Math.min(a, sa);
+          if (sb != null) b = b == null ? sb : Math.max(b, sb);
+        }
+        return a != null || b != null ? { a, b } : null;
+      };
+      return out.map((issue) => {
+        let start = startOf(issue);
+        let due = parseDay(issue.fields?.duedate);
+        const sp = sprintSpan(issue);
+        if (sp) {
+          if (start == null) start = sp.a;
+          if (due == null) due = sp.b;
+        }
+        return {
+          key: issue.key,
+          summary: issue.fields?.summary || issue.key,
+          isEpic: isEpicIssue(issue),
+          parentKey: issue.fields?.parent?.key || null,
+          projectKey: issue.fields?.project?.key || issue.key.split('-')[0],
+          start,
+          due,
+        };
+      });
     }
 
     async function fetchMilestones(projectKeys) {
       const all = [];
+      const keep = milestoneFilter();
       for (const pk of projectKeys) {
         try {
           const versions = await jiraApi.request(`/rest/api/3/project/${encodeURIComponent(pk)}/versions`);
           for (const v of versions || []) {
             const d = parseDay(v.releaseDate);
-            if (d != null && !v.archived) all.push({ date: d, label: v.name });
+            if (d != null && !v.archived && keep(v.name || '')) all.push({ date: d, label: v.name });
           }
         } catch (e) {
           warn('ppt: versions unavailable for', pk, e?.message || e);
         }
       }
-      return all.sort((a, b) => a.date - b.date);
+      const seen = new Set();
+      return all
+        .sort((a, b) => a.date - b.date)
+        .filter((m) => {
+          const id = `${m.date}|${m.label}`;
+          if (seen.has(id)) return false;
+          seen.add(id);
+          return true;
+        });
     }
 
     function buildModel(issues, order) {
@@ -5452,10 +5526,17 @@
       const epics = order.map((k) => byKey.get(k)).filter((i) => i && i.isEpic);
       const epicKeys = new Set(epics.map((e) => e.key));
       const discoByEpic = new Map();
-      for (const i of issues) {
-        if (i.isEpic || !i.parentKey || !epicKeys.has(i.parentKey)) continue;
-        if (!discoByEpic.has(i.parentKey)) discoByEpic.set(i.parentKey, []);
-        discoByEpic.get(i.parentKey).push(i);
+      let currentEpic = null;
+      for (const k of order) {
+        const i = byKey.get(k);
+        if (!i) continue;
+        if (i.isEpic) { currentEpic = i.key; continue; }
+        // `parent` first; otherwise the Epic the row is nested under on the
+        // Timeline (classic projects link via "Epic Link", not `parent`).
+        const owner = i.parentKey && epicKeys.has(i.parentKey) ? i.parentKey : currentEpic;
+        if (!owner) continue;
+        if (!discoByEpic.has(owner)) discoByEpic.set(owner, []);
+        discoByEpic.get(owner).push(i);
       }
       return epics.map((e) => {
         let buildStart = e.start;
@@ -5479,6 +5560,9 @@
           }
           if (a != null) disco = { a, b, estimated: false };
           else if (build) disco = { a: build.a - DISCO_DEFAULT_DAYS * DAY, b: build.a - DAY, estimated: true };
+        }
+        if (kids.length && !disco) {
+          debug(`ppt: ${e.key} — disco ${kids.map((k) => k.key).join(', ')} sans date ni sprint, et Epic sans dates de build`);
         }
         // Lone due date: show it as a delivery point even without a start.
         const dueOnly = !build && e.due != null ? e.due : null;
@@ -5540,22 +5624,19 @@
       return out;
     }
 
-    function render(rows, milestonesAll) {
+    function render(allRows, milestonesAll) {
       const today = todayUtc();
-      // Period: every drawn date, padded a few days, starting on a Monday.
-      const dates = [];
-      for (const r of rows) {
-        if (r.build) dates.push(r.build.a, r.build.b);
-        if (r.disco) dates.push(r.disco.a, r.disco.b);
-        if (r.dueOnly != null) dates.push(r.dueOnly);
-      }
-      if (!dates.length) dates.push(today, today + 28 * DAY);
-      let d0 = Math.min(...dates) - 3 * DAY;
-      const dow = (new Date(d0).getUTCDay() + 6) % 7;
-      d0 -= dow * DAY;
-      let d1 = Math.max(...dates) + 4 * DAY;
-      if (d1 - d0 < 28 * DAY) d1 = d0 + 28 * DAY;
-      const milestones = milestonesAll.filter((m) => m.date >= d0 && m.date <= d1);
+      // Period: one quarter. Epics entirely outside it are left out; undated
+      // Epics stay (« Dates à planifier ») so nothing silently disappears.
+      const { start: d0, end: d1 } = quarterBounds(today);
+      const overlaps = (a, b) => a < d1 && b + DAY > d0;
+      const rows = allRows.filter((r) => {
+        if (!r.build && !r.disco && r.dueOnly == null) return true;
+        return (r.build && overlaps(r.build.a, r.build.b))
+          || (r.disco && overlaps(r.disco.a, r.disco.b))
+          || (r.dueOnly != null && r.dueOnly >= d0);
+      });
+      const milestones = milestonesAll.filter((m) => m.date >= d0 && m.date < d1);
 
       const W = 1280;
       const L = 300;
@@ -5576,14 +5657,12 @@
 
       // Title
       const title = localStorage.getItem('momentum-light::ppt-title') || 'Roadmap produit';
-      const q0 = quarterLabel(Math.min(...dates));
-      const q1 = quarterLabel(Math.max(...dates));
       ctx.fillStyle = INK;
       ctx.font = font(28, 800);
       ctx.fillText(title, 36, 50);
       ctx.fillStyle = INK_SOFT;
       ctx.font = font(15, 400);
-      ctx.fillText(`${q0 === q1 ? q0 : `${q0} – ${q1}`} · Discovery en clair, build en plein · échéance au bout`, 36, 76);
+      ctx.fillText(`${quarterLabel(d0)} · Discovery en clair, build en plein · échéance au bout`, 36, 76);
 
       // Legend (top right)
       ctx.font = font(13, 600);
@@ -5644,7 +5723,7 @@
       if (!rows.length) {
         ctx.fillStyle = INK_SOFT;
         ctx.font = font(15, 400);
-        ctx.fillText('Aucune Epic visible sur la Timeline.', L, top + 32);
+        ctx.fillText('Aucune Epic sur ce trimestre.', L, top + 32);
       }
       rows.forEach((r, i) => {
         const c = PALETTE[i % PALETTE.length];
@@ -5664,6 +5743,14 @@
 
         const BAR_H = 28;
         const y = mid - BAR_H / 2;
+        const xL = X(d0);
+        const xR = X(d1);
+
+        // Bars are clipped to the quarter; labels stay inside the visible part.
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(xL, 0, xR - xL, H);
+        ctx.clip();
 
         if (r.disco) {
           const x0 = X(r.disco.a);
@@ -5680,9 +5767,11 @@
           ctx.setLineDash([]);
           ctx.font = font(12, 700);
           const lbl = r.disco.estimated ? 'Disco (est.)' : 'Disco';
-          if (ctx.measureText(lbl).width + 22 < x1 - x0) {
+          const lx = Math.max(x0, xL) + 12;
+          const visibleEnd = Math.min(x1, r.build ? X(r.build.a) : x1, xR);
+          if (ctx.measureText(lbl).width + 10 < visibleEnd - lx) {
             ctx.fillStyle = c;
-            ctx.fillText(lbl, x0 + 12, mid + 4);
+            ctx.fillText(lbl, lx, mid + 4);
           }
         }
 
@@ -5694,19 +5783,26 @@
           ctx.fillStyle = c;
           ctx.fill();
           const weeks = Math.max(1, Math.round((r.build.b - r.build.a + DAY) / (7 * DAY)));
+          const lx = Math.max(x0, xL) + 14;
+          const room = Math.min(x0 + w, xR) - lx;
           ctx.font = font(12, 700);
           let lbl = `${weeks} semaine${weeks > 1 ? 's' : ''}`;
-          if (ctx.measureText(lbl).width + 28 > w) lbl = `${weeks} sem`;
-          if (ctx.measureText(lbl).width + 24 < w) {
+          if (ctx.measureText(lbl).width + 14 > room) lbl = `${weeks} sem`;
+          if (ctx.measureText(lbl).width + 10 < room) {
             ctx.fillStyle = '#FFFFFF';
-            ctx.fillText(lbl, x0 + 14, mid + 4);
+            ctx.fillText(lbl, lx, mid + 4);
           }
         }
+        ctx.restore();
 
-        const endX = r.build ? X(r.build.b + DAY) : (r.dueOnly != null ? X(r.dueOnly + DAY) : null);
         const endDay = r.build ? r.build.b : r.dueOnly;
-        if (endX != null) {
-          const dx = endX + 14;
+        if (endDay != null && endDay >= d1) {
+          // Delivery after the quarter: arrow + date in the right margin.
+          ctx.fillStyle = c;
+          ctx.font = font(13, 800);
+          ctx.fillText(`→ ${fmtDay(endDay)}`, xR + 10, mid + 5);
+        } else if (endDay != null && endDay >= d0) {
+          const dx = X(endDay + DAY) + 14;
           ctx.fillStyle = c;
           ctx.beginPath();
           ctx.moveTo(dx, mid - 8);
@@ -5718,7 +5814,7 @@
           ctx.fillStyle = INK;
           ctx.font = font(13, 800);
           ctx.fillText(fmtDay(endDay), dx + 14, mid + 5);
-        } else if (!r.disco) {
+        } else if (!r.disco && !r.build) {
           ctx.fillStyle = INK_FAINT;
           ctx.font = font(13, 400);
           ctx.fillText('Dates à planifier', L, mid + 5);
@@ -5834,7 +5930,7 @@
       );
     }
 
-    return { copyToClipboard, _render: render, _buildModel: buildModel };
+    return { copyToClipboard, _buildCanvas: buildCanvas };
   })();
 
   // ---------------------------------------------------------------------------
