@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.14.0
+// @version      0.14.1
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur sur chaque chip de sprint (actif : progression fait/engagé issue du Sprint Report, teinté par engagement vs vélocité moyenne ; futur : charge planifiée vs vélocité moyenne), macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, menu « How-to » guidé qui surligne chaque feature au premier lancement, toggle « Vue PM / Vue Business » qui remplace les overlays de chiffrage par la date d'atterrissage (duedate) de chaque Epic, recoloration ternaire 🟢🟡🔴 (On Track / At Risk / Off Track / Livré) de chaque barre d'Epic en Vue Business calculée à partir de la duedate, de la projection vélocité et de la confidence, surcharge du menu Export → Image (.png) qui capture la Timeline au format natif (via html2canvas) avec tous les overlays Momentum-Light visibles dessus, variante d'export business-friendly (en Vue Business) qui ajoute une bande titre + légende des couleurs de statut au-dessus de la Timeline capturée, et indicateur « On Hold » qui grise la barre d'une Epic en pause (désaturée + badge ⏸) en Vue Business, transversalement au statut d'atterrissage, et entrée « Copier pour PowerPoint » dans le menu Export qui place dans le presse-papier un visuel Disco → Build (une couleur par Epic, discovery en clair, build en plein, échéance, releases et ligne du jour) prêt à coller dans un slide.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -5756,7 +5756,7 @@
       return out;
     }
 
-    // Layout: a single long column (1280 px wide), one 54 px row per Epic —
+    // Layout: a single long column (1450 px wide), one 54 px row per Epic —
     // the user crops it in PowerPoint if it needs splitting. No title band:
     // just the legend, the month pills and the milestones above the rows.
     // Period: one quarter. Epics entirely outside it are left out; undated
@@ -5784,7 +5784,8 @@
       const n = Math.max(rows.length, 1);
       const cols = 1;
       const perCol = n;
-      const W = 1280;
+      // Timeline area = W − 2×OUTER − LABEL_W − R = 1018 px (848 px +20 %).
+      const W = 1450;
       const top = 124;
       const BOTTOM = 36;
       const ROW_H = 54;
