@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.13.0
+// @version      0.13.1
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur sur chaque chip de sprint (actif : progression fait/engagé issue du Sprint Report, teinté par engagement vs vélocité moyenne ; futur : charge planifiée vs vélocité moyenne), macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, menu « How-to » guidé qui surligne chaque feature au premier lancement, toggle « Vue PM / Vue Business » qui remplace les overlays de chiffrage par la date d'atterrissage (duedate) de chaque Epic, recoloration ternaire 🟢🟡🔴 (On Track / At Risk / Off Track / Livré) de chaque barre d'Epic en Vue Business calculée à partir de la duedate, de la projection vélocité et de la confidence, surcharge du menu Export → Image (.png) qui capture la Timeline au format natif (via html2canvas) avec tous les overlays Momentum-Light visibles dessus, variante d'export business-friendly (en Vue Business) qui ajoute une bande titre + légende des couleurs de statut au-dessus de la Timeline capturée, et indicateur « On Hold » qui grise la barre d'une Epic en pause (désaturée + badge ⏸) en Vue Business, transversalement au statut d'atterrissage, et entrée « Copier pour PowerPoint » dans le menu Export qui place dans le presse-papier un visuel Disco → Build (une couleur par Epic, discovery en clair, build en plein, échéance, releases et ligne du jour) prêt à coller dans un slide.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -5347,6 +5347,8 @@
       '[data-testid="roadmap.timeline-table-kit.ui.list-item-content.summary.key"]';
     const START_FIELD_CACHE = 'momentum-light::ppt-start-fields';
     const START_FIELD_NAMES = ['start date', 'date de début', 'date de debut', 'target start', 'début cible', 'debut cible'];
+    const END_FIELD_CACHE = 'momentum-light::ppt-end-fields';
+    const END_FIELD_NAMES = ['target end', 'fin cible', 'end date', 'date de fin'];
 
     // ---- dates -----------------------------------------------------------
     const parseDay = (s) => {
@@ -5395,6 +5397,23 @@
     }
 
     // ---- data ------------------------------------------------------------
+    // Used only when the due date is empty (Plans set up on target dates).
+    async function resolveEndFields() {
+      const cached = sessionStorage.getItem(END_FIELD_CACHE);
+      if (cached) {
+        try { return JSON.parse(cached); } catch (_) { /* refetch */ }
+      }
+      const fields = await jiraApi.listFields();
+      const ids = [];
+      for (const name of END_FIELD_NAMES) {
+        for (const f of fields) {
+          if ((f.name || '').toLowerCase().trim() === name && !ids.includes(f.id)) ids.push(f.id);
+        }
+      }
+      sessionStorage.setItem(END_FIELD_CACHE, JSON.stringify(ids));
+      return ids;
+    }
+
     async function resolveStartFields() {
       const forced = localStorage.getItem('momentum-light::ppt-start-field');
       if (forced) return [forced];
@@ -5429,22 +5448,69 @@
         || document.body;
     }
 
+    // Several nested containers can be "scrollable" around a row (chart
+    // pane, horizontal scroller with a few px of overflow…). The one that
+    // actually pages through the rows is the one with the largest vertical
+    // scroll range, so we look at the ancestors of a sample of rows and keep
+    // that one — the document itself included.
     function findScroller(root) {
-      let el = root.querySelector(KEY_NODES);
-      while (el && el !== document.body && el !== document.documentElement) {
-        const oy = getComputedStyle(el).overflowY;
-        if (/(auto|scroll|overlay)/.test(oy) && el.scrollHeight > el.clientHeight + 4) return el;
-        el = el.parentElement;
+      const docEl = document.scrollingElement || document.documentElement;
+      const candidates = new Set([docEl]);
+      const nodes = [...root.querySelectorAll(KEY_NODES)];
+      const sample = nodes.filter((_, i) => i % Math.max(1, Math.floor(nodes.length / 8)) === 0).slice(0, 10);
+      for (const node of sample) {
+        let el = node.parentElement;
+        while (el && el !== document.body && el !== document.documentElement) {
+          const oy = getComputedStyle(el).overflowY;
+          if (/(auto|scroll|overlay)/.test(oy) && el.scrollHeight > el.clientHeight + 4) candidates.add(el);
+          el = el.parentElement;
+        }
       }
-      return document.scrollingElement || document.documentElement;
+      let best = docEl;
+      let bestRange = docEl.scrollHeight - docEl.clientHeight;
+      for (const el of candidates) {
+        const range = el.scrollHeight - el.clientHeight;
+        if (range > bestRange) { best = el; bestRange = range; }
+      }
+      debug('ppt: scroll container', best, `range ${bestRange}px`, `(${candidates.size} candidat(s))`);
+      return best;
     }
 
+    // Wait until the virtualised list has re-rendered after a scroll: first
+    // the rendered rows must actually change (Jira may debounce its repaint),
+    // then stay unchanged for a few polls. Fixed delays miss rows when Jira —
+    // or our own overlays — is slow to paint.
     const settle = (ms = 160) => new Promise((resolve) => {
       let done = false;
       const finish = () => { if (!done) { done = true; resolve(); } };
       requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(finish, ms)));
       setTimeout(finish, ms + 400); // rAF is throttled in background tabs
     });
+
+    function rowsSignature() {
+      const nodes = timelineRoot().querySelectorAll(KEY_NODES);
+      const id = (n) => (n ? (n.getAttribute('href') || n.textContent || '') : '');
+      return `${nodes.length}|${id(nodes[0])}|${id(nodes[nodes.length - 1])}`;
+    }
+
+    async function waitForRows(before, { max = 2000 } = {}) {
+      const t0 = Date.now();
+      await settle(60);
+      let cur = rowsSignature();
+      // Phase 1 — wait for the repaint to start (skipped when nothing to compare).
+      while (before != null && cur === before && Date.now() - t0 < max) {
+        await new Promise((r) => setTimeout(r, 60));
+        cur = rowsSignature();
+      }
+      // Phase 2 — wait for it to settle.
+      let stable = 0;
+      while (stable < 3 && Date.now() - t0 < max + 600) {
+        await new Promise((r) => setTimeout(r, 70));
+        const next = rowsSignature();
+        stable = next === cur ? stable + 1 : 0;
+        cur = next;
+      }
+    }
 
     async function collectAllKeys(onProgress) {
       const root = timelineRoot();
@@ -5468,22 +5534,26 @@
 
       const initial = scroller.scrollTop;
       try {
+        const sig0 = rowsSignature();
+        const wasAtTop = scroller.scrollTop === 0;
         scroller.scrollTop = 0;
-        await settle();
+        await waitForRows(wasAtTop ? null : sig0);
         for (let step = 0; step < 400; step += 1) {
           harvest();
           if (onProgress) onProgress(positions.size);
           const atBottom = scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 2;
           if (atBottom) {
             // Content can grow once the last rows mount — check once more.
-            await settle(250);
+            await waitForRows(null);
             harvest();
             if (scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 2) break;
           }
           const before = scroller.scrollTop;
-          scroller.scrollTop = before + Math.max(120, Math.floor(scroller.clientHeight * 0.75));
+          const sig = rowsSignature();
+          // Half a screen per step: generous overlap so no row is skipped.
+          scroller.scrollTop = before + Math.max(100, Math.floor(scroller.clientHeight * 0.5));
           if (scroller.scrollTop === before) break;
-          await settle();
+          await waitForRows(sig);
         }
       } finally {
         scroller.scrollTop = initial;
@@ -5500,11 +5570,12 @@
     }
 
     async function fetchIssues(keys) {
-      const [startFields, sprintFieldId] = await Promise.all([
+      const [startFields, endFields, sprintFieldId] = await Promise.all([
         resolveStartFields().catch(() => []),
+        resolveEndFields().catch(() => []),
         sprintField.resolve().catch(() => null),
       ]);
-      const fields = ['summary', 'issuetype', 'status', 'duedate', 'parent', 'project', ...startFields];
+      const fields = ['summary', 'issuetype', 'status', 'duedate', 'parent', 'project', ...startFields, ...endFields];
       if (sprintFieldId) fields.push(sprintFieldId);
       const out = [];
       for (let i = 0; i < keys.length; i += 100) {
@@ -5537,6 +5608,10 @@
       return out.map((issue) => {
         let start = startOf(issue);
         let due = parseDay(issue.fields?.duedate);
+        for (const id of endFields) {
+          if (due != null) break;
+          due = parseDay(issue.fields?.[id]);
+        }
         const sp = sprintSpan(issue);
         if (sp) {
           if (start == null) start = sp.a;
@@ -5686,20 +5761,25 @@
     // 1280 px; beyond → two side-by-side columns at 1920 px. Row height
     // shrinks (54 → 34 px) to fit the 16:9 frame before the picture is
     // allowed to grow taller; small rows switch to a single-line label.
-    function render(allRows, milestonesAll) {
-      const today = todayUtc();
-      // Period: one quarter. Epics entirely outside it are left out; undated
-      // Epics stay (« Dates à planifier ») so nothing silently disappears.
-      const { start: d0, end: d1 } = quarterBounds(today);
+    // Period: one quarter. Epics entirely outside it are left out; undated
+    // Epics stay (« Dates à planifier ») so nothing silently disappears.
+    function splitRows(allRows, d0, d1) {
       const overlaps = (a, b) => a < d1 && b + DAY > d0;
       const isUndated = (r) => !r.build && !r.disco && r.dueOnly == null;
-      const dated = allRows.filter((r) => !isUndated(r) && (
-        (r.build && overlaps(r.build.a, r.build.b))
-          || (r.disco && overlaps(r.disco.a, r.disco.b))
-          || (r.dueOnly != null && r.dueOnly >= d0)
-      ));
-      // « Dates à planifier » Epics go last so the planned work reads first.
+      const inQuarter = (r) => (r.build && overlaps(r.build.a, r.build.b))
+        || (r.disco && overlaps(r.disco.a, r.disco.b))
+        || (r.dueOnly != null && r.dueOnly >= d0);
+      const dated = allRows.filter((r) => !isUndated(r) && inQuarter(r));
       const undated = allRows.filter(isUndated);
+      const outside = allRows.filter((r) => !isUndated(r) && !inQuarter(r));
+      return { dated, undated, outside };
+    }
+
+    function render(allRows, milestonesAll) {
+      const today = todayUtc();
+      const { start: d0, end: d1 } = quarterBounds(today);
+      const { dated, undated } = splitRows(allRows, d0, d1);
+      // « Dates à planifier » Epics go last so the planned work reads first.
       const rows = [...dated, ...undated];
       const milestones = milestonesAll.filter((m) => m.date >= d0 && m.date < d1);
 
@@ -5986,16 +6066,47 @@
       return canvas;
     }
 
+    let lastStats = null;
+
     async function buildCanvas(toast) {
       const keys = await collectAllKeys((nb) => toast?.update(`Momentum-Light — lecture de la Timeline… ${nb} tickets`));
-      toast?.update(`Momentum-Light — ${keys.length} tickets lus, construction du visuel…`);
       if (!keys.length) throw new Error('aucune issue visible sur la Timeline');
+      toast?.update(`Momentum-Light — ${keys.length} tickets lus, construction du visuel…`);
       const issues = await fetchIssues(keys);
       const rows = buildModel(issues, keys);
       const projects = [...new Set(issues.filter((i) => i.isEpic).map((i) => i.projectKey))].slice(0, 5);
       const milestones = await fetchMilestones(projects);
-      log(`ppt: ${rows.length} Epic(s), ${milestones.length} version(s)`);
+
+      // Diagnostics: what was read, and why an Epic is not on the picture.
+      const { start: d0, end: d1 } = quarterBounds(todayUtc());
+      const { dated, undated, outside } = splitRows(rows, d0, d1);
+      const found = new Set(issues.map((i) => i.key));
+      lastStats = { keys: keys.length, epics: rows.length, shown: dated.length, undated: undated.length, outside: outside.length, quarter: quarterLabel(d0) };
+      log(`ppt: ${keys.length} ticket(s) lus, ${rows.length} Epic(s) — ${dated.length} sur ${quarterLabel(d0)}, ${undated.length} à planifier, ${outside.length} hors trimestre`);
+      const missing = keys.filter((k) => !found.has(k));
+      if (missing.length) warn(`ppt: ${missing.length} clé(s) lue(s) mais non renvoyée(s) par l'API (droits ?) :`, missing.join(', '));
+      if (outside.length) {
+        log('ppt: Epics écartées car hors trimestre :');
+        console.table(outside.map((r) => ({
+          epic: r.key,
+          titre: r.name,
+          build: r.build ? `${fmtDay(r.build.a)} → ${fmtDay(r.build.b)}` : '',
+          disco: r.disco ? `${fmtDay(r.disco.a)} → ${fmtDay(r.disco.b)}` : '',
+          échéance: r.dueOnly != null ? fmtDay(r.dueOnly) : '',
+        })));
+      }
+      // Keep a handle for support: `copy(window.__MOMENTUM_PPT__)` in DevTools.
+      window.__MOMENTUM_PPT__ = { stats: lastStats, keys, epics: rows.map((r) => r.key), outside: outside.map((r) => r.key) };
       return render(rows, milestones);
+    }
+
+    function statsLine() {
+      const s = lastStats;
+      if (!s) return '';
+      const extra = [];
+      if (s.undated) extra.push(`${s.undated} à planifier`);
+      if (s.outside) extra.push(`${s.outside} hors ${s.quarter} écartée${s.outside > 1 ? 's' : ''}`);
+      return ` — ${s.shown} Epic${s.shown > 1 ? 's' : ''}${extra.length ? ` (${extra.join(', ')})` : ''} · ${s.keys} tickets lus`;
     }
 
     const toBlob = (canvas) => new Promise((resolve, reject) => {
@@ -6031,15 +6142,15 @@
       }
       return clipboardPromise.then(
         () => {
-          toast.update('Momentum-Light — visuel copié ✓ Colle-le dans PowerPoint (Ctrl+V)');
-          setTimeout(() => toast.hide(), 2600);
+          toast.update(`Momentum-Light — visuel copié ✓${statsLine()}`);
+          setTimeout(() => toast.hide(), 5000);
         },
         async (clipErr) => {
           try {
             const blob = await blobPromise;
             warn('ppt: clipboard refused, downloading instead:', clipErr?.message || clipErr);
             download(blob);
-            toast.update('Momentum-Light — copie refusée par le navigateur, PNG téléchargé');
+            toast.update(`Momentum-Light — copie refusée, PNG téléchargé${statsLine()}`);
             setTimeout(() => toast.hide(), 3200);
           } catch (buildErr) {
             error('ppt export failed:', buildErr?.message || buildErr);
