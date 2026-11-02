@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.11.0
-// @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur sur chaque chip de sprint (actif : progression fait/engagé issue du Sprint Report, teinté par engagement vs vélocité moyenne ; futur : charge planifiée vs vélocité moyenne), macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, menu « How-to » guidé qui surligne chaque feature au premier lancement, toggle « Vue PM / Vue Business » qui remplace les overlays de chiffrage par la date d'atterrissage (duedate) de chaque Epic, recoloration ternaire 🟢🟡🔴 (On Track / At Risk / Off Track / Livré) de chaque barre d'Epic en Vue Business calculée à partir de la duedate, de la projection vélocité et de la confidence, surcharge du menu Export → Image (.png) qui capture la Timeline au format natif (via html2canvas) avec tous les overlays Momentum-Light visibles dessus, variante d'export business-friendly (en Vue Business) qui ajoute une bande titre + légende des couleurs de statut au-dessus de la Timeline capturée, et indicateur « On Hold » qui grise la barre d'une Epic en pause (désaturée + badge ⏸) en Vue Business, transversalement au statut d'atterrissage.
+// @version      0.12.0
+// @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur sur chaque chip de sprint (actif : progression fait/engagé issue du Sprint Report, teinté par engagement vs vélocité moyenne ; futur : charge planifiée vs vélocité moyenne), macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, menu « How-to » guidé qui surligne chaque feature au premier lancement, toggle « Vue PM / Vue Business » qui remplace les overlays de chiffrage par la date d'atterrissage (duedate) de chaque Epic, recoloration ternaire 🟢🟡🔴 (On Track / At Risk / Off Track / Livré) de chaque barre d'Epic en Vue Business calculée à partir de la duedate, de la projection vélocité et de la confidence, surcharge du menu Export → Image (.png) qui capture la Timeline au format natif (via html2canvas) avec tous les overlays Momentum-Light visibles dessus, variante d'export business-friendly (en Vue Business) qui ajoute une bande titre + légende des couleurs de statut au-dessus de la Timeline capturée, et indicateur « On Hold » qui grise la barre d'une Epic en pause (désaturée + badge ⏸) en Vue Business, transversalement au statut d'atterrissage, et entrée « Copier pour PowerPoint » dans le menu Export qui place dans le presse-papier un visuel Disco → Build (une couleur par Epic, discovery en clair, build en plein, échéance, releases et ligne du jour) prêt à coller dans un slide.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
 // @run-at       document-idle
@@ -5297,6 +5297,547 @@
   })();
 
   // ---------------------------------------------------------------------------
+  // pptRoadmap — "Copier pour PowerPoint" (Disco → Build, style « une couleur
+  // par Epic »).
+  //
+  // Builds a clean, slide-ready roadmap image from the issues currently shown
+  // on the Timeline and puts it on the clipboard as a 2× PNG, so a single
+  // Ctrl+V drops it into PowerPoint / Keynote / Google Slides.
+  //
+  // Data model (read from the API, not from a screenshot):
+  //   - Epics      = visible issues classified as Epic (same heuristic as
+  //                  issueMeta). Build period = Epic start date → due date.
+  //   - Disco      = visible non-Epic children of a visible Epic (the user
+  //                  filters the view down to the discovery tasks). Several
+  //                  disco children are merged into one span. A disco task
+  //                  with no dates is drawn as an estimate: the 2 weeks right
+  //                  before the build starts, labelled « Disco (est.) ».
+  //   - Milestones = unreleased/released versions of the Epics' projects whose
+  //                  releaseDate falls inside the drawn period.
+  //
+  // Rendering is done straight on a 2D canvas (no html2canvas, no SVG → image
+  // round-trip) so fonts, truncation and colours are deterministic.
+  //
+  // Optional overrides (localStorage):
+  //   momentum-light::ppt-title      → title of the image (default « Roadmap produit »)
+  //   momentum-light::ppt-start-field → custom field id for the start date
+  // ---------------------------------------------------------------------------
+
+  const pptRoadmap = (() => {
+    const DAY = 864e5;
+    const DISCO_DEFAULT_DAYS = 14;
+    const SCALE = 2;
+    const FONT_STACK = '"Segoe UI", -apple-system, BlinkMacSystemFont, Roboto, "Helvetica Neue", Arial, sans-serif';
+    const PALETTE = ['#6366F1', '#EC4899', '#10B981', '#F59E0B', '#0EA5E9', '#8B5CF6', '#EF4444', '#14B8A6'];
+    const INK = '#1F1B3A';
+    const INK_SOFT = '#6B6790';
+    const INK_FAINT = '#A19DBF';
+    const TODAY_COLOR = '#FF5A5F';
+    const KEY_CELL_SELECTOR =
+      '[data-testid="roadmap.timeline-table-kit.ui.list-item-content.summary.key"]';
+    const START_FIELD_CACHE = 'momentum-light::ppt-start-fields';
+    const START_FIELD_NAMES = ['start date', 'date de début', 'date de debut', 'target start', 'début cible', 'debut cible'];
+
+    // ---- dates -----------------------------------------------------------
+    const parseDay = (s) => {
+      if (!s || typeof s !== 'string') return null;
+      const m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+      return m ? Date.UTC(+m[1], +m[2] - 1, +m[3]) : null;
+    };
+    const todayUtc = () => {
+      const d = new Date();
+      return Date.UTC(d.getFullYear(), d.getMonth(), d.getDate());
+    };
+    const fmtDay = (ms) => new Date(ms)
+      .toLocaleDateString('fr-FR', { day: 'numeric', month: 'short', timeZone: 'UTC' })
+      .replace(/\.$/, '');
+    const quarterLabel = (ms) => {
+      const d = new Date(ms);
+      return `T${Math.floor(d.getUTCMonth() / 3) + 1} ${d.getUTCFullYear()}`;
+    };
+
+    // ---- data ------------------------------------------------------------
+    async function resolveStartFields() {
+      const forced = localStorage.getItem('momentum-light::ppt-start-field');
+      if (forced) return [forced];
+      const cached = sessionStorage.getItem(START_FIELD_CACHE);
+      if (cached) {
+        try { return JSON.parse(cached); } catch (_) { /* refetch */ }
+      }
+      const fields = await jiraApi.listFields();
+      const ids = [];
+      for (const name of START_FIELD_NAMES) {
+        for (const f of fields) {
+          if ((f.name || '').toLowerCase().trim() === name && !ids.includes(f.id)) ids.push(f.id);
+        }
+      }
+      sessionStorage.setItem(START_FIELD_CACHE, JSON.stringify(ids));
+      log('ppt: start date field(s):', ids);
+      return ids;
+    }
+
+    function collectVisibleKeys() {
+      const root = document.getElementById('sr-timeline')
+        || document.querySelector('[role="main"]')
+        || document.body;
+      const keys = [];
+      const seen = new Set();
+      const push = (k) => { if (k && !seen.has(k)) { seen.add(k); keys.push(k); } };
+      // Walk both sources in document order so the image keeps the order the
+      // user arranged on the Timeline.
+      const nodes = root.querySelectorAll(`${KEY_CELL_SELECTOR}, a[href*="/browse/"]`);
+      for (const el of nodes) {
+        const src = el.matches(KEY_CELL_SELECTOR)
+          ? (el.textContent || '')
+          : (el.getAttribute('href') || '');
+        const m = src.match(ISSUE_KEY_REGEX);
+        if (m) push(m[1]);
+      }
+      return keys;
+    }
+
+    function isEpicIssue(issue) {
+      const typeName = issue.fields?.issuetype?.name || '';
+      const hierarchy = Number(issue.fields?.issuetype?.hierarchyLevel);
+      const isStoryLike = /\b(story|t[âa]che|tache|task|bug|incident|d[eé]faut|defect|spike)\b/i.test(typeName);
+      return !isStoryLike && (/\bepic\b/i.test(typeName) || (Number.isFinite(hierarchy) && hierarchy >= 1));
+    }
+
+    async function fetchIssues(keys) {
+      const startFields = await resolveStartFields().catch(() => []);
+      const fields = ['summary', 'issuetype', 'status', 'duedate', 'parent', 'project', ...startFields];
+      const out = [];
+      for (let i = 0; i < keys.length; i += 100) {
+        const chunk = keys.slice(i, i + 100);
+        const jql = `key in (${chunk.map((k) => `"${k}"`).join(',')})`;
+        const data = await jiraApi.searchIssues(jql, fields, chunk.length);
+        out.push(...(data.issues || []));
+      }
+      const startOf = (issue) => {
+        for (const id of startFields) {
+          const v = parseDay(issue.fields?.[id]);
+          if (v != null) return v;
+        }
+        return null;
+      };
+      return out.map((issue) => ({
+        key: issue.key,
+        summary: issue.fields?.summary || issue.key,
+        isEpic: isEpicIssue(issue),
+        parentKey: issue.fields?.parent?.key || null,
+        projectKey: issue.fields?.project?.key || issue.key.split('-')[0],
+        start: startOf(issue),
+        due: parseDay(issue.fields?.duedate),
+      }));
+    }
+
+    async function fetchMilestones(projectKeys) {
+      const all = [];
+      for (const pk of projectKeys) {
+        try {
+          const versions = await jiraApi.request(`/rest/api/3/project/${encodeURIComponent(pk)}/versions`);
+          for (const v of versions || []) {
+            const d = parseDay(v.releaseDate);
+            if (d != null && !v.archived) all.push({ date: d, label: v.name });
+          }
+        } catch (e) {
+          warn('ppt: versions unavailable for', pk, e?.message || e);
+        }
+      }
+      return all.sort((a, b) => a.date - b.date);
+    }
+
+    function buildModel(issues, order) {
+      const byKey = new Map(issues.map((i) => [i.key, i]));
+      const epics = order.map((k) => byKey.get(k)).filter((i) => i && i.isEpic);
+      const epicKeys = new Set(epics.map((e) => e.key));
+      const discoByEpic = new Map();
+      for (const i of issues) {
+        if (i.isEpic || !i.parentKey || !epicKeys.has(i.parentKey)) continue;
+        if (!discoByEpic.has(i.parentKey)) discoByEpic.set(i.parentKey, []);
+        discoByEpic.get(i.parentKey).push(i);
+      }
+      return epics.map((e) => {
+        let buildStart = e.start;
+        let buildEnd = e.due;
+        if (buildStart != null && buildEnd != null && buildEnd < buildStart) [buildStart, buildEnd] = [buildEnd, buildStart];
+        const build = buildStart != null && buildEnd != null ? { a: buildStart, b: buildEnd } : null;
+
+        let disco = null;
+        const kids = discoByEpic.get(e.key) || [];
+        if (kids.length) {
+          let a = null;
+          let b = null;
+          for (const k of kids) {
+            let ka = k.start;
+            let kb = k.due;
+            if (ka == null && kb != null) ka = kb - (DISCO_DEFAULT_DAYS - 1) * DAY;
+            if (kb == null && ka != null) kb = ka + (DISCO_DEFAULT_DAYS - 1) * DAY;
+            if (ka == null) continue;
+            a = a == null ? ka : Math.min(a, ka);
+            b = b == null ? kb : Math.max(b, kb);
+          }
+          if (a != null) disco = { a, b, estimated: false };
+          else if (build) disco = { a: build.a - DISCO_DEFAULT_DAYS * DAY, b: build.a - DAY, estimated: true };
+        }
+        // Lone due date: show it as a delivery point even without a start.
+        const dueOnly = !build && e.due != null ? e.due : null;
+        return { key: e.key, name: e.summary, build, disco, dueOnly };
+      });
+    }
+
+    // ---- drawing -----------------------------------------------------------
+    function font(size, weight = 400) {
+      return `${weight} ${size}px ${FONT_STACK}`;
+    }
+
+    function roundRect(ctx, x, y, w, h, r) {
+      const rr = Math.max(0, Math.min(r, w / 2, h / 2));
+      ctx.beginPath();
+      ctx.moveTo(x + rr, y);
+      ctx.arcTo(x + w, y, x + w, y + h, rr);
+      ctx.arcTo(x + w, y + h, x, y + h, rr);
+      ctx.arcTo(x, y + h, x, y, rr);
+      ctx.arcTo(x, y, x + w, y, rr);
+      ctx.closePath();
+    }
+
+    function hexA(hex, a) {
+      const n = parseInt(hex.slice(1), 16);
+      return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${a})`;
+    }
+
+    function ellipsize(ctx, text, maxW) {
+      if (ctx.measureText(text).width <= maxW) return text;
+      let lo = 0;
+      let hi = text.length;
+      while (lo < hi) {
+        const mid = Math.ceil((lo + hi) / 2);
+        if (ctx.measureText(`${text.slice(0, mid)}…`).width <= maxW) lo = mid; else hi = mid - 1;
+      }
+      return `${text.slice(0, lo).trimEnd()}…`;
+    }
+
+    function monthsBetween(d0, d1) {
+      const out = [];
+      const s = new Date(d0);
+      let y = s.getUTCFullYear();
+      let m = s.getUTCMonth();
+      while (Date.UTC(y, m, 1) < d1) {
+        const a = Math.max(d0, Date.UTC(y, m, 1));
+        const b = Math.min(d1, Date.UTC(y, m + 1, 1));
+        const date = new Date(Date.UTC(y, m, 1));
+        out.push({
+          a,
+          b,
+          long: date.toLocaleDateString('fr-FR', { month: 'long', timeZone: 'UTC' }),
+          short: date.toLocaleDateString('fr-FR', { month: 'short', timeZone: 'UTC' }).replace(/\.$/, ''),
+          year: y,
+        });
+        m += 1;
+        if (m > 11) { m = 0; y += 1; }
+      }
+      return out;
+    }
+
+    function render(rows, milestonesAll) {
+      const today = todayUtc();
+      // Period: every drawn date, padded a few days, starting on a Monday.
+      const dates = [];
+      for (const r of rows) {
+        if (r.build) dates.push(r.build.a, r.build.b);
+        if (r.disco) dates.push(r.disco.a, r.disco.b);
+        if (r.dueOnly != null) dates.push(r.dueOnly);
+      }
+      if (!dates.length) dates.push(today, today + 28 * DAY);
+      let d0 = Math.min(...dates) - 3 * DAY;
+      const dow = (new Date(d0).getUTCDay() + 6) % 7;
+      d0 -= dow * DAY;
+      let d1 = Math.max(...dates) + 4 * DAY;
+      if (d1 - d0 < 28 * DAY) d1 = d0 + 28 * DAY;
+      const milestones = milestonesAll.filter((m) => m.date >= d0 && m.date <= d1);
+
+      const W = 1280;
+      const L = 300;
+      const R = 110;
+      const ROW_H = 54;
+      const top = 150;
+      const H = top + Math.max(rows.length, 1) * ROW_H + 36;
+      const X = (ms) => L + ((ms - d0) / (d1 - d0)) * (W - L - R);
+
+      const canvas = document.createElement('canvas');
+      canvas.width = W * SCALE;
+      canvas.height = H * SCALE;
+      const ctx = canvas.getContext('2d');
+      ctx.scale(SCALE, SCALE);
+      ctx.textBaseline = 'alphabetic';
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fillRect(0, 0, W, H);
+
+      // Title
+      const title = localStorage.getItem('momentum-light::ppt-title') || 'Roadmap produit';
+      const q0 = quarterLabel(Math.min(...dates));
+      const q1 = quarterLabel(Math.max(...dates));
+      ctx.fillStyle = INK;
+      ctx.font = font(28, 800);
+      ctx.fillText(title, 36, 50);
+      ctx.fillStyle = INK_SOFT;
+      ctx.font = font(15, 400);
+      ctx.fillText(`${q0 === q1 ? q0 : `${q0} – ${q1}`} · Discovery en clair, build en plein · échéance au bout`, 36, 76);
+
+      // Legend (top right)
+      ctx.font = font(13, 600);
+      let lx = W - 36;
+      const legend = [
+        { label: 'Échéance', draw: (x, y) => { ctx.fillStyle = INK; ctx.beginPath(); ctx.moveTo(x + 7, y - 7); ctx.lineTo(x + 14, y); ctx.lineTo(x + 7, y + 7); ctx.lineTo(x, y); ctx.closePath(); ctx.fill(); }, w: 14 },
+        { label: 'Build', draw: (x, y) => { roundRect(ctx, x, y - 8, 30, 16, 8); ctx.fillStyle = PALETTE[0]; ctx.fill(); }, w: 30 },
+        { label: 'Disco', draw: (x, y) => { roundRect(ctx, x, y - 8, 30, 16, 8); ctx.fillStyle = hexA(PALETTE[0], 0.16); ctx.fill(); ctx.setLineDash([4, 3]); ctx.strokeStyle = PALETTE[0]; ctx.lineWidth = 1; ctx.stroke(); ctx.setLineDash([]); }, w: 30 },
+      ];
+      for (const item of legend) {
+        const tw = ctx.measureText(item.label).width;
+        lx -= tw;
+        ctx.fillStyle = INK_SOFT;
+        ctx.fillText(item.label, lx, 51);
+        lx -= item.w + 8;
+        item.draw(lx, 46);
+        lx -= 22;
+      }
+
+      // Month pills
+      const months = monthsBetween(d0, d1);
+      const spanYears = months.length && months[0].year !== months[months.length - 1].year;
+      months.forEach((m, i) => {
+        const x0 = X(m.a);
+        const w = X(m.b) - x0 - 3;
+        if (w < 30) return;
+        roundRect(ctx, x0, top - 64, w, 24, 12);
+        ctx.fillStyle = i % 2 ? '#F1EFFB' : '#F7F6FD';
+        ctx.fill();
+        ctx.font = font(12.5, 700);
+        let label = m.long.charAt(0).toUpperCase() + m.long.slice(1);
+        if (spanYears && m.a === Date.UTC(m.year, 0, 1)) label += ` ${m.year}`;
+        if (ctx.measureText(label).width > w - 12) label = m.short.charAt(0).toUpperCase() + m.short.slice(1);
+        if (ctx.measureText(label).width <= w - 8) {
+          ctx.fillStyle = '#5B5585';
+          ctx.textAlign = 'center';
+          ctx.fillText(label, x0 + w / 2, top - 47);
+          ctx.textAlign = 'left';
+        }
+      });
+
+      // Milestone guides (drawn under the bars)
+      for (const m of milestones) {
+        const x = X(m.date);
+        ctx.save();
+        ctx.strokeStyle = hexA(INK, 0.28);
+        ctx.lineWidth = 2;
+        ctx.lineCap = 'round';
+        ctx.setLineDash([1, 5]);
+        ctx.beginPath();
+        ctx.moveTo(x, top - 12);
+        ctx.lineTo(x, H - 18);
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      // Rows
+      if (!rows.length) {
+        ctx.fillStyle = INK_SOFT;
+        ctx.font = font(15, 400);
+        ctx.fillText('Aucune Epic visible sur la Timeline.', L, top + 32);
+      }
+      rows.forEach((r, i) => {
+        const c = PALETTE[i % PALETTE.length];
+        const mid = top + i * ROW_H + ROW_H / 2;
+
+        // Label column
+        ctx.fillStyle = c;
+        ctx.beginPath();
+        ctx.arc(44, mid, 6, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = INK;
+        ctx.font = font(15, 700);
+        ctx.fillText(ellipsize(ctx, r.name, L - 84), 60, mid - 2);
+        ctx.fillStyle = INK_FAINT;
+        ctx.font = font(11.5, 400);
+        ctx.fillText(r.key, 60, mid + 15);
+
+        const BAR_H = 28;
+        const y = mid - BAR_H / 2;
+
+        if (r.disco) {
+          const x0 = X(r.disco.a);
+          const x1 = X(r.disco.b + DAY);
+          // Extend under the build pill so the two read as one sequence.
+          const w = Math.max(x1 - x0, 6) + (r.build ? 14 : 0);
+          roundRect(ctx, x0, y, w, BAR_H, BAR_H / 2);
+          ctx.fillStyle = hexA(c, r.disco.estimated ? 0.09 : 0.16);
+          ctx.fill();
+          ctx.setLineDash([4, 3]);
+          ctx.strokeStyle = r.disco.estimated ? hexA(c, 0.55) : c;
+          ctx.lineWidth = 1;
+          ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.font = font(12, 700);
+          const lbl = r.disco.estimated ? 'Disco (est.)' : 'Disco';
+          if (ctx.measureText(lbl).width + 22 < x1 - x0) {
+            ctx.fillStyle = c;
+            ctx.fillText(lbl, x0 + 12, mid + 4);
+          }
+        }
+
+        if (r.build) {
+          const x0 = X(r.build.a);
+          const x1 = X(r.build.b + DAY);
+          const w = Math.max(x1 - x0, BAR_H);
+          roundRect(ctx, x0, y, w, BAR_H, BAR_H / 2);
+          ctx.fillStyle = c;
+          ctx.fill();
+          const weeks = Math.max(1, Math.round((r.build.b - r.build.a + DAY) / (7 * DAY)));
+          ctx.font = font(12, 700);
+          let lbl = `${weeks} semaine${weeks > 1 ? 's' : ''}`;
+          if (ctx.measureText(lbl).width + 28 > w) lbl = `${weeks} sem`;
+          if (ctx.measureText(lbl).width + 24 < w) {
+            ctx.fillStyle = '#FFFFFF';
+            ctx.fillText(lbl, x0 + 14, mid + 4);
+          }
+        }
+
+        const endX = r.build ? X(r.build.b + DAY) : (r.dueOnly != null ? X(r.dueOnly + DAY) : null);
+        const endDay = r.build ? r.build.b : r.dueOnly;
+        if (endX != null) {
+          const dx = endX + 14;
+          ctx.fillStyle = c;
+          ctx.beginPath();
+          ctx.moveTo(dx, mid - 8);
+          ctx.lineTo(dx + 8, mid);
+          ctx.lineTo(dx, mid + 8);
+          ctx.lineTo(dx - 8, mid);
+          ctx.closePath();
+          ctx.fill();
+          ctx.fillStyle = INK;
+          ctx.font = font(13, 800);
+          ctx.fillText(fmtDay(endDay), dx + 14, mid + 5);
+        } else if (!r.disco) {
+          ctx.fillStyle = INK_FAINT;
+          ctx.font = font(13, 400);
+          ctx.fillText('Dates à planifier', L, mid + 5);
+        }
+      });
+
+      // Milestone chips, staggered on two lanes when they would overlap.
+      ctx.font = font(11, 700);
+      const laneEnd = [-Infinity, -Infinity];
+      for (const m of milestones) {
+        const x = X(m.date);
+        const label = ellipsize(ctx, m.label, 180);
+        const w = ctx.measureText(label).width + 18;
+        let cx = Math.min(x - 4, W - w - 8);
+        let lane = laneEnd.findIndex((end) => cx > end + 6);
+        if (lane < 0) {
+          // Both lanes busy: take the one that frees up first and nudge the
+          // chip right of its neighbour rather than drawing on top of it.
+          lane = laneEnd[0] <= laneEnd[1] ? 0 : 1;
+          cx = Math.min(laneEnd[lane] + 6, W - w - 8);
+        }
+        const yChip = lane === 0 ? top - 30 : top - 8;
+        roundRect(ctx, cx, yChip, w, 18, 9);
+        ctx.fillStyle = INK;
+        ctx.fill();
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fillText(label, cx + 9, yChip + 13);
+        laneEnd[lane] = cx + w;
+      }
+
+      // Today line
+      if (today >= d0 && today <= d1) {
+        const tx = X(today);
+        ctx.strokeStyle = TODAY_COLOR;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(tx, top + 16);
+        ctx.lineTo(tx, H - 18);
+        ctx.stroke();
+        ctx.fillStyle = TODAY_COLOR;
+        ctx.beginPath();
+        ctx.arc(tx, top + 16, 4, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.font = font(10.5, 700);
+        ctx.textAlign = 'center';
+        ctx.fillText("AUJOURD'HUI", tx, H - 6);
+        ctx.textAlign = 'left';
+      }
+
+      return canvas;
+    }
+
+    async function buildCanvas() {
+      const keys = collectVisibleKeys();
+      if (!keys.length) throw new Error('aucune issue visible sur la Timeline');
+      const issues = await fetchIssues(keys);
+      const rows = buildModel(issues, keys);
+      const projects = [...new Set(issues.filter((i) => i.isEpic).map((i) => i.projectKey))].slice(0, 5);
+      const milestones = await fetchMilestones(projects);
+      log(`ppt: ${rows.length} Epic(s), ${milestones.length} version(s)`);
+      return render(rows, milestones);
+    }
+
+    const toBlob = (canvas) => new Promise((resolve, reject) => {
+      canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('toBlob a renvoyé null'))), 'image/png');
+    });
+
+    function download(blob) {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `momentum-roadmap-ppt-${new Date().toISOString().slice(0, 10)}.png`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+
+    // Must be called synchronously from the click handler: the clipboard
+    // write is started right away with a *promise* of the PNG, which keeps
+    // the user activation alive while the API calls run (Chrome, Safari,
+    // Firefox ≥ 127). Falls back to a download when the clipboard refuses.
+    function copyToClipboard(showToast) {
+      const toast = showToast('Momentum-Light — préparation du visuel PowerPoint…');
+      const blobPromise = buildCanvas().then(toBlob);
+      let clipboardPromise;
+      try {
+        if (!navigator.clipboard?.write || typeof window.ClipboardItem !== 'function') {
+          throw new Error('Clipboard API indisponible');
+        }
+        clipboardPromise = navigator.clipboard.write([new window.ClipboardItem({ 'image/png': blobPromise })]);
+      } catch (e) {
+        clipboardPromise = Promise.reject(e);
+      }
+      return clipboardPromise.then(
+        () => {
+          toast.update('Momentum-Light — visuel copié ✓ Colle-le dans PowerPoint (Ctrl+V)');
+          setTimeout(() => toast.hide(), 2600);
+        },
+        async (clipErr) => {
+          try {
+            const blob = await blobPromise;
+            warn('ppt: clipboard refused, downloading instead:', clipErr?.message || clipErr);
+            download(blob);
+            toast.update('Momentum-Light — copie refusée par le navigateur, PNG téléchargé');
+            setTimeout(() => toast.hide(), 3200);
+          } catch (buildErr) {
+            error('ppt export failed:', buildErr?.message || buildErr);
+            toast.update(`Momentum-Light — échec : ${buildErr?.message || buildErr}`);
+            setTimeout(() => toast.hide(), 3600);
+          }
+        },
+      );
+    }
+
+    return { copyToClipboard, _render: render, _buildModel: buildModel };
+  })();
+
+  // ---------------------------------------------------------------------------
   // exportPng — intercepts the native Plans/Timeline "Export" popover and
   // injects a companion menu entry "Image enrichie Momentum (.png)" right
   // after the native "Image (.png)" item.
@@ -5421,7 +5962,30 @@
       );
 
       native.parentNode.insertBefore(enriched, native.nextSibling);
-      debug('exportPng: enriched menu entry injected');
+
+      // Second companion entry — slide-ready Disco → Build roadmap copied
+      // to the clipboard (see pptRoadmap). The clipboard write has to start
+      // synchronously inside the click handler, hence no await before it.
+      const ppt = native.cloneNode(true);
+      ppt.setAttribute(ITEM_ATTR, 'ppt');
+      ppt.removeAttribute('id');
+      ppt.removeAttribute('aria-describedby');
+      const pptLeaf = textLeafMatching(ppt, IMAGE_LABEL)
+        || (IMAGE_LABEL.test(ppt.textContent || '') ? ppt : null);
+      if (pptLeaf) pptLeaf.textContent = 'Copier pour PowerPoint (Disco → Build)';
+      const runPpt = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        e.stopImmediatePropagation();
+        pptRoadmap.copyToClipboard(showToast);
+        closeOpenMenus();
+      };
+      ppt.addEventListener('click', runPpt, true);
+      ppt.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') runPpt(e);
+      }, true);
+      enriched.parentNode.insertBefore(ppt, enriched.nextSibling);
+      debug('exportPng: enriched menu entries injected');
     }
 
     function install() {
