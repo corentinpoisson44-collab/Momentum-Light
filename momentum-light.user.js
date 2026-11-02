@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.12.2
+// @version      0.13.0
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur sur chaque chip de sprint (actif : progression fait/engagé issue du Sprint Report, teinté par engagement vs vélocité moyenne ; futur : charge planifiée vs vélocité moyenne), macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, menu « How-to » guidé qui surligne chaque feature au premier lancement, toggle « Vue PM / Vue Business » qui remplace les overlays de chiffrage par la date d'atterrissage (duedate) de chaque Epic, recoloration ternaire 🟢🟡🔴 (On Track / At Risk / Off Track / Livré) de chaque barre d'Epic en Vue Business calculée à partir de la duedate, de la projection vélocité et de la confidence, surcharge du menu Export → Image (.png) qui capture la Timeline au format natif (via html2canvas) avec tous les overlays Momentum-Light visibles dessus, variante d'export business-friendly (en Vue Business) qui ajoute une bande titre + légende des couleurs de statut au-dessus de la Timeline capturée, et indicateur « On Hold » qui grise la barre d'une Epic en pause (désaturée + badge ⏸) en Vue Business, transversalement au statut d'atterrissage, et entrée « Copier pour PowerPoint » dans le menu Export qui place dans le presse-papier un visuel Disco → Build (une couleur par Epic, discovery en clair, build en plein, échéance, releases et ligne du jour) prêt à coller dans un slide.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -5414,24 +5414,82 @@
       return ids;
     }
 
-    function collectVisibleKeys() {
-      const root = document.getElementById('sr-timeline')
+    // The Timeline virtualises its rows: only what is on screen (plus a small
+    // buffer) exists in the DOM. To get every Epic we scroll the Timeline's
+    // own scroll container top → bottom, harvest the keys rendered at each
+    // step with their absolute vertical position, then restore the user's
+    // scroll position. Sorting by position keeps the on-screen order (and
+    // therefore the Epic → disco nesting) even though virtualised rows are
+    // recycled out of DOM order.
+    const KEY_NODES = `${KEY_CELL_SELECTOR}, a[href*="/browse/"]`;
+
+    function timelineRoot() {
+      return document.getElementById('sr-timeline')
         || document.querySelector('[role="main"]')
         || document.body;
-      const keys = [];
-      const seen = new Set();
-      const push = (k) => { if (k && !seen.has(k)) { seen.add(k); keys.push(k); } };
-      // Walk both sources in document order so the image keeps the order the
-      // user arranged on the Timeline.
-      const nodes = root.querySelectorAll(`${KEY_CELL_SELECTOR}, a[href*="/browse/"]`);
-      for (const el of nodes) {
-        const src = el.matches(KEY_CELL_SELECTOR)
-          ? (el.textContent || '')
-          : (el.getAttribute('href') || '');
-        const m = src.match(ISSUE_KEY_REGEX);
-        if (m) push(m[1]);
+    }
+
+    function findScroller(root) {
+      let el = root.querySelector(KEY_NODES);
+      while (el && el !== document.body && el !== document.documentElement) {
+        const oy = getComputedStyle(el).overflowY;
+        if (/(auto|scroll|overlay)/.test(oy) && el.scrollHeight > el.clientHeight + 4) return el;
+        el = el.parentElement;
       }
-      return keys;
+      return document.scrollingElement || document.documentElement;
+    }
+
+    const settle = (ms = 160) => new Promise((resolve) => {
+      let done = false;
+      const finish = () => { if (!done) { done = true; resolve(); } };
+      requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(finish, ms)));
+      setTimeout(finish, ms + 400); // rAF is throttled in background tabs
+    });
+
+    async function collectAllKeys(onProgress) {
+      const root = timelineRoot();
+      const scroller = findScroller(root);
+      const isDoc = scroller === document.scrollingElement || scroller === document.documentElement;
+      const positions = new Map(); // key -> absolute y (first seen)
+
+      const harvest = () => {
+        const baseTop = isDoc ? 0 : scroller.getBoundingClientRect().top;
+        for (const el of timelineRoot().querySelectorAll(KEY_NODES)) {
+          const src = el.matches(KEY_CELL_SELECTOR)
+            ? (el.textContent || '')
+            : (el.getAttribute('href') || '');
+          const m = src.match(ISSUE_KEY_REGEX);
+          if (!m || positions.has(m[1])) continue;
+          const rect = el.getBoundingClientRect();
+          if (!rect.height && !rect.width) continue; // detached / hidden
+          positions.set(m[1], rect.top - baseTop + scroller.scrollTop);
+        }
+      };
+
+      const initial = scroller.scrollTop;
+      try {
+        scroller.scrollTop = 0;
+        await settle();
+        for (let step = 0; step < 400; step += 1) {
+          harvest();
+          if (onProgress) onProgress(positions.size);
+          const atBottom = scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 2;
+          if (atBottom) {
+            // Content can grow once the last rows mount — check once more.
+            await settle(250);
+            harvest();
+            if (scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 2) break;
+          }
+          const before = scroller.scrollTop;
+          scroller.scrollTop = before + Math.max(120, Math.floor(scroller.clientHeight * 0.75));
+          if (scroller.scrollTop === before) break;
+          await settle();
+        }
+      } finally {
+        scroller.scrollTop = initial;
+      }
+      log(`ppt: ${positions.size} ticket(s) lus sur la Timeline`);
+      return [...positions.entries()].sort((a, b) => a[1] - b[1]).map(([k]) => k);
     }
 
     function isEpicIssue(issue) {
@@ -5624,6 +5682,10 @@
       return out;
     }
 
+    // Layout: aims for a 16:9 picture. Up to 14 Epics → one column at
+    // 1280 px; beyond → two side-by-side columns at 1920 px. Row height
+    // shrinks (54 → 34 px) to fit the 16:9 frame before the picture is
+    // allowed to grow taller; small rows switch to a single-line label.
     function render(allRows, milestonesAll) {
       const today = todayUtc();
       // Period: one quarter. Epics entirely outside it are left out; undated
@@ -5641,13 +5703,23 @@
       const rows = [...dated, ...undated];
       const milestones = milestonesAll.filter((m) => m.date >= d0 && m.date < d1);
 
-      const W = 1280;
-      const L = 300;
-      const R = 110;
-      const ROW_H = 54;
+      const n = Math.max(rows.length, 1);
+      const cols = n > 14 ? 2 : 1;
+      const perCol = Math.ceil(n / cols);
+      const W = cols === 1 ? 1280 : 1920;
       const top = 150;
-      const H = top + Math.max(rows.length, 1) * ROW_H + 36;
-      const X = (ms) => L + ((ms - d0) / (d1 - d0)) * (W - L - R);
+      const BOTTOM = 36;
+      const targetH = Math.round((W * 9) / 16);
+      const ROW_H = Math.max(34, Math.min(54, Math.floor((targetH - top - BOTTOM) / perCol)));
+      const compact = ROW_H < 44;
+      const BAR_H = Math.max(18, Math.min(28, Math.round(ROW_H * 0.52)));
+      const rowsBottom = top + perCol * ROW_H;
+      const H = rowsBottom + BOTTOM;
+      const OUTER = 36;
+      const GAP = 48;
+      const panelW = (W - OUTER * 2 - GAP * (cols - 1)) / cols;
+      const LABEL_W = cols === 1 ? 264 : 250;
+      const R = 96;
 
       const canvas = document.createElement('canvas');
       canvas.width = W * SCALE;
@@ -5662,14 +5734,15 @@
       const title = localStorage.getItem('momentum-light::ppt-title') || 'Roadmap produit';
       ctx.fillStyle = INK;
       ctx.font = font(28, 800);
-      ctx.fillText(title, 36, 50);
+      ctx.fillText(title, OUTER, 50);
       ctx.fillStyle = INK_SOFT;
       ctx.font = font(15, 400);
-      ctx.fillText(`${quarterLabel(d0)} · Discovery en clair, build en plein · échéance au bout`, 36, 76);
+      const count = `${dated.length} Epic${dated.length > 1 ? 's' : ''}${undated.length ? ` · ${undated.length} à planifier` : ''}`;
+      ctx.fillText(`${quarterLabel(d0)} · ${count} · Discovery en clair, build en plein, échéance au bout`, OUTER, 76);
 
       // Legend (top right)
       ctx.font = font(13, 600);
-      let lx = W - 36;
+      let lx = W - OUTER;
       const legend = [
         { label: 'Échéance', draw: (x, y) => { ctx.fillStyle = INK; ctx.beginPath(); ctx.moveTo(x + 7, y - 7); ctx.lineTo(x + 14, y); ctx.lineTo(x + 7, y + 7); ctx.lineTo(x, y); ctx.closePath(); ctx.fill(); }, w: 14 },
         { label: 'Build', draw: (x, y) => { roundRect(ctx, x, y - 8, 30, 16, 8); ctx.fillStyle = PALETTE[0]; ctx.fill(); }, w: 30 },
@@ -5685,206 +5758,237 @@
         lx -= 22;
       }
 
-      // Month pills
-      const months = monthsBetween(d0, d1);
-      const spanYears = months.length && months[0].year !== months[months.length - 1].year;
-      months.forEach((m, i) => {
-        const x0 = X(m.a);
-        const w = X(m.b) - x0 - 3;
-        if (w < 30) return;
-        roundRect(ctx, x0, top - 64, w, 24, 12);
-        ctx.fillStyle = i % 2 ? '#F1EFFB' : '#F7F6FD';
-        ctx.fill();
-        ctx.font = font(12.5, 700);
-        let label = m.long.charAt(0).toUpperCase() + m.long.slice(1);
-        if (spanYears && m.a === Date.UTC(m.year, 0, 1)) label += ` ${m.year}`;
-        if (ctx.measureText(label).width > w - 12) label = m.short.charAt(0).toUpperCase() + m.short.slice(1);
-        if (ctx.measureText(label).width <= w - 8) {
-          ctx.fillStyle = '#5B5585';
-          ctx.textAlign = 'center';
-          ctx.fillText(label, x0 + w / 2, top - 47);
-          ctx.textAlign = 'left';
-        }
-      });
-
-      // Milestone guides (drawn under the bars)
-      for (const m of milestones) {
-        const x = X(m.date);
-        ctx.save();
-        ctx.strokeStyle = hexA(INK, 0.28);
-        ctx.lineWidth = 2;
-        ctx.lineCap = 'round';
-        ctx.setLineDash([1, 5]);
-        ctx.beginPath();
-        ctx.moveTo(x, top - 12);
-        ctx.lineTo(x, H - 18);
-        ctx.stroke();
-        ctx.restore();
-      }
-
-      // Rows
       if (!rows.length) {
         ctx.fillStyle = INK_SOFT;
         ctx.font = font(15, 400);
-        ctx.fillText('Aucune Epic sur ce trimestre.', L, top + 32);
+        ctx.fillText('Aucune Epic sur ce trimestre.', OUTER + LABEL_W, top + 32);
+        return canvas;
       }
-      if (dated.length && undated.length) {
-        // Faint divider between planned Epics and the ones still to schedule.
-        const sy = top + dated.length * ROW_H;
-        ctx.save();
-        ctx.strokeStyle = hexA(INK, 0.14);
-        ctx.lineWidth = 1;
-        ctx.setLineDash([4, 4]);
-        ctx.beginPath();
-        ctx.moveTo(36, sy);
-        ctx.lineTo(W - 36, sy);
-        ctx.stroke();
-        ctx.restore();
-      }
-      rows.forEach((r, i) => {
-        const c = PALETTE[i % PALETTE.length];
-        const mid = top + i * ROW_H + ROW_H / 2;
 
-        // Label column
-        ctx.fillStyle = c;
-        ctx.beginPath();
-        ctx.arc(44, mid, 6, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.fillStyle = INK;
-        ctx.font = font(15, 700);
-        ctx.fillText(ellipsize(ctx, r.name, L - 84), 60, mid - 2);
-        ctx.fillStyle = INK_FAINT;
-        ctx.font = font(11.5, 400);
-        ctx.fillText(r.key, 60, mid + 15);
+      for (let col = 0; col < cols; col += 1) {
+        const px = OUTER + col * (panelW + GAP);
+        const slice = rows.slice(col * perCol, (col + 1) * perCol);
+        const firstIndex = col * perCol;
+        const xL = px + LABEL_W;
+        const xR = px + panelW - R;
+        const X = (ms) => xL + ((ms - d0) / (d1 - d0)) * (xR - xL);
+        const panelBottom = top + slice.length * ROW_H;
 
-        const BAR_H = 28;
-        const y = mid - BAR_H / 2;
-        const xL = X(d0);
-        const xR = X(d1);
-
-        // Bars are clipped to the quarter; labels stay inside the visible part.
-        ctx.save();
-        ctx.beginPath();
-        ctx.rect(xL, 0, xR - xL, H);
-        ctx.clip();
-
-        if (r.disco) {
-          const x0 = X(r.disco.a);
-          const x1 = X(r.disco.b + DAY);
-          // Extend under the build pill so the two read as one sequence.
-          const w = Math.max(x1 - x0, 6) + (r.build ? 14 : 0);
-          roundRect(ctx, x0, y, w, BAR_H, BAR_H / 2);
-          ctx.fillStyle = hexA(c, r.disco.estimated ? 0.09 : 0.16);
-          ctx.fill();
-          ctx.setLineDash([4, 3]);
-          ctx.strokeStyle = r.disco.estimated ? hexA(c, 0.55) : c;
+        if (col > 0) {
+          ctx.strokeStyle = hexA(INK, 0.08);
           ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.moveTo(px - GAP / 2, top - 64);
+          ctx.lineTo(px - GAP / 2, rowsBottom);
           ctx.stroke();
-          ctx.setLineDash([]);
-          ctx.font = font(12, 700);
-          const lbl = r.disco.estimated ? 'Disco (est.)' : 'Disco';
-          const lx = Math.max(x0, xL) + 12;
-          const visibleEnd = Math.min(x1, r.build ? X(r.build.a) : x1, xR);
-          if (ctx.measureText(lbl).width + 10 < visibleEnd - lx) {
-            ctx.fillStyle = c;
-            ctx.fillText(lbl, lx, mid + 4);
-          }
         }
 
-        if (r.build) {
-          const x0 = X(r.build.a);
-          const x1 = X(r.build.b + DAY);
-          const w = Math.max(x1 - x0, BAR_H);
-          roundRect(ctx, x0, y, w, BAR_H, BAR_H / 2);
-          ctx.fillStyle = c;
+        // Month pills
+        const months = monthsBetween(d0, d1);
+        months.forEach((m, i) => {
+          const x0 = X(m.a);
+          const w = X(m.b) - x0 - 3;
+          if (w < 30) return;
+          roundRect(ctx, x0, top - 64, w, 24, 12);
+          ctx.fillStyle = i % 2 ? '#F1EFFB' : '#F7F6FD';
           ctx.fill();
-          const weeks = Math.max(1, Math.round((r.build.b - r.build.a + DAY) / (7 * DAY)));
-          const lx = Math.max(x0, xL) + 14;
-          const room = Math.min(x0 + w, xR) - lx;
-          ctx.font = font(12, 700);
-          let lbl = `${weeks} semaine${weeks > 1 ? 's' : ''}`;
-          if (ctx.measureText(lbl).width + 14 > room) lbl = `${weeks} sem`;
-          if (ctx.measureText(lbl).width + 10 < room) {
-            ctx.fillStyle = '#FFFFFF';
-            ctx.fillText(lbl, lx, mid + 4);
+          ctx.font = font(12.5, 700);
+          let label = m.long.charAt(0).toUpperCase() + m.long.slice(1);
+          if (ctx.measureText(label).width > w - 12) label = m.short.charAt(0).toUpperCase() + m.short.slice(1);
+          if (ctx.measureText(label).width <= w - 8) {
+            ctx.fillStyle = '#5B5585';
+            ctx.textAlign = 'center';
+            ctx.fillText(label, x0 + w / 2, top - 47);
+            ctx.textAlign = 'left';
           }
-        }
-        ctx.restore();
+        });
 
-        const endDay = r.build ? r.build.b : r.dueOnly;
-        if (endDay != null && endDay >= d1) {
-          // Delivery after the quarter: arrow + date in the right margin.
-          ctx.fillStyle = c;
-          ctx.font = font(13, 800);
-          ctx.fillText(`→ ${fmtDay(endDay)}`, xR + 10, mid + 5);
-        } else if (endDay != null && endDay >= d0) {
-          const dx = X(endDay + DAY) + 14;
+        // Milestone guides (under the bars)
+        for (const m of milestones) {
+          const x = X(m.date);
+          ctx.save();
+          ctx.strokeStyle = hexA(INK, 0.28);
+          ctx.lineWidth = 2;
+          ctx.lineCap = 'round';
+          ctx.setLineDash([1, 5]);
+          ctx.beginPath();
+          ctx.moveTo(x, top - 12);
+          ctx.lineTo(x, panelBottom + 4);
+          ctx.stroke();
+          ctx.restore();
+        }
+
+        // Divider between planned Epics and the ones still to schedule.
+        const splitAt = dated.length - firstIndex;
+        if (splitAt > 0 && splitAt < slice.length) {
+          const sy = top + splitAt * ROW_H;
+          ctx.save();
+          ctx.strokeStyle = hexA(INK, 0.14);
+          ctx.lineWidth = 1;
+          ctx.setLineDash([4, 4]);
+          ctx.beginPath();
+          ctx.moveTo(px, sy);
+          ctx.lineTo(px + panelW, sy);
+          ctx.stroke();
+          ctx.restore();
+        }
+
+        slice.forEach((r, j) => {
+          const i = firstIndex + j;
+          const c = PALETTE[i % PALETTE.length];
+          const mid = top + j * ROW_H + ROW_H / 2;
+
+          // Label column
           ctx.fillStyle = c;
           ctx.beginPath();
-          ctx.moveTo(dx, mid - 8);
-          ctx.lineTo(dx + 8, mid);
-          ctx.lineTo(dx, mid + 8);
-          ctx.lineTo(dx - 8, mid);
-          ctx.closePath();
+          ctx.arc(px + 8, mid, compact ? 5 : 6, 0, Math.PI * 2);
           ctx.fill();
+          if (compact) {
+            ctx.font = font(11, 400);
+            const kw = ctx.measureText(r.key).width;
+            ctx.fillStyle = INK_FAINT;
+            ctx.fillText(r.key, px + 22, mid + 4.5);
+            ctx.fillStyle = INK;
+            ctx.font = font(13.5, 700);
+            ctx.fillText(ellipsize(ctx, r.name, LABEL_W - 44 - kw), px + 30 + kw, mid + 5);
+          } else {
+            ctx.fillStyle = INK;
+            ctx.font = font(15, 700);
+            ctx.fillText(ellipsize(ctx, r.name, LABEL_W - 40), px + 24, mid - 2);
+            ctx.fillStyle = INK_FAINT;
+            ctx.font = font(11.5, 400);
+            ctx.fillText(r.key, px + 24, mid + 15);
+          }
+
+          const y = mid - BAR_H / 2;
+          const barFont = compact ? 11 : 12;
+
+          // Bars are clipped to the quarter; labels stay inside the visible part.
+          ctx.save();
+          ctx.beginPath();
+          ctx.rect(xL, 0, xR - xL, H);
+          ctx.clip();
+
+          if (r.disco) {
+            const x0 = X(r.disco.a);
+            const x1 = X(r.disco.b + DAY);
+            // Extend under the build pill so the two read as one sequence.
+            const w = Math.max(x1 - x0, 6) + (r.build ? 14 : 0);
+            roundRect(ctx, x0, y, w, BAR_H, BAR_H / 2);
+            ctx.fillStyle = hexA(c, r.disco.estimated ? 0.09 : 0.16);
+            ctx.fill();
+            ctx.setLineDash([4, 3]);
+            ctx.strokeStyle = r.disco.estimated ? hexA(c, 0.55) : c;
+            ctx.lineWidth = 1;
+            ctx.stroke();
+            ctx.setLineDash([]);
+            ctx.font = font(barFont, 700);
+            const lbl = r.disco.estimated ? 'Disco (est.)' : 'Disco';
+            const tx0 = Math.max(x0, xL) + 10;
+            const visibleEnd = Math.min(x1, r.build ? X(r.build.a) : x1, xR);
+            if (ctx.measureText(lbl).width + 8 < visibleEnd - tx0) {
+              ctx.fillStyle = c;
+              ctx.fillText(lbl, tx0, mid + barFont / 3);
+            }
+          }
+
+          if (r.build) {
+            const x0 = X(r.build.a);
+            const x1 = X(r.build.b + DAY);
+            const w = Math.max(x1 - x0, BAR_H);
+            roundRect(ctx, x0, y, w, BAR_H, BAR_H / 2);
+            ctx.fillStyle = c;
+            ctx.fill();
+            const weeks = Math.max(1, Math.round((r.build.b - r.build.a + DAY) / (7 * DAY)));
+            const tx0 = Math.max(x0, xL) + 12;
+            const room = Math.min(x0 + w, xR) - tx0;
+            ctx.font = font(barFont, 700);
+            let lbl = `${weeks} semaine${weeks > 1 ? 's' : ''}`;
+            if (ctx.measureText(lbl).width + 12 > room) lbl = `${weeks} sem`;
+            if (ctx.measureText(lbl).width + 8 < room) {
+              ctx.fillStyle = '#FFFFFF';
+              ctx.fillText(lbl, tx0, mid + barFont / 3);
+            }
+          }
+          ctx.restore();
+
+          const endDay = r.build ? r.build.b : r.dueOnly;
+          const dateFont = compact ? 12 : 13;
+          if (endDay != null && endDay >= d1) {
+            // Delivery after the quarter: arrow + date in the right margin.
+            ctx.fillStyle = c;
+            ctx.font = font(dateFont, 800);
+            ctx.fillText(`→ ${fmtDay(endDay)}`, xR + 10, mid + dateFont / 2.6);
+          } else if (endDay != null && endDay >= d0) {
+            const s = compact ? 6 : 8;
+            const dx = X(endDay + DAY) + 6 + s;
+            ctx.fillStyle = c;
+            ctx.beginPath();
+            ctx.moveTo(dx, mid - s);
+            ctx.lineTo(dx + s, mid);
+            ctx.lineTo(dx, mid + s);
+            ctx.lineTo(dx - s, mid);
+            ctx.closePath();
+            ctx.fill();
+            ctx.fillStyle = INK;
+            ctx.font = font(dateFont, 800);
+            ctx.fillText(fmtDay(endDay), dx + s + 6, mid + dateFont / 2.6);
+          } else if (!r.disco && !r.build) {
+            ctx.fillStyle = INK_FAINT;
+            ctx.font = font(13, 400);
+            ctx.fillText('Dates à planifier', xL, mid + 5);
+          }
+        });
+
+        // Milestone chips, staggered on two lanes when they would overlap.
+        ctx.font = font(11, 700);
+        const laneEnd = [-Infinity, -Infinity];
+        const chipMax = px + panelW;
+        for (const m of milestones) {
+          const x = X(m.date);
+          const label = ellipsize(ctx, m.label, 180);
+          const w = ctx.measureText(label).width + 18;
+          let cx = Math.min(x - 4, chipMax - w);
+          let lane = laneEnd.findIndex((end) => cx > end + 6);
+          if (lane < 0) {
+            lane = laneEnd[0] <= laneEnd[1] ? 0 : 1;
+            cx = Math.min(laneEnd[lane] + 6, chipMax - w);
+          }
+          const yChip = lane === 0 ? top - 30 : top - 8;
+          roundRect(ctx, cx, yChip, w, 18, 9);
           ctx.fillStyle = INK;
-          ctx.font = font(13, 800);
-          ctx.fillText(fmtDay(endDay), dx + 14, mid + 5);
-        } else if (!r.disco && !r.build) {
-          ctx.fillStyle = INK_FAINT;
-          ctx.font = font(13, 400);
-          ctx.fillText('Dates à planifier', L, mid + 5);
+          ctx.fill();
+          ctx.fillStyle = '#FFFFFF';
+          ctx.fillText(label, cx + 9, yChip + 13);
+          laneEnd[lane] = cx + w;
         }
-      });
 
-      // Milestone chips, staggered on two lanes when they would overlap.
-      ctx.font = font(11, 700);
-      const laneEnd = [-Infinity, -Infinity];
-      for (const m of milestones) {
-        const x = X(m.date);
-        const label = ellipsize(ctx, m.label, 180);
-        const w = ctx.measureText(label).width + 18;
-        let cx = Math.min(x - 4, W - w - 8);
-        let lane = laneEnd.findIndex((end) => cx > end + 6);
-        if (lane < 0) {
-          // Both lanes busy: take the one that frees up first and nudge the
-          // chip right of its neighbour rather than drawing on top of it.
-          lane = laneEnd[0] <= laneEnd[1] ? 0 : 1;
-          cx = Math.min(laneEnd[lane] + 6, W - w - 8);
+        // Today line
+        if (today >= d0 && today < d1) {
+          const tx = X(today);
+          ctx.strokeStyle = TODAY_COLOR;
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.moveTo(tx, top + 16);
+          ctx.lineTo(tx, panelBottom + 4);
+          ctx.stroke();
+          ctx.fillStyle = TODAY_COLOR;
+          ctx.beginPath();
+          ctx.arc(tx, top + 16, 4, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.font = font(10.5, 700);
+          ctx.textAlign = 'center';
+          ctx.fillText("AUJOURD'HUI", tx, panelBottom + 18);
+          ctx.textAlign = 'left';
         }
-        const yChip = lane === 0 ? top - 30 : top - 8;
-        roundRect(ctx, cx, yChip, w, 18, 9);
-        ctx.fillStyle = INK;
-        ctx.fill();
-        ctx.fillStyle = '#FFFFFF';
-        ctx.fillText(label, cx + 9, yChip + 13);
-        laneEnd[lane] = cx + w;
-      }
-
-      // Today line
-      if (today >= d0 && today <= d1) {
-        const tx = X(today);
-        ctx.strokeStyle = TODAY_COLOR;
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        ctx.moveTo(tx, top + 16);
-        ctx.lineTo(tx, H - 18);
-        ctx.stroke();
-        ctx.fillStyle = TODAY_COLOR;
-        ctx.beginPath();
-        ctx.arc(tx, top + 16, 4, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.font = font(10.5, 700);
-        ctx.textAlign = 'center';
-        ctx.fillText("AUJOURD'HUI", tx, H - 6);
-        ctx.textAlign = 'left';
       }
 
       return canvas;
     }
 
-    async function buildCanvas() {
-      const keys = collectVisibleKeys();
+    async function buildCanvas(toast) {
+      const keys = await collectAllKeys((nb) => toast?.update(`Momentum-Light — lecture de la Timeline… ${nb} tickets`));
+      toast?.update(`Momentum-Light — ${keys.length} tickets lus, construction du visuel…`);
       if (!keys.length) throw new Error('aucune issue visible sur la Timeline');
       const issues = await fetchIssues(keys);
       const rows = buildModel(issues, keys);
@@ -5915,7 +6019,7 @@
     // Firefox ≥ 127). Falls back to a download when the clipboard refuses.
     function copyToClipboard(showToast) {
       const toast = showToast('Momentum-Light — préparation du visuel PowerPoint…');
-      const blobPromise = buildCanvas().then(toBlob);
+      const blobPromise = buildCanvas(toast).then(toBlob);
       let clipboardPromise;
       try {
         if (!navigator.clipboard?.write || typeof window.ClipboardItem !== 'function') {
