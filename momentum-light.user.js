@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.13.1
+// @version      0.14.0
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur sur chaque chip de sprint (actif : progression fait/engagé issue du Sprint Report, teinté par engagement vs vélocité moyenne ; futur : charge planifiée vs vélocité moyenne), macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, menu « How-to » guidé qui surligne chaque feature au premier lancement, toggle « Vue PM / Vue Business » qui remplace les overlays de chiffrage par la date d'atterrissage (duedate) de chaque Epic, recoloration ternaire 🟢🟡🔴 (On Track / At Risk / Off Track / Livré) de chaque barre d'Epic en Vue Business calculée à partir de la duedate, de la projection vélocité et de la confidence, surcharge du menu Export → Image (.png) qui capture la Timeline au format natif (via html2canvas) avec tous les overlays Momentum-Light visibles dessus, variante d'export business-friendly (en Vue Business) qui ajoute une bande titre + légende des couleurs de statut au-dessus de la Timeline capturée, et indicateur « On Hold » qui grise la barre d'une Epic en pause (désaturée + badge ⏸) en Vue Business, transversalement au statut d'atterrissage, et entrée « Copier pour PowerPoint » dans le menu Export qui place dans le presse-papier un visuel Disco → Build (une couleur par Epic, discovery en clair, build en plein, échéance, releases et ligne du jour) prêt à coller dans un slide.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -5326,7 +5326,6 @@
   // round-trip) so fonts, truncation and colours are deterministic.
   //
   // Optional overrides (localStorage):
-  //   momentum-light::ppt-title      → title of the image (default « Roadmap produit »)
   //   momentum-light::ppt-start-field → custom field id for the start date
   //   momentum-light::ppt-quarter    → '2027-T1', 'next' or 'previous' (default: current quarter)
   //   momentum-light::ppt-milestones → regex on version names (default 'go[- ]?live'),
@@ -5757,10 +5756,9 @@
       return out;
     }
 
-    // Layout: aims for a 16:9 picture. Up to 14 Epics → one column at
-    // 1280 px; beyond → two side-by-side columns at 1920 px. Row height
-    // shrinks (54 → 34 px) to fit the 16:9 frame before the picture is
-    // allowed to grow taller; small rows switch to a single-line label.
+    // Layout: a single long column (1280 px wide), one 54 px row per Epic —
+    // the user crops it in PowerPoint if it needs splitting. No title band:
+    // just the legend, the month pills and the milestones above the rows.
     // Period: one quarter. Epics entirely outside it are left out; undated
     // Epics stay (« Dates à planifier ») so nothing silently disappears.
     function splitRows(allRows, d0, d1) {
@@ -5784,14 +5782,13 @@
       const milestones = milestonesAll.filter((m) => m.date >= d0 && m.date < d1);
 
       const n = Math.max(rows.length, 1);
-      const cols = n > 14 ? 2 : 1;
-      const perCol = Math.ceil(n / cols);
-      const W = cols === 1 ? 1280 : 1920;
-      const top = 150;
+      const cols = 1;
+      const perCol = n;
+      const W = 1280;
+      const top = 124;
       const BOTTOM = 36;
-      const targetH = Math.round((W * 9) / 16);
-      const ROW_H = Math.max(34, Math.min(54, Math.floor((targetH - top - BOTTOM) / perCol)));
-      const compact = ROW_H < 44;
+      const ROW_H = 54;
+      const compact = false;
       const BAR_H = Math.max(18, Math.min(28, Math.round(ROW_H * 0.52)));
       const rowsBottom = top + perCol * ROW_H;
       const H = rowsBottom + BOTTOM;
@@ -5810,16 +5807,6 @@
       ctx.fillStyle = '#FFFFFF';
       ctx.fillRect(0, 0, W, H);
 
-      // Title
-      const title = localStorage.getItem('momentum-light::ppt-title') || 'Roadmap produit';
-      ctx.fillStyle = INK;
-      ctx.font = font(28, 800);
-      ctx.fillText(title, OUTER, 50);
-      ctx.fillStyle = INK_SOFT;
-      ctx.font = font(15, 400);
-      const count = `${dated.length} Epic${dated.length > 1 ? 's' : ''}${undated.length ? ` · ${undated.length} à planifier` : ''}`;
-      ctx.fillText(`${quarterLabel(d0)} · ${count} · Discovery en clair, build en plein, échéance au bout`, OUTER, 76);
-
       // Legend (top right)
       ctx.font = font(13, 600);
       let lx = W - OUTER;
@@ -5832,9 +5819,9 @@
         const tw = ctx.measureText(item.label).width;
         lx -= tw;
         ctx.fillStyle = INK_SOFT;
-        ctx.fillText(item.label, lx, 51);
+        ctx.fillText(item.label, lx, 29);
         lx -= item.w + 8;
-        item.draw(lx, 46);
+        item.draw(lx, 24);
         lx -= 22;
       }
 
