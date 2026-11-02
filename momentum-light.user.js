@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.12.1
+// @version      0.12.2
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur sur chaque chip de sprint (actif : progression fait/engagé issue du Sprint Report, teinté par engagement vs vélocité moyenne ; futur : charge planifiée vs vélocité moyenne), macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, menu « How-to » guidé qui surligne chaque feature au premier lancement, toggle « Vue PM / Vue Business » qui remplace les overlays de chiffrage par la date d'atterrissage (duedate) de chaque Epic, recoloration ternaire 🟢🟡🔴 (On Track / At Risk / Off Track / Livré) de chaque barre d'Epic en Vue Business calculée à partir de la duedate, de la projection vélocité et de la confidence, surcharge du menu Export → Image (.png) qui capture la Timeline au format natif (via html2canvas) avec tous les overlays Momentum-Light visibles dessus, variante d'export business-friendly (en Vue Business) qui ajoute une bande titre + légende des couleurs de statut au-dessus de la Timeline capturée, et indicateur « On Hold » qui grise la barre d'une Epic en pause (désaturée + badge ⏸) en Vue Business, transversalement au statut d'atterrissage, et entrée « Copier pour PowerPoint » dans le menu Export qui place dans le presse-papier un visuel Disco → Build (une couleur par Epic, discovery en clair, build en plein, échéance, releases et ligne du jour) prêt à coller dans un slide.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -5630,12 +5630,15 @@
       // Epics stay (« Dates à planifier ») so nothing silently disappears.
       const { start: d0, end: d1 } = quarterBounds(today);
       const overlaps = (a, b) => a < d1 && b + DAY > d0;
-      const rows = allRows.filter((r) => {
-        if (!r.build && !r.disco && r.dueOnly == null) return true;
-        return (r.build && overlaps(r.build.a, r.build.b))
+      const isUndated = (r) => !r.build && !r.disco && r.dueOnly == null;
+      const dated = allRows.filter((r) => !isUndated(r) && (
+        (r.build && overlaps(r.build.a, r.build.b))
           || (r.disco && overlaps(r.disco.a, r.disco.b))
-          || (r.dueOnly != null && r.dueOnly >= d0);
-      });
+          || (r.dueOnly != null && r.dueOnly >= d0)
+      ));
+      // « Dates à planifier » Epics go last so the planned work reads first.
+      const undated = allRows.filter(isUndated);
+      const rows = [...dated, ...undated];
       const milestones = milestonesAll.filter((m) => m.date >= d0 && m.date < d1);
 
       const W = 1280;
@@ -5724,6 +5727,19 @@
         ctx.fillStyle = INK_SOFT;
         ctx.font = font(15, 400);
         ctx.fillText('Aucune Epic sur ce trimestre.', L, top + 32);
+      }
+      if (dated.length && undated.length) {
+        // Faint divider between planned Epics and the ones still to schedule.
+        const sy = top + dated.length * ROW_H;
+        ctx.save();
+        ctx.strokeStyle = hexA(INK, 0.14);
+        ctx.lineWidth = 1;
+        ctx.setLineDash([4, 4]);
+        ctx.beginPath();
+        ctx.moveTo(36, sy);
+        ctx.lineTo(W - 36, sy);
+        ctx.stroke();
+        ctx.restore();
       }
       rows.forEach((r, i) => {
         const c = PALETTE[i % PALETTE.length];
