@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.15.1
+// @version      0.16.0
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur sur chaque chip de sprint (actif : progression fait/engagé issue du Sprint Report, teinté par engagement vs vélocité moyenne ; futur : charge planifiée vs vélocité moyenne), macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, menu « How-to » guidé qui surligne chaque feature au premier lancement, toggle « Vue PM / Vue Business » qui remplace les overlays de chiffrage par la date d'atterrissage (duedate) de chaque Epic, recoloration ternaire 🟢🟡🔴 (On Track / At Risk / Off Track / Livré) de chaque barre d'Epic en Vue Business calculée à partir de la duedate, de la projection vélocité et de la confidence, surcharge du menu Export → Image (.png) qui capture la Timeline au format natif (via html2canvas) avec tous les overlays Momentum-Light visibles dessus, variante d'export business-friendly (en Vue Business) qui ajoute une bande titre + légende des couleurs de statut au-dessus de la Timeline capturée, et indicateur « On Hold » qui grise la barre d'une Epic en pause (désaturée + badge ⏸) en Vue Business, transversalement au statut d'atterrissage, et entrée « Copier pour PowerPoint » dans le menu Export qui place dans le presse-papier un visuel Disco → Build (une couleur par Epic, discovery en clair, build en plein, échéance, releases et ligne du jour) prêt à coller dans un slide.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -5785,8 +5785,20 @@
       const today = todayUtc();
       const { start: d0, end: d1 } = quarterBounds(today);
       const { dated, undated } = splitRows(allRows, d0, d1);
-      // « Dates à planifier » Epics go last so the planned work reads first.
-      const rows = [...dated, ...undated];
+      // Three groups, read top to bottom:
+      //   1. build scheduled — by build start (Epic start date), then disco start;
+      //   2. build not scheduled yet (disco only, or a lone due date) — by disco start / due;
+      //   3. « Dates à planifier » — Timeline order.
+      const byStart = (a, b) => a - b;
+      const planned = dated.filter((r) => r.build)
+        .sort((a, b) => byStart(a.build.a, b.build.a) || byStart(a.disco?.a ?? a.build.a, b.disco?.a ?? b.build.a));
+      const pendingKey = (r) => (r.disco ? r.disco.a : r.dueOnly);
+      const pending = dated.filter((r) => !r.build).sort((a, b) => byStart(pendingKey(a), pendingKey(b)));
+      const rows = [...planned, ...pending, ...undated];
+      const groupBreaks = [
+        { at: planned.length, label: 'BUILD À PLANIFIER', show: planned.length > 0 && pending.length > 0 },
+        { at: planned.length + pending.length, label: 'DATES À PLANIFIER', show: planned.length + pending.length > 0 && undated.length > 0 },
+      ].filter((g) => g.show);
       const milestones = milestonesAll.filter((m) => m.date >= d0 && m.date < d1);
 
       const n = Math.max(rows.length, 1);
@@ -5802,7 +5814,11 @@
       const top = 124;
       const BOTTOM = 36;
       const BAR_H = Math.max(18, Math.min(28, Math.round(ROW_H * 0.52)));
-      const rowsBottom = top + perCol * ROW_H;
+      // Each group break opens a GROUP_GAP band that carries its caption.
+      const GROUP_GAP = 30;
+      const gapsBefore = (index) => groupBreaks.filter((g) => g.at <= index).length;
+      const rowTop = (index) => top + index * ROW_H + gapsBefore(index) * GROUP_GAP;
+      const rowsBottom = top + perCol * ROW_H + groupBreaks.length * GROUP_GAP;
       const H = rowsBottom + BOTTOM;
       const OUTER = 36;
       const GAP = 48;
@@ -5851,7 +5867,7 @@
         const xL = px + LABEL_W;
         const xR = px + panelW - R;
         const X = (ms) => xL + ((ms - d0) / (d1 - d0)) * (xR - xL);
-        const panelBottom = top + slice.length * ROW_H;
+        const panelBottom = rowTop(firstIndex + slice.length - 1) + ROW_H;
 
         if (col > 0) {
           ctx.strokeStyle = hexA(INK, 0.08);
@@ -5897,25 +5913,34 @@
           ctx.restore();
         }
 
-        // Divider between planned Epics and the ones still to schedule.
-        const splitAt = dated.length - firstIndex;
-        if (splitAt > 0 && splitAt < slice.length) {
-          const sy = top + splitAt * ROW_H;
+        // Dividers between groups, captioned with the group that follows.
+        for (const g of groupBreaks) {
+          const splitAt = g.at - firstIndex;
+          if (splitAt <= 0 || splitAt >= slice.length) continue;
+          const sy = rowTop(g.at) - GROUP_GAP / 2;
           ctx.save();
-          ctx.strokeStyle = hexA(INK, 0.14);
+          ctx.strokeStyle = hexA(INK, 0.16);
           ctx.lineWidth = 1;
           ctx.setLineDash([4, 4]);
           ctx.beginPath();
           ctx.moveTo(px, sy);
           ctx.lineTo(px + panelW, sy);
           ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.font = font(10, 700);
+          ctx.letterSpacing = '1px';
+          const tw = ctx.measureText(g.label).width + (g.label.length * 1);
+          ctx.fillStyle = '#FFFFFF';
+          ctx.fillRect(px, sy - 7, tw + 16, 14);
+          ctx.fillStyle = INK_SOFT;
+          ctx.fillText(g.label, px + 4, sy + 3.5);
           ctx.restore();
         }
 
         slice.forEach((r, j) => {
           const i = firstIndex + j;
           const c = PALETTE[i % PALETTE.length];
-          const mid = top + j * ROW_H + ROW_H / 2;
+          const mid = rowTop(i) + ROW_H / 2;
 
           // Label column
           ctx.fillStyle = c;
