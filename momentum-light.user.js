@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.14.1
+// @version      0.15.0
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur sur chaque chip de sprint (actif : progression fait/engagé issue du Sprint Report, teinté par engagement vs vélocité moyenne ; futur : charge planifiée vs vélocité moyenne), macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, menu « How-to » guidé qui surligne chaque feature au premier lancement, toggle « Vue PM / Vue Business » qui remplace les overlays de chiffrage par la date d'atterrissage (duedate) de chaque Epic, recoloration ternaire 🟢🟡🔴 (On Track / At Risk / Off Track / Livré) de chaque barre d'Epic en Vue Business calculée à partir de la duedate, de la projection vélocité et de la confidence, surcharge du menu Export → Image (.png) qui capture la Timeline au format natif (via html2canvas) avec tous les overlays Momentum-Light visibles dessus, variante d'export business-friendly (en Vue Business) qui ajoute une bande titre + légende des couleurs de statut au-dessus de la Timeline capturée, et indicateur « On Hold » qui grise la barre d'une Epic en pause (désaturée + badge ⏸) en Vue Business, transversalement au statut d'atterrissage, et entrée « Copier pour PowerPoint » dans le menu Export qui place dans le presse-papier un visuel Disco → Build (une couleur par Epic, discovery en clair, build en plein, échéance, releases et ligne du jour) prêt à coller dans un slide.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -5327,6 +5327,7 @@
   //
   // Optional overrides (localStorage):
   //   momentum-light::ppt-start-field → custom field id for the start date
+  //   momentum-light::ppt-rows-per-slide → rows per 16:9 slide once pasted full width (12–40, default 20)
   //   momentum-light::ppt-quarter    → '2027-T1', 'next' or 'previous' (default: current quarter)
   //   momentum-light::ppt-milestones → regex on version names (default 'go[- ]?live'),
   //                                    '*' = all versions, '' = none
@@ -5377,6 +5378,12 @@
       const start = Date.UTC(y, q * 3, 1);
       const end = Date.UTC(y, q * 3 + 3, 1); // exclusive
       return { start, end };
+    }
+
+    function rowsPerSlide() {
+      let v = NaN;
+      try { v = parseInt(localStorage.getItem('momentum-light::ppt-rows-per-slide'), 10); } catch (_) { /* default */ }
+      return Number.isFinite(v) ? Math.max(12, Math.min(40, v)) : 20;
     }
 
     function milestoneFilter() {
@@ -5756,8 +5763,8 @@
       return out;
     }
 
-    // Layout: a single long column (1450 px wide), one 54 px row per Epic —
-    // the user crops it in PowerPoint if it needs splitting. No title band:
+    // Layout: a single long column, one 42 px row per Epic, as wide as needed
+    // for ~20 rows per 16:9 slide — the user crops it in PowerPoint. No title band:
     // just the legend, the month pills and the milestones above the rows.
     // Period: one quarter. Epics entirely outside it are left out; undated
     // Epics stay (« Dates à planifier ») so nothing silently disappears.
@@ -5784,12 +5791,15 @@
       const n = Math.max(rows.length, 1);
       const cols = 1;
       const perCol = n;
-      // Timeline area = W − 2×OUTER − LABEL_W − R = 1018 px (848 px +20 %).
-      const W = 1450;
+      // Width is derived from a target number of rows per 16:9 slide: once
+      // the picture is pasted full-width on a slide, a slide's height covers
+      // W × 9/16 px of it, i.e. ROWS_PER_SLIDE rows of ROW_H. Wider picture
+      // ⇒ more rows per slide (and slightly smaller text once scaled).
+      const ROW_H = 42;
+      const compact = true;
+      const W = Math.max(1280, Math.round((16 / 9) * rowsPerSlide() * ROW_H));
       const top = 124;
       const BOTTOM = 36;
-      const ROW_H = 54;
-      const compact = false;
       const BAR_H = Math.max(18, Math.min(28, Math.round(ROW_H * 0.52)));
       const rowsBottom = top + perCol * ROW_H;
       const H = rowsBottom + BOTTOM;
@@ -5912,13 +5922,12 @@
           ctx.arc(px + 8, mid, compact ? 5 : 6, 0, Math.PI * 2);
           ctx.fill();
           if (compact) {
-            ctx.font = font(11, 400);
-            const kw = ctx.measureText(r.key).width;
-            ctx.fillStyle = INK_FAINT;
-            ctx.fillText(r.key, px + 22, mid + 4.5);
             ctx.fillStyle = INK;
-            ctx.font = font(13.5, 700);
-            ctx.fillText(ellipsize(ctx, r.name, LABEL_W - 44 - kw), px + 30 + kw, mid + 5);
+            ctx.font = font(14, 700);
+            ctx.fillText(ellipsize(ctx, r.name, LABEL_W - 40), px + 24, mid - 1);
+            ctx.fillStyle = INK_FAINT;
+            ctx.font = font(10.5, 400);
+            ctx.fillText(r.key, px + 24, mid + 13);
           } else {
             ctx.fillStyle = INK;
             ctx.font = font(15, 700);
