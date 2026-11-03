@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.16.1
+// @version      0.17.0
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur sur chaque chip de sprint (actif : progression fait/engagé issue du Sprint Report, teinté par engagement vs vélocité moyenne ; futur : charge planifiée vs vélocité moyenne), macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, menu « How-to » guidé qui surligne chaque feature au premier lancement, toggle « Vue PM / Vue Business » qui remplace les overlays de chiffrage par la date d'atterrissage (duedate) de chaque Epic, recoloration ternaire 🟢🟡🔴 (On Track / At Risk / Off Track / Livré) de chaque barre d'Epic en Vue Business calculée à partir de la duedate, de la projection vélocité et de la confidence, surcharge du menu Export → Image (.png) qui capture la Timeline au format natif (via html2canvas) avec tous les overlays Momentum-Light visibles dessus, variante d'export business-friendly (en Vue Business) qui ajoute une bande titre + légende des couleurs de statut au-dessus de la Timeline capturée, et indicateur « On Hold » qui grise la barre d'une Epic en pause (désaturée + badge ⏸) en Vue Business, transversalement au statut d'atterrissage, et entrée « Copier pour PowerPoint » dans le menu Export qui place dans le presse-papier un visuel Disco → Build (une couleur par Epic, discovery en clair, build en plein, échéance, releases et ligne du jour) prêt à coller dans un slide.
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -5350,6 +5350,71 @@
     const END_FIELD_CACHE = 'momentum-light::ppt-end-fields';
     const END_FIELD_NAMES = ['target end', 'fin cible', 'end date', 'date de fin'];
 
+    // ---- Epic phase (status marker) ----------------------------------------
+    // The dot in front of each Epic title is filled according to where the
+    // Epic stands: ○ À faire (OPEN / TO DO) · ◐ Discovery (DESIGN) · ● Build
+    // (IN PROGRESS, and anything further along). Resolved from the status NAME
+    // first, then from JIRA's statusCategory. Overrides (status name, any case
+    // → 'todo' | 'disco' | 'build'):
+    //   localStorage.setItem('momentum-light::ppt-status-map',
+    //     JSON.stringify({ 'CADRAGE': 'disco', 'READY': 'todo' }))
+    const PHASE_DISCO_RX = /\b(design|discovery|disco|cadrage|conception|exploration)\b/i;
+    const PHASE_TODO_RX = /\b(open|to\s*do|backlog|new|ouvert[e]?|nouveau|nouvelle)\b|à\s+faire|a\s+faire/i;
+    const PHASE_BUILD_RX = /\b(in\s+progress|build|en\s+cours)\b/i;
+
+    function statusPhaseOverrides() {
+      try {
+        const raw = JSON.parse(localStorage.getItem('momentum-light::ppt-status-map') || 'null');
+        if (!raw || typeof raw !== 'object') return null;
+        const out = {};
+        for (const [k, v] of Object.entries(raw)) {
+          if (['todo', 'disco', 'build'].includes(v)) out[k.trim().toLowerCase()] = v;
+        }
+        return out;
+      } catch (_) {
+        return null;
+      }
+    }
+
+    function epicPhase(statusName, categoryKey, overrides) {
+      const name = (statusName || '').trim();
+      const forced = overrides && overrides[name.toLowerCase()];
+      if (forced) return forced;
+      if (PHASE_DISCO_RX.test(name)) return 'disco';
+      if (PHASE_BUILD_RX.test(name)) return 'build';
+      if (PHASE_TODO_RX.test(name)) return 'todo';
+      if (categoryKey === 'new') return 'todo';
+      if (categoryKey === 'indeterminate' || categoryKey === 'done') return 'build';
+      return null;
+    }
+
+    // ○ / ◐ / ● in the Epic colour; null phase → plain dot (unchanged look).
+    function drawPhaseDot(ctx, x, y, r, color, phase) {
+      if (phase === 'todo' || phase === 'disco') {
+        ctx.beginPath();
+        ctx.arc(x, y, r - 0.75, 0, Math.PI * 2);
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fill();
+        ctx.lineWidth = 1.75;
+        ctx.strokeStyle = color;
+        ctx.stroke();
+        if (phase === 'disco') {
+          // Left half filled: the Epic is half-way (discovery before build).
+          ctx.beginPath();
+          ctx.moveTo(x, y - r + 0.75);
+          ctx.arc(x, y, r - 0.75, -Math.PI / 2, Math.PI / 2, true);
+          ctx.closePath();
+          ctx.fillStyle = color;
+          ctx.fill();
+        }
+        return;
+      }
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, Math.PI * 2);
+      ctx.fillStyle = color;
+      ctx.fill();
+    }
+
     // ---- dates -----------------------------------------------------------
     const parseDay = (s) => {
       if (!s || typeof s !== 'string') return null;
@@ -5585,6 +5650,7 @@
       const fields = ['summary', 'issuetype', 'status', 'duedate', 'parent', 'project', ...startFields, ...endFields];
       if (sprintFieldId) fields.push(sprintFieldId);
       const out = [];
+      const phaseOverrides = statusPhaseOverrides();
       for (let i = 0; i < keys.length; i += 100) {
         const chunk = keys.slice(i, i + 100);
         const jql = `key in (${chunk.map((k) => `"${k}"`).join(',')})`;
@@ -5630,6 +5696,8 @@
           isEpic: isEpicIssue(issue),
           parentKey: issue.fields?.parent?.key || null,
           projectKey: issue.fields?.project?.key || issue.key.split('-')[0],
+          statusName: issue.fields?.status?.name || '',
+          phase: epicPhase(issue.fields?.status?.name, issue.fields?.status?.statusCategory?.key, phaseOverrides),
           start,
           due,
         };
@@ -5706,7 +5774,7 @@
         }
         // Lone due date: show it as a delivery point even without a start.
         const dueOnly = !build && e.due != null ? e.due : null;
-        return { key: e.key, name: e.summary, build, disco, dueOnly };
+        return { key: e.key, name: e.summary, build, disco, dueOnly, phase: e.phase, statusName: e.statusName };
       });
     }
 
@@ -5843,8 +5911,23 @@
         { label: 'Échéance', draw: (x, y) => { ctx.fillStyle = INK; ctx.beginPath(); ctx.moveTo(x + 7, y - 7); ctx.lineTo(x + 14, y); ctx.lineTo(x + 7, y + 7); ctx.lineTo(x, y); ctx.closePath(); ctx.fill(); }, w: 14 },
         { label: 'Build', draw: (x, y) => { roundRect(ctx, x, y - 8, 30, 16, 8); ctx.fillStyle = PALETTE[0]; ctx.fill(); }, w: 30 },
         { label: 'Disco', draw: (x, y) => { roundRect(ctx, x, y - 8, 30, 16, 8); ctx.fillStyle = hexA(PALETTE[0], 0.16); ctx.fill(); ctx.setLineDash([4, 3]); ctx.strokeStyle = PALETTE[0]; ctx.lineWidth = 1; ctx.stroke(); ctx.setLineDash([]); }, w: 30 },
+        { sep: true },
+        { label: 'En build', draw: (x, y) => drawPhaseDot(ctx, x + 6, y, 6, INK_SOFT, 'build'), w: 12 },
+        { label: 'En discovery', draw: (x, y) => drawPhaseDot(ctx, x + 6, y, 6, INK_SOFT, 'disco'), w: 12 },
+        { label: 'À faire', draw: (x, y) => drawPhaseDot(ctx, x + 6, y, 6, INK_SOFT, 'todo'), w: 12 },
       ];
       for (const item of legend) {
+        if (item.sep) {
+          lx += 6;
+          ctx.strokeStyle = hexA(INK, 0.16);
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.moveTo(lx, 15);
+          ctx.lineTo(lx, 33);
+          ctx.stroke();
+          lx -= 20;
+          continue;
+        }
         const tw = ctx.measureText(item.label).width;
         lx -= tw;
         ctx.fillStyle = INK_SOFT;
@@ -5944,10 +6027,7 @@
           const mid = rowTop(i) + ROW_H / 2;
 
           // Label column
-          ctx.fillStyle = c;
-          ctx.beginPath();
-          ctx.arc(px + 8, mid, compact ? 5 : 6, 0, Math.PI * 2);
-          ctx.fill();
+          drawPhaseDot(ctx, px + 8, mid, compact ? 5 : 6, c, r.phase);
           if (compact) {
             ctx.fillStyle = INK;
             ctx.font = font(14, 700);
@@ -6120,6 +6200,7 @@
         })));
       }
       // Keep a handle for support: `copy(window.__MOMENTUM_PPT__)` in DevTools.
+      debug('ppt: phases —', rows.map((r) => `${r.key}=${r.phase || '?'} (${r.statusName || '—'})`).join(', '));
       window.__MOMENTUM_PPT__ = { stats: lastStats, keys, epics: rows.map((r) => r.key), outside: outside.map((r) => r.key) };
       return render(rows, milestones);
     }
