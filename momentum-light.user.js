@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.16.1
-// @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur sur chaque chip de sprint (actif : progression fait/engagé issue du Sprint Report, teinté par engagement vs vélocité moyenne ; futur : charge planifiée vs vélocité moyenne), macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, menu « How-to » guidé qui surligne chaque feature au premier lancement, toggle « Vue PM / Vue Business » qui remplace les overlays de chiffrage par la date d'atterrissage (duedate) de chaque Epic, recoloration ternaire 🟢🟡🔴 (On Track / At Risk / Off Track / Livré) de chaque barre d'Epic en Vue Business calculée à partir de la duedate, de la projection vélocité et de la confidence, surcharge du menu Export → Image (.png) qui capture la Timeline au format natif (via html2canvas) avec tous les overlays Momentum-Light visibles dessus, variante d'export business-friendly (en Vue Business) qui ajoute une bande titre + légende des couleurs de statut au-dessus de la Timeline capturée, et indicateur « On Hold » qui grise la barre d'une Epic en pause (désaturée + badge ⏸) en Vue Business, transversalement au statut d'atterrissage, et entrée « Copier pour PowerPoint » dans le menu Export qui place dans le presse-papier un visuel Disco → Build (une couleur par Epic, discovery en clair, build en plein, échéance, releases et ligne du jour) prêt à coller dans un slide.
+// @version      0.17.0
+// @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur sur chaque chip de sprint (actif : progression fait/engagé issue du Sprint Report, teinté par engagement vs vélocité moyenne ; futur : charge planifiée vs vélocité moyenne), macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, menu « How-to » guidé qui surligne chaque feature au premier lancement, toggle « Vue PM / Vue Business » qui remplace les overlays de chiffrage par la date d'atterrissage (duedate) de chaque Epic, recoloration ternaire 🟢🟡🔴 (On Track / At Risk / Off Track / Livré) de chaque barre d'Epic en Vue Business calculée à partir de la duedate, de la projection vélocité et de la confidence, surcharge du menu Export → Image (.png) qui capture la Timeline au format natif (via html2canvas) avec tous les overlays Momentum-Light visibles dessus, variante d'export business-friendly (en Vue Business) qui ajoute une bande titre + légende des couleurs de statut au-dessus de la Timeline capturée, et indicateur « On Hold » qui grise la barre d'une Epic en pause (désaturée + badge ⏸) en Vue Business, transversalement au statut d'atterrissage, et entrée « Copier pour PowerPoint » dans le menu Export qui place dans le presse-papier un visuel Disco → Build (une couleur par Epic, discovery en clair, build en plein, échéance, releases et ligne du jour) prêt à coller dans un slide, et entrée « Copier le tableau pour PowerPoint » qui copie un tableau éditable des Epics (Sujet / Macro Sizing / Date de démarrage / Date de finalisation UAT).
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
 // @run-at       document-idle
@@ -5577,13 +5577,25 @@
     }
 
     async function fetchIssues(keys) {
-      const [startFields, endFields, sprintFieldId] = await Promise.all([
+      const [startFields, endFields, sprintFieldId, tshirtFieldId] = await Promise.all([
         resolveStartFields().catch(() => []),
         resolveEndFields().catch(() => []),
         sprintField.resolve().catch(() => null),
+        tshirtSizeField.resolve().catch(() => null),
       ]);
       const fields = ['summary', 'issuetype', 'status', 'duedate', 'parent', 'project', ...startFields, ...endFields];
       if (sprintFieldId) fields.push(sprintFieldId);
+      if (tshirtFieldId) fields.push(tshirtFieldId);
+      // T-Shirt value as displayed: canonical bucket when known, else the
+      // raw option / text (e.g. 'XXL'), else empty.
+      const sizeOf = (issue) => {
+        const raw = tshirtFieldId ? issue.fields?.[tshirtFieldId] : null;
+        if (raw == null) return '';
+        const norm = normalizeTshirtSize(raw);
+        if (norm) return norm;
+        const v = typeof raw === 'string' ? raw : (raw.value ?? raw.name ?? '');
+        return String(v || '').trim();
+      };
       const out = [];
       for (let i = 0; i < keys.length; i += 100) {
         const chunk = keys.slice(i, i + 100);
@@ -5632,6 +5644,7 @@
           projectKey: issue.fields?.project?.key || issue.key.split('-')[0],
           start,
           due,
+          size: sizeOf(issue),
         };
       });
     }
@@ -5706,7 +5719,7 @@
         }
         // Lone due date: show it as a delivery point even without a start.
         const dueOnly = !build && e.due != null ? e.due : null;
-        return { key: e.key, name: e.summary, build, disco, dueOnly };
+        return { key: e.key, name: e.summary, build, disco, dueOnly, size: e.size || '', start: e.start, due: e.due };
       });
     }
 
@@ -6185,7 +6198,137 @@
       );
     }
 
-    return { copyToClipboard, _buildCanvas: buildCanvas };
+    // ---- tableau « Sujet / Macro Sizing / Démarrage / Finalisation (UAT) » --
+    // Same Timeline read as the visual, but copied as a real HTML table
+    // (+ TSV fallback): pasted into PowerPoint it becomes a native, editable
+    // table. One row per Epic of the view (no quarter filter).
+    //   Sujet            = Epic summary
+    //   Macro Sizing     = T-Shirt Sizing field of the Epic
+    //   Date de démarrage = Epic start date, else start of its disco
+    //   Finalisation UAT = Epic due date (else target end / sprint end)
+    const fmtFull = (ms) => (ms == null ? '' : new Date(ms)
+      .toLocaleDateString('fr-FR', { day: '2-digit', month: '2-digit', year: 'numeric', timeZone: 'UTC' }));
+    const escHtml = (t) => String(t ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    const TABLE_HEADERS = ['SUJET', 'Macro Sizing', 'Date de démarrage', 'Date de finalisation (UAT)'];
+
+    async function buildTableRows(toast) {
+      const keys = await collectAllKeys((nb) => toast?.update(`Momentum-Light — lecture de la Timeline… ${nb} tickets`));
+      if (!keys.length) throw new Error('aucune issue visible sur la Timeline');
+      toast?.update(`Momentum-Light — ${keys.length} tickets lus, construction du tableau…`);
+      const issues = await fetchIssues(keys);
+      const model = buildModel(issues, keys);
+      if (!model.length) throw new Error('aucune Epic visible sur la Timeline');
+      const rows = model.map((r, idx) => {
+        const start = r.start != null ? r.start : (r.disco && !r.disco.estimated ? r.disco.a : null);
+        const end = r.due;
+        return { idx, key: r.key, subject: r.name, size: r.size, start, end };
+      });
+      // Dated first by start (then end), undated after — Timeline order as tie-break.
+      const rank = (r) => (r.start != null ? 0 : r.end != null ? 1 : 2);
+      rows.sort((a, b) => rank(a) - rank(b)
+        || (a.start ?? a.end ?? 0) - (b.start ?? b.end ?? 0)
+        || (a.end ?? 0) - (b.end ?? 0)
+        || a.idx - b.idx);
+      log(`ppt-table: ${rows.length} Epic(s)`);
+      window.__MOMENTUM_PPT_TABLE__ = rows;
+      return rows;
+    }
+
+    function tableHtml(rows) {
+      const cell = 'border:1px solid #C9C6DD;padding:6px 10px;font-family:Segoe UI,Arial,sans-serif;font-size:12pt;vertical-align:middle;';
+      const head = `${cell}background:${INK};color:#FFFFFF;font-weight:bold;`;
+      const ths = TABLE_HEADERS.map((h, i) => `<th style="${head}text-align:${i === 0 ? 'left' : 'center'};">${escHtml(h)}</th>`).join('');
+      const trs = rows.map((r, n) => {
+        const bg = n % 2 ? 'background:#F4F3FA;' : 'background:#FFFFFF;';
+        const td = (v, align, extra = '') => `<td style="${cell}${bg}color:${INK};text-align:${align};${extra}">${escHtml(v) || '&nbsp;'}</td>`;
+        return `<tr>${td(r.subject, 'left')}${td(r.size, 'center', 'font-weight:bold;')}${td(fmtFull(r.start), 'center')}${td(fmtFull(r.end), 'center')}</tr>`;
+      }).join('');
+      return `<table style="border-collapse:collapse;width:100%;"><thead><tr>${ths}</tr></thead><tbody>${trs}</tbody></table>`;
+    }
+
+    function tableTsv(rows) {
+      const clean = (v) => String(v ?? '').replace(/[\t\r\n]+/g, ' ');
+      return [TABLE_HEADERS, ...rows.map((r) => [r.subject, r.size, fmtFull(r.start), fmtFull(r.end)])]
+        .map((cols) => cols.map(clean).join('\t')).join('\r\n');
+    }
+
+    // Last resort when the async clipboard is refused: select a hidden copy
+    // of the table and use execCommand (works while the click activation is
+    // still fresh), else download an .html file that opens in Excel / Word.
+    function fallbackCopy(html, rows) {
+      const host = document.createElement('div');
+      host.contentEditable = 'true';
+      Object.assign(host.style, { position: 'fixed', left: '-10000px', top: '0', opacity: '0' });
+      host.innerHTML = html;
+      document.body.appendChild(host);
+      let ok = false;
+      try {
+        const range = document.createRange();
+        range.selectNodeContents(host);
+        const sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+        ok = document.execCommand('copy');
+        sel.removeAllRanges();
+      } catch (_) { ok = false; }
+      host.remove();
+      if (ok) return 'copied';
+      const blob = new Blob([`<!doctype html><meta charset="utf-8">${html}`], { type: 'text/html' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `momentum-tableau-ppt-${new Date().toISOString().slice(0, 10)}.html`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      debug('ppt-table: fallback download', rows.length);
+      return 'downloaded';
+    }
+
+    // Same contract as copyToClipboard: call synchronously from the click.
+    function copyTableToClipboard(showToast) {
+      const toast = showToast('Momentum-Light — préparation du tableau PowerPoint…');
+      const rowsPromise = buildTableRows(toast);
+      const htmlPromise = rowsPromise.then((rows) => new Blob([tableHtml(rows)], { type: 'text/html' }));
+      const textPromise = rowsPromise.then((rows) => new Blob([tableTsv(rows)], { type: 'text/plain' }));
+      let clipboardPromise;
+      try {
+        if (!navigator.clipboard?.write || typeof window.ClipboardItem !== 'function') {
+          throw new Error('Clipboard API indisponible');
+        }
+        clipboardPromise = navigator.clipboard.write([
+          new window.ClipboardItem({ 'text/html': htmlPromise, 'text/plain': textPromise }),
+        ]);
+      } catch (e) {
+        clipboardPromise = Promise.reject(e);
+      }
+      const done = (rows) => ` — ${rows.length} Epic${rows.length > 1 ? 's' : ''}`;
+      return clipboardPromise.then(
+        async () => {
+          const rows = await rowsPromise;
+          toast.update(`Momentum-Light — tableau copié ✓${done(rows)} · Ctrl+V dans PowerPoint`);
+          setTimeout(() => toast.hide(), 5000);
+        },
+        async (clipErr) => {
+          try {
+            const rows = await rowsPromise;
+            warn('ppt-table: clipboard refused:', clipErr?.message || clipErr);
+            const how = fallbackCopy(tableHtml(rows), rows);
+            toast.update(how === 'copied'
+              ? `Momentum-Light — tableau copié ✓${done(rows)}`
+              : `Momentum-Light — copie refusée, tableau téléchargé (.html)${done(rows)}`);
+            setTimeout(() => toast.hide(), 4000);
+          } catch (buildErr) {
+            error('ppt-table export failed:', buildErr?.message || buildErr);
+            toast.update(`Momentum-Light — échec : ${buildErr?.message || buildErr}`);
+            setTimeout(() => toast.hide(), 3600);
+          }
+        },
+      );
+    }
+
+    return { copyToClipboard, copyTableToClipboard, _buildCanvas: buildCanvas, _buildTableRows: buildTableRows };
   })();
 
   // ---------------------------------------------------------------------------
@@ -6336,6 +6479,28 @@
         if (e.key === 'Enter' || e.key === ' ') runPpt(e);
       }, true);
       enriched.parentNode.insertBefore(ppt, enriched.nextSibling);
+
+      // Third companion entry — Epic table (Sujet / Macro Sizing / dates)
+      // copied as an editable PowerPoint table.
+      const tbl = native.cloneNode(true);
+      tbl.setAttribute(ITEM_ATTR, 'ppt-table');
+      tbl.removeAttribute('id');
+      tbl.removeAttribute('aria-describedby');
+      const tblLeaf = textLeafMatching(tbl, IMAGE_LABEL)
+        || (IMAGE_LABEL.test(tbl.textContent || '') ? tbl : null);
+      if (tblLeaf) tblLeaf.textContent = 'Copier le tableau pour PowerPoint (Sujet / Sizing / Dates)';
+      const runTbl = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        e.stopImmediatePropagation();
+        pptRoadmap.copyTableToClipboard(showToast);
+        closeOpenMenus();
+      };
+      tbl.addEventListener('click', runTbl, true);
+      tbl.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') runTbl(e);
+      }, true);
+      ppt.parentNode.insertBefore(tbl, ppt.nextSibling);
       debug('exportPng: enriched menu entries injected');
     }
 
