@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Momentum-Light
 // @namespace    https://github.com/corentinpoisson44-collab/Momentum-Light
-// @version      0.17.0
+// @version      0.17.1
 // @description  Augmente la Timeline JIRA (Plans / Advanced Roadmaps) — progression sur les Epics (SP done/total enfants), chiffrage SP centré sur les barres de tickets, chip de vélocité moyenne des 5 derniers sprints (calculée via le Sprint Report comme dans l'UI Backlog), indicateur sur chaque chip de sprint (actif : progression fait/engagé issue du Sprint Report, teinté par engagement vs vélocité moyenne ; futur : charge planifiée vs vélocité moyenne), macro-estimation T-Shirt (XS/S/M/L/XL → SP) avec badge discret sur la barre d'Epic, projection de fin de sprint et indicateur de sur/sous-cadrage dans le tooltip, menu « How-to » guidé qui surligne chaque feature au premier lancement, toggle « Vue PM / Vue Business » qui remplace les overlays de chiffrage par la date d'atterrissage (duedate) de chaque Epic, recoloration ternaire 🟢🟡🔴 (On Track / At Risk / Off Track / Livré) de chaque barre d'Epic en Vue Business calculée à partir de la duedate, de la projection vélocité et de la confidence, surcharge du menu Export → Image (.png) qui capture la Timeline au format natif (via html2canvas) avec tous les overlays Momentum-Light visibles dessus, variante d'export business-friendly (en Vue Business) qui ajoute une bande titre + légende des couleurs de statut au-dessus de la Timeline capturée, et indicateur « On Hold » qui grise la barre d'une Epic en pause (désaturée + badge ⏸) en Vue Business, transversalement au statut d'atterrissage, et entrée « Copier pour PowerPoint » dans le menu Export qui place dans le presse-papier un visuel Disco → Build (une couleur par Epic, discovery en clair, build en plein, échéance, releases et ligne du jour) prêt à coller dans un slide, et entrée « Copier le tableau pour PowerPoint » qui copie un tableau éditable des Epics (Sujet / Macro Sizing / Date de démarrage / Date de finalisation UAT).
 // @author       corentinpoisson44
 // @match        https://*.atlassian.net/*
@@ -6206,8 +6206,6 @@
     //   Macro Sizing     = T-Shirt Sizing field of the Epic
     //   Date de démarrage = Epic start date, else start of its disco
     //   Finalisation UAT = Epic due date (else target end / sprint end)
-    const fmtFull = (ms) => (ms == null ? '' : new Date(ms)
-      .toLocaleDateString('fr-FR', { day: '2-digit', month: '2-digit', year: 'numeric', timeZone: 'UTC' }));
     const escHtml = (t) => String(t ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
     const TABLE_HEADERS = ['SUJET', 'Macro Sizing', 'Date de démarrage', 'Date de finalisation (UAT)'];
 
@@ -6234,21 +6232,53 @@
       return rows;
     }
 
+    // Minimal « slide » look (cf. maquette) : no fill, no vertical borders,
+    // small grey uppercase headers over a thick dark rule, hairline row
+    // separators, sizing in grey, dates in bold « 26 Février ». Every style
+    // is inline and per cell — PowerPoint ignores <style> blocks and
+    // inherited table borders when pasting HTML.
+    const MONTHS_FR = ['Janvier', 'Février', 'Mars', 'Avril', 'Mai', 'Juin', 'Juillet', 'Août', 'Septembre', 'Octobre', 'Novembre', 'Décembre'];
+    const fmtSlide = (ms) => {
+      if (ms == null) return '';
+      const d = new Date(ms);
+      const y = d.getUTCFullYear();
+      // Year only when it is not the current one, to keep cells short.
+      return `${d.getUTCDate()} ${MONTHS_FR[d.getUTCMonth()]}${y !== new Date().getFullYear() ? ` ${y}` : ''}`;
+    };
+
     function tableHtml(rows) {
-      const cell = 'border:1px solid #C9C6DD;padding:6px 10px;font-family:Segoe UI,Arial,sans-serif;font-size:12pt;vertical-align:middle;';
-      const head = `${cell}background:${INK};color:#FFFFFF;font-weight:bold;`;
-      const ths = TABLE_HEADERS.map((h, i) => `<th style="${head}text-align:${i === 0 ? 'left' : 'center'};">${escHtml(h)}</th>`).join('');
+      const FONT = "font-family:'Segoe UI',Arial,sans-serif;";
+      const DARK = '#1A1A1A';
+      const GREY = '#7A7A7A';
+      const RULE = '#D9D9D9';
+      const COLS = [
+        { label: 'Sujet', width: '52%' },
+        { label: 'Macro Sizing', width: '14%' },
+        { label: 'Date de démarrage', width: '16%' },
+        { label: 'Date de finalisation (UAT)', width: '18%' },
+      ];
+      const base = `${FONT}text-align:left;border-left:none;border-right:none;border-top:none;`;
+      const ths = COLS.map((c) => `<th width="${c.width}" style="${base}width:${c.width};`
+        + `padding:4pt 8pt 8pt 0;vertical-align:bottom;border-bottom:1.5pt solid ${DARK};`
+        + `color:${GREY};font-size:10pt;font-weight:normal;text-transform:uppercase;letter-spacing:0.5pt;">`
+        + `${escHtml(c.label.toUpperCase())}</th>`).join('');
       const trs = rows.map((r, n) => {
-        const bg = n % 2 ? 'background:#F4F3FA;' : 'background:#FFFFFF;';
-        const td = (v, align, extra = '') => `<td style="${cell}${bg}color:${INK};text-align:${align};${extra}">${escHtml(v) || '&nbsp;'}</td>`;
-        return `<tr>${td(r.subject, 'left')}${td(r.size, 'center', 'font-weight:bold;')}${td(fmtFull(r.start), 'center')}${td(fmtFull(r.end), 'center')}</tr>`;
+        const last = n === rows.length - 1;
+        const td = (v, extra) => `<td style="${base}padding:9pt 8pt 9pt 0;vertical-align:middle;`
+          + `border-bottom:${last ? 'none' : `0.5pt solid ${RULE}`};font-size:11pt;${extra}">`
+          + `${escHtml(v) || '&nbsp;'}</td>`;
+        return `<tr>${td(r.subject, `color:${DARK};`)}`
+          + `${td(r.size, `color:${GREY};`)}`
+          + `${td(fmtSlide(r.start), `color:${DARK};font-weight:bold;`)}`
+          + `${td(fmtSlide(r.end), `color:${DARK};font-weight:bold;`)}</tr>`;
       }).join('');
-      return `<table style="border-collapse:collapse;width:100%;"><thead><tr>${ths}</tr></thead><tbody>${trs}</tbody></table>`;
+      return `<table cellspacing="0" cellpadding="0" style="border-collapse:collapse;border:none;width:100%;">`
+        + `<thead><tr>${ths}</tr></thead><tbody>${trs}</tbody></table>`;
     }
 
     function tableTsv(rows) {
       const clean = (v) => String(v ?? '').replace(/[\t\r\n]+/g, ' ');
-      return [TABLE_HEADERS, ...rows.map((r) => [r.subject, r.size, fmtFull(r.start), fmtFull(r.end)])]
+      return [TABLE_HEADERS, ...rows.map((r) => [r.subject, r.size, fmtSlide(r.start), fmtSlide(r.end)])]
         .map((cols) => cols.map(clean).join('\t')).join('\r\n');
     }
 
